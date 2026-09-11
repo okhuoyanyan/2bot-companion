@@ -1,0 +1,40 @@
+name: bot_companion
+description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # 设备状态采集核心库 (纯开源官方插件)
+  battery_plus: ^6.2.1
+  connectivity_plus: ^6.1.1
+  network_info_plus: ^6.1.1
+  
+  # Android 前台常驻通知保活
+  flutter_foreground_task: ^8.17.0
+  
+  # 本地参数持久化存储
+  shared_preferences: ^2.3.2
+  
+  # 网络请求
+  http: ^1.2.2
+  
+  # 动态权限申请 (WiFi SSID 所需定位权限、通知权限)
+  permission_handler: ^11.3.1
+  
+  # 国际化与日期格式化
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
