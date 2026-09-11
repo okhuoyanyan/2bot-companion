@@ -1,10 +1,10 @@
 /// 2BOT 官方伴侣端核心全局常量与默认配置
 class AppConstants {
-  // 默认中继服务地址（官方 Vercel Serverless 中继）
-  static const String defaultRelayUrl = 'https://2bot-relay.vercel.app';
+  // 默认中继服务地址（安全通用占位符，需替换为您自己部署的中继域名）
+  static const String defaultRelayUrl = 'https://your-relay-service.vercel.app';
   
-  // 默认设备鉴权密钥
-  static const String defaultDeviceToken = 'telemetry_sec_8848';
+  // 默认设备鉴权密钥（初始为空，强制引导用户在设置中配置私有密钥）
+  static const String defaultDeviceToken = '';
 
   // 默认定时上报频率（分钟）
   static const int defaultIntervalMinutes = 10;

@@ -120,7 +120,7 @@ class _ConfigCardState extends State<ConfigCard> {
               ),
               decoration: const InputDecoration(
                 labelText: '中继服务地址 (Relay Base URL)',
-                hintText: 'https://2bot-relay.vercel.app',
+                hintText: 'https://your-relay-service.vercel.app',
                 prefixIcon: Icon(Icons.cloud_queue_rounded,
                     size: 20, color: AppTheme.textSecondary),
               ),
@@ -138,7 +138,7 @@ class _ConfigCardState extends State<ConfigCard> {
               ),
               decoration: InputDecoration(
                 labelText: '设备鉴权密钥 (x-device-token)',
-                hintText: 'telemetry_sec_8848',
+                hintText: '填入您在云端中继配置的自定义 Token',
                 prefixIcon: const Icon(Icons.vpn_key_rounded,
                     size: 20, color: AppTheme.textSecondary),
                 suffixIcon: IconButton(

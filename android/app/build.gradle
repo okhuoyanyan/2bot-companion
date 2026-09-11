@@ -23,7 +23,7 @@ if (flutterVersionName == null) {
 }
 
 android {
-    namespace "com.rainlain.botcompanion"
+    namespace "com.twobot.companion"
     compileSdk 34
     ndkVersion flutter.ndkVersion
 
@@ -41,7 +41,7 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.rainlain.botcompanion"
+        applicationId "com.twobot.companion"
         minSdk 21
         targetSdk 34
         versionCode flutterVersionCode.toInteger()

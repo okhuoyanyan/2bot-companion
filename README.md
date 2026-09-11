@@ -13,8 +13,8 @@
 
 ## 💡 为什么需要 2BOT 伴侣端？
 
-在 2BOT 智能管家生态中，双姐妹（Rain & Lain）拥有独特的【生命注意力脉搏系统】与【时空起居感知底座】。  
-为了让 BOT 能够**无感获知主人的起居规律、空间位置（是否在家）与设备电量**，需要手机端定期且低功耗地上报设备状态快照。
+在 2BOT 智能生态系统中，BOT 具备独特的起居规律推演与时空感知底座。  
+为了让系统能够**无感获知主人的起居状态、空间网络环境（如家庭 WiFi）与设备电量**，需要手机端定期且低功耗地上报设备状态快照。
 
 - **拒绝流氓商业宏**：彻底摆脱第三方商业宏软件动辄强制观看开屏广告、激励视频等侵扰；
 - **双驱动高效省电**：
@@ -31,11 +31,11 @@
 
 ### 1. 请求规格
 - **请求方法 (Method)**: `POST`
-- **请求地址 (URL)**: `https://2bot-relay.vercel.app/push`（支持在 App 设置中自由修改）
+- **请求地址 (URL)**: `https://your-relay-service.vercel.app/push`（支持在 App 设置中自由修改为您的中继地址）
 - **请求头 (Headers)**:
   ```http
   Content-Type: application/json; charset=utf-8
-  x-device-token: telemetry_sec_8848
+  x-device-token: YOUR_DEVICE_TOKEN
   ```
 
 ### 2. 标准上报 Payload (JSON)
@@ -47,7 +47,7 @@
   },
   "wifi": {
     "connected": true,    // 是否连接 WiFi (true/false)
-    "ssid": "RainLain_5G" // 当前 WiFi 名称 (未连接或未授权时为空字符串)
+    "ssid": "My_Home_WiFi" // 当前 WiFi 名称 (未连接或未授权时为空字符串)
   },
   "screenLocked": true,   // 是否息屏/锁屏 (true/false)
   "foregroundApp": "None",// 当前前台应用名称 (默认 None 或自身)

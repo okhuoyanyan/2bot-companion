@@ -291,6 +291,52 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(vertical: 12),
           children: [
+            // 0. 未配置密钥/端点引导横幅
+            if (_settings.deviceToken.isEmpty ||
+                _settings.relayUrl.contains('your-relay-service'))
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: AppTheme.warningAmber.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: AppTheme.warningAmber.withOpacity(0.4),
+                  ),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.lock_clock_outlined,
+                        color: AppTheme.warningAmber, size: 24),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '尚未配置云端中继密钥',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: AppTheme.warningAmber,
+                            ),
+                          ),
+                          SizedBox(height: 4),
+                          Text(
+                            '请在下方【云端通信与中继设置】中填入您自己部署的中继 URL 与私有 Token 即可开启自动上报。',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: AppTheme.textSecondary,
+                              height: 1.4,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
             // 1. 实时状态看板卡片
             StatusCard(
               snapshot: _snapshot,

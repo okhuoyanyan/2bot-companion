@@ -1,0 +1,84 @@
+name: 🚀 Build Release APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Android Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: 🎯 Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.x'
+          channel: 'stable'
+          cache: true
+
+      - name: 🔍 Verify Flutter & Dart Environment
+        run: |
+          flutter --version
+          dart --version
+
+      - name: 📦 Install Flutter Dependencies
+        run: flutter pub get
+
+      - name: 🔨 Build Release APK
+        run: flutter build apk --release
+
+      - name: 🏷️ Prepare APK Artifact Name
+        id: prep
+        run: |
+          BUILD_TIME=$(date +'%Y%m%d_%H%M%S')
+          APK_NAME="2bot-companion-${BUILD_TIME}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "build/app/outputs/flutter-apk/${APK_NAME}"
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
+
+      - name: 📤 Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2bot-companion-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 🌟 Create GitHub Release (On Version Tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/${{ steps.prep.outputs.apk_name }}
+          name: 2BOT 伴侣端 ${{ github.ref_name }}
+          body: |
+            ### 2BOT 官方 Android 专属轻量伴侣端 (`2bot-companion`) 发布
+            - **版本标号**：${{ github.ref_name }}
+            - **构建时间**：${{ steps.prep.outputs.build_time }}
+            - **核心特性**：100% 纯血开源、0 广告、0 商业 SDK、超低功耗设备状态上报与生命脉搏双驱动保活。
+            
+            直接下载下方的 `app-release.apk` 即可在 Android 手机上直接安装使用！
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
