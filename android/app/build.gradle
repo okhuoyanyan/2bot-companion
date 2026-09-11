@@ -48,9 +48,18 @@ android {
         versionName flutterVersionName
     }
 
+    signingConfigs {
+        release {
+            storeFile file('twobot-release.jks')
+            storePassword 'twobot123'
+            keyAlias 'twobot'
+            keyPassword 'twobot123'
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            signingConfig file('twobot-release.jks').exists() ? signingConfigs.release : signingConfigs.debug
             minifyEnabled false
             shrinkResources false
         }
