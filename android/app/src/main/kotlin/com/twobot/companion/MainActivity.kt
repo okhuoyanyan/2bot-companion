@@ -152,7 +152,7 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         val isMusicActive = audioManager?.isMusicActive ?: false
         val isBluetoothAudio: Boolean = if (audioManager != null) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val devices = audioManager.getDevices(AudioDeviceInfo.GET_DEVICES_OUTPUTS)
+                val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                 devices.any {
                     it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
                     it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
@@ -169,11 +169,11 @@ class MainActivity : FlutterActivity(), SensorEventListener {
 
         val isWiredHeadset: Boolean = if (audioManager != null) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val devices = audioManager.getDevices(AudioDeviceInfo.GET_DEVICES_OUTPUTS)
+                val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                 devices.any {
                     it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
                     it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && it.type == AudioDeviceInfo.TYPE_USB_HEADSET)
                 }
             } else {
                 @Suppress("DEPRECATION")
@@ -309,19 +309,30 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (powerManager?.isIgnoringBatteryOptimizations(packageName) == false) {
-                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    try {
+                        val fallbackIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        }
+                        startActivity(fallbackIntent)
+                    } catch (_: Exception) {}
                 }
-                startActivity(intent)
             }
         }
     }
 
     private fun openUsageSettings() {
-        val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        startActivity(intent)
+        try {
+            val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(intent)
+        } catch (_: Exception) {}
     }
 }
