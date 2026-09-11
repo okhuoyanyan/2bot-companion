@@ -1,11 +1,15 @@
 import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../models/device_telemetry.dart';
 
 /// 设备物理状态采集服务
 class TelemetryCollectorService {
+  static const MethodChannel _channel =
+      MethodChannel('com.twobot.companion/native_sensors');
+
   static final Battery _battery = Battery();
   static final Connectivity _connectivity = Connectivity();
   static final NetworkInfo _networkInfo = NetworkInfo();
@@ -53,6 +57,37 @@ class TelemetryCollectorService {
     // 4. 前台应用名称（纯血开源零侵入，默认上报 None 或自身）
     final String foregroundApp = isAppForeground ? '2bot-companion' : 'None';
 
+    // 5. 采集 Android 原生底层传感器与系统状态 (v1.1.0 新增)
+    int? stepsToday;
+    String? ringerMode;
+    bool? isDnd;
+    bool? isMusicActive;
+    bool? isBluetoothAudio;
+    Map<String, dynamic>? nextAlarm;
+    int? screenTimeMinutes;
+    bool? isIgnoringBatteryOptimizations;
+
+    try {
+      final nativeData =
+          await _channel.invokeMapMethod<String, dynamic>('getNativeSensors');
+      if (nativeData != null) {
+        stepsToday = (nativeData['stepsToday'] as num?)?.toInt();
+        ringerMode = nativeData['ringerMode'] as String?;
+        isDnd = nativeData['isDnd'] as bool?;
+        isMusicActive = nativeData['isMusicActive'] as bool?;
+        isBluetoothAudio = nativeData['isBluetoothAudio'] as bool?;
+        if (nativeData['nextAlarm'] != null) {
+          nextAlarm =
+              Map<String, dynamic>.from(nativeData['nextAlarm'] as Map);
+        }
+        screenTimeMinutes = (nativeData['screenTimeMinutes'] as num?)?.toInt();
+        isIgnoringBatteryOptimizations =
+            nativeData['isIgnoringBatteryOptimizations'] as bool?;
+      }
+    } catch (_) {
+      // 优雅静默降级为 null，确保原有电量、WiFi、屏幕状态 100% 稳定采集
+    }
+
     return DeviceTelemetry(
       battery: BatteryInfo(
         level: batteryLevel,
@@ -65,6 +100,14 @@ class TelemetryCollectorService {
       screenLocked: screenLocked,
       foregroundApp: foregroundApp,
       timestamp: DateTime.now().millisecondsSinceEpoch,
+      stepsToday: stepsToday,
+      ringerMode: ringerMode,
+      isDnd: isDnd,
+      isMusicActive: isMusicActive,
+      isBluetoothAudio: isBluetoothAudio,
+      nextAlarm: nextAlarm,
+      screenTimeMinutes: screenTimeMinutes,
+      isIgnoringBatteryOptimizations: isIgnoringBatteryOptimizations,
     );
   }
 
@@ -72,5 +115,29 @@ class TelemetryCollectorService {
   static Future<bool> requestLocationPermission() async {
     final status = await Permission.location.request();
     return status.isGranted;
+  }
+
+  /// 一键触发系统电池优化白名单申请弹窗
+  static Future<void> requestIgnoreBatteryOptimizations() async {
+    try {
+      await _channel.invokeMethod('requestIgnoreBatteryOptimizations');
+    } catch (_) {}
+  }
+
+  /// 打开系统使用情况授权页面 (屏幕使用时长)
+  static Future<void> openUsageSettings() async {
+    try {
+      await _channel.invokeMethod('openUsageSettings');
+    } catch (_) {}
+  }
+
+  /// 动态申请 Android 10+ 健身运动/步数权限
+  static Future<bool> requestActivityPermission() async {
+    try {
+      final status = await Permission.activityRecognition.request();
+      return status.isGranted;
+    } catch (_) {
+      return false;
+    }
   }
 }

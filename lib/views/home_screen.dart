@@ -30,6 +30,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _isReporting = false;
   bool _isServiceRunning = false;
   bool _hasLocationPermission = true;
+  bool _isIgnoringBatteryOptimizations = true;
+  bool _hasActivityPermission = true;
 
   StreamSubscription<BatteryState>? _batterySubscription;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -55,6 +57,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _refreshLocalSnapshot();
       _checkLocationPermission();
+      _checkActivityPermission();
       _checkServiceStatus();
     }
   }
@@ -63,6 +66,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _loadInitialData() async {
     _settings = StorageService.loadSettings();
     _checkLocationPermission();
+    _checkActivityPermission();
     _checkServiceStatus();
     await _refreshLocalSnapshot();
   }
@@ -83,6 +87,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (mounted) {
       setState(() {
         _hasLocationPermission = granted;
+      });
+    }
+  }
+
+  /// 检查健身运动权限 (步数读取必需)
+  Future<void> _checkActivityPermission() async {
+    final granted = await Permission.activityRecognition.isGranted;
+    if (mounted) {
+      setState(() {
+        _hasActivityPermission = granted;
       });
     }
   }
@@ -112,6 +126,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _snapshot = snap;
+          if (snap.isIgnoringBatteryOptimizations != null) {
+            _isIgnoringBatteryOptimizations =
+                snap.isIgnoringBatteryOptimizations!;
+          }
           _settings = StorageService.loadSettings();
         });
       }
@@ -130,6 +148,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _snapshot = snap;
+          if (snap.isIgnoringBatteryOptimizations != null) {
+            _isIgnoringBatteryOptimizations =
+                snap.isIgnoringBatteryOptimizations!;
+          }
           _settings = StorageService.loadSettings();
         });
       }
@@ -149,6 +171,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       setState(() {
         _snapshot = snap;
+        if (snap.isIgnoringBatteryOptimizations != null) {
+          _isIgnoringBatteryOptimizations =
+              snap.isIgnoringBatteryOptimizations!;
+        }
         _settings = StorageService.loadSettings();
       });
 
@@ -237,6 +263,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// 申请电池优化白名单 (直达系统弹窗)
+  Future<void> _handleRequestBatteryOptimization() async {
+    await TelemetryCollectorService.requestIgnoreBatteryOptimizations();
+    await _refreshLocalSnapshot();
+  }
+
+  /// 申请步数/健身运动权限
+  Future<void> _handleRequestActivityPermission() async {
+    final ok = await TelemetryCollectorService.requestActivityPermission();
+    if (mounted) {
+      setState(() => _hasActivityPermission = ok);
+      if (ok) {
+        _refreshLocalSnapshot();
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -265,7 +308,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 borderRadius: BorderRadius.circular(6),
               ),
               child: const Text(
-                'v1.0.0',
+                'v1.1.0',
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
@@ -351,9 +394,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               isServiceRunning: _isServiceRunning,
               isReporting: _isReporting,
               hasLocationPermission: _hasLocationPermission,
+              isIgnoringBatteryOptimizations: _isIgnoringBatteryOptimizations,
+              hasActivityPermission: _hasActivityPermission,
               onToggleService: _handleToggleService,
               onTestReport: _handleManualTestReport,
               onRequestPermission: _handleRequestPermission,
+              onRequestBatteryOptimization: _handleRequestBatteryOptimization,
+              onRequestActivityPermission: _handleRequestActivityPermission,
             ),
 
             // 3. 云端通信与中继配置卡片

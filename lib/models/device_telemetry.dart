@@ -52,12 +52,30 @@ class DeviceTelemetry {
   final String foregroundApp;
   final int timestamp;
 
+  // v1.1.0 新增原生拓展字段 (全部支持可空回退)
+  final int? stepsToday;
+  final String? ringerMode; // 'normal' | 'vibrate' | 'silent'
+  final bool? isDnd;
+  final bool? isMusicActive;
+  final bool? isBluetoothAudio;
+  final Map<String, dynamic>? nextAlarm; // {'triggerTime': int, 'formatted': String}
+  final int? screenTimeMinutes;
+  final bool? isIgnoringBatteryOptimizations;
+
   DeviceTelemetry({
     required this.battery,
     required this.wifi,
     required this.screenLocked,
     required this.foregroundApp,
     required this.timestamp,
+    this.stepsToday,
+    this.ringerMode,
+    this.isDnd,
+    this.isMusicActive,
+    this.isBluetoothAudio,
+    this.nextAlarm,
+    this.screenTimeMinutes,
+    this.isIgnoringBatteryOptimizations,
   });
 
   Map<String, dynamic> toJson() => {
@@ -66,6 +84,15 @@ class DeviceTelemetry {
     'screenLocked': screenLocked,
     'foregroundApp': foregroundApp,
     'timestamp': timestamp,
+    if (stepsToday != null) 'stepsToday': stepsToday,
+    if (ringerMode != null) 'ringerMode': ringerMode,
+    if (isDnd != null) 'isDnd': isDnd,
+    if (isMusicActive != null) 'isMusicActive': isMusicActive,
+    if (isBluetoothAudio != null) 'isBluetoothAudio': isBluetoothAudio,
+    if (nextAlarm != null) 'nextAlarm': nextAlarm,
+    if (screenTimeMinutes != null) 'screenTimeMinutes': screenTimeMinutes,
+    if (isIgnoringBatteryOptimizations != null)
+      'isIgnoringBatteryOptimizations': isIgnoringBatteryOptimizations,
   };
 
   factory DeviceTelemetry.fromJson(Map<String, dynamic> json) {
@@ -75,11 +102,21 @@ class DeviceTelemetry {
       screenLocked: json['screenLocked'] as bool? ?? false,
       foregroundApp: json['foregroundApp'] as String? ?? 'None',
       timestamp: (json['timestamp'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
+      stepsToday: (json['stepsToday'] as num?)?.toInt(),
+      ringerMode: json['ringerMode'] as String?,
+      isDnd: json['isDnd'] as bool?,
+      isMusicActive: json['isMusicActive'] as bool?,
+      isBluetoothAudio: json['isBluetoothAudio'] as bool?,
+      nextAlarm: json['nextAlarm'] != null
+          ? Map<String, dynamic>.from(json['nextAlarm'] as Map)
+          : null,
+      screenTimeMinutes: (json['screenTimeMinutes'] as num?)?.toInt(),
+      isIgnoringBatteryOptimizations: json['isIgnoringBatteryOptimizations'] as bool?,
     );
   }
 
   @override
   String toString() {
-    return 'DeviceTelemetry(battery: ${battery.level}%, charging: ${battery.isCharging}, wifi: ${wifi.ssid.isNotEmpty ? wifi.ssid : "None"}, screenLocked: $screenLocked, app: $foregroundApp)';
+    return 'DeviceTelemetry(battery: ${battery.level}%, charging: ${battery.isCharging}, wifi: ${wifi.ssid.isNotEmpty ? wifi.ssid : "None"}, screenLocked: $screenLocked, app: $foregroundApp, stepsToday: $stepsToday, ringer: $ringerMode, dnd: $isDnd, music: $isMusicActive, btAudio: $isBluetoothAudio, nextAlarm: ${nextAlarm?['formatted']}, screenTime: ${screenTimeMinutes}m, batteryOptIgnored: $isIgnoringBatteryOptimizations)';
   }
 }

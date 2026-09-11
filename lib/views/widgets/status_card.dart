@@ -153,6 +153,120 @@ class StatusCard extends StatelessWidget {
                 ),
               ],
             ),
+            const SizedBox(height: 12),
+
+            // 第二行硬件细节指示栏 (v1.1.0 新增)
+            Row(
+              children: [
+                // 4. 今日步数卡
+                Expanded(
+                  child: _buildMetricTile(
+                    icon: Icons.directions_walk_rounded,
+                    iconColor: snapshot?.stepsToday != null
+                        ? AppTheme.accentEmerald
+                        : AppTheme.secondarySky,
+                    label: '今日步数',
+                    value: snapshot?.stepsToday != null
+                        ? '${snapshot!.stepsToday} 步'
+                        : '--',
+                    subValue: snapshot?.stepsToday != null
+                        ? '健康计步'
+                        : '待计步/未授权',
+                  ),
+                ),
+                const SizedBox(width: 12),
+
+                // 5. 音频/耳机卡
+                Expanded(
+                  child: () {
+                    final isBt = snapshot?.isBluetoothAudio ?? false;
+                    final isMusic = snapshot?.isMusicActive ?? false;
+                    final String value;
+                    final String subValue;
+                    final IconData icon;
+                    final Color iconColor;
+
+                    if (isBt) {
+                      value = '蓝牙耳机 🎧';
+                      subValue = isMusic ? '播放音乐中' : '蓝牙已就绪';
+                      icon = Icons.headphones_rounded;
+                      iconColor = AppTheme.secondarySky;
+                    } else if (isMusic) {
+                      value = '音乐播放中 🎵';
+                      subValue = '媒体发声中';
+                      icon = Icons.music_note_rounded;
+                      iconColor = AppTheme.accentEmerald;
+                    } else {
+                      value = '扬声器待机';
+                      subValue = '音频通道待命';
+                      icon = Icons.volume_up_rounded;
+                      iconColor = AppTheme.textMuted;
+                    }
+
+                    return _buildMetricTile(
+                      icon: icon,
+                      iconColor: iconColor,
+                      label: '音频状态',
+                      value: value,
+                      subValue: subValue,
+                    );
+                  }(),
+                ),
+                const SizedBox(width: 12),
+
+                // 6. 闹钟/起居卡
+                Expanded(
+                  child: () {
+                    final hasAlarm = snapshot?.nextAlarm != null &&
+                        snapshot?.nextAlarm?['formatted'] != null;
+                    final isDnd = snapshot?.isDnd ?? false;
+                    final ringer = snapshot?.ringerMode;
+
+                    final String value;
+                    final String subValue;
+                    final IconData icon;
+                    final Color iconColor;
+
+                    if (hasAlarm) {
+                      value = '闹钟 ${snapshot!.nextAlarm!['formatted']}';
+                      subValue = isDnd ? '勿扰已开启 🌙' : '准时响铃';
+                      icon = Icons.alarm_rounded;
+                      iconColor = AppTheme.warningAmber;
+                    } else if (isDnd) {
+                      value = '勿扰模式 🌙';
+                      subValue = '静音免打扰';
+                      icon = Icons.do_not_disturb_on_rounded;
+                      iconColor = AppTheme.secondarySky;
+                    } else {
+                      if (ringer == 'silent') {
+                        value = '静音模式 🔕';
+                        subValue = '关闭震铃';
+                        icon = Icons.notifications_off_rounded;
+                        iconColor = AppTheme.textMuted;
+                      } else if (ringer == 'vibrate') {
+                        value = '振动模式 📳';
+                        subValue = '震动提醒';
+                        icon = Icons.vibration_rounded;
+                        iconColor = AppTheme.warningAmber;
+                      } else {
+                        value = '正常响铃 🔔';
+                        subValue = '响铃畅通';
+                        icon = Icons.notifications_active_rounded;
+                        iconColor = AppTheme.accentEmerald;
+                      }
+                    }
+
+                    return _buildMetricTile(
+                      icon: icon,
+                      iconColor: iconColor,
+                      label: '起居与勿扰',
+                      value: value,
+                      subValue: subValue,
+                    );
+                  }(),
+                ),
+              ],
+            ),
             const SizedBox(height: 18),
             const Divider(color: AppTheme.cardBorder, height: 1),
             const SizedBox(height: 14),
