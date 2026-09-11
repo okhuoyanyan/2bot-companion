@@ -63,11 +63,7 @@ class BackgroundTaskService {
         channelDescription: AppConstants.notificationDesc,
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
-        iconData: const NotificationIconData(
-          resType: ResourceType.mipmap,
-          resPrefix: ResourcePrefix.ic,
-          name: 'launcher',
-        ),
+        onlyAlertOnce: true,
       ),
       iosNotificationOptions: const IOSNotificationOptions(
         showNotification: false,
@@ -94,11 +90,7 @@ class BackgroundTaskService {
         channelDescription: AppConstants.notificationDesc,
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
-        iconData: const NotificationIconData(
-          resType: ResourceType.mipmap,
-          resPrefix: ResourcePrefix.ic,
-          name: 'launcher',
-        ),
+        onlyAlertOnce: true,
       ),
       iosNotificationOptions: const IOSNotificationOptions(
         showNotification: false,

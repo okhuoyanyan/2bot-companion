@@ -189,12 +189,10 @@ class StatusCard extends StatelessWidget {
                         ? AppTheme.accentEmerald.withOpacity(0.12)
                         : AppTheme.errorRose.withOpacity(0.12),
                     borderRadius: BorderRadius.circular(20),
-                    border: Border.parse(
-                      BorderSide(
-                        color: isSuccess
-                            ? AppTheme.accentEmerald.withOpacity(0.4)
-                            : AppTheme.errorRose.withOpacity(0.4),
-                      ),
+                    border: Border.all(
+                      color: isSuccess
+                          ? AppTheme.accentEmerald.withOpacity(0.4)
+                          : AppTheme.errorRose.withOpacity(0.4),
                     ),
                   ),
                   child: Text(
