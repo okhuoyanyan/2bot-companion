@@ -75,6 +75,13 @@ class MainActivity : FlutterActivity(), SensorEventListener {
                         result.error("USAGE_SETTINGS_ERROR", e.localizedMessage, null)
                     }
                 }
+                "hasUsagePermission" -> {
+                    try {
+                        result.success(checkUsagePermission())
+                    } catch (e: Exception) {
+                        result.error("USAGE_PERM_ERROR", e.localizedMessage, null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -254,55 +261,68 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         }
         map["isIgnoringBatteryOptimizations"] = isIgnoringBatteryOptimizations
 
-        // 6. Screen Time Minutes
-        val screenTimeMinutes: Int? = run {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return@run null
-            val appOps = getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return@run null
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                appOps.unsafeCheckOpNoThrow(
-                    AppOpsManager.OPSTR_GET_USAGE_STATS,
-                    android.os.Process.myUid(),
-                    packageName
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                appOps.checkOpNoThrow(
-                    AppOpsManager.OPSTR_GET_USAGE_STATS,
-                    android.os.Process.myUid(),
-                    packageName
-                )
-            }
-            if (mode != AppOpsManager.MODE_ALLOWED) return@run null
+        // 6. Screen Time Minutes & Usage Permission
+        val hasUsagePermission = checkUsagePermission()
+        map["hasUsagePermission"] = hasUsagePermission
 
+        val screenTimeMinutes: Int? = if (hasUsagePermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             try {
                 val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
-                    ?: return@run null
-                val calendar = Calendar.getInstance().apply {
-                    set(Calendar.HOUR_OF_DAY, 0)
-                    set(Calendar.MINUTE, 0)
-                    set(Calendar.SECOND, 0)
-                    set(Calendar.MILLISECOND, 0)
+                if (usageStatsManager != null) {
+                    val calendar = Calendar.getInstance().apply {
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    val startTime = calendar.timeInMillis
+                    val endTime = System.currentTimeMillis()
+                    val stats = usageStatsManager.queryUsageStats(
+                        UsageStatsManager.INTERVAL_DAILY,
+                        startTime,
+                        endTime
+                    )
+                    if (stats != null) {
+                        var totalTimeMs = 0L
+                        for (usage in stats) {
+                            totalTimeMs += usage.totalTimeInForeground
+                        }
+                        (totalTimeMs / (1000 * 60)).toInt()
+                    } else {
+                        null
+                    }
+                } else {
+                    null
                 }
-                val startTime = calendar.timeInMillis
-                val endTime = System.currentTimeMillis()
-                val stats = usageStatsManager.queryUsageStats(
-                    UsageStatsManager.INTERVAL_DAILY,
-                    startTime,
-                    endTime
-                ) ?: return@run null
-
-                var totalTimeMs = 0L
-                for (usage in stats) {
-                    totalTimeMs += usage.totalTimeInForeground
-                }
-                (totalTimeMs / (1000 * 60)).toInt()
             } catch (_: Exception) {
                 null
             }
+        } else {
+            null
         }
         map["screenTimeMinutes"] = screenTimeMinutes
 
         return map
+    }
+
+    private fun checkUsagePermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
+        val appOps = getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                android.os.Process.myUid(),
+                packageName
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                android.os.Process.myUid(),
+                packageName
+            )
+        }
+        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private fun requestIgnoreBatteryOptimizations() {

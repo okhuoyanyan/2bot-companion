@@ -137,19 +137,32 @@ class StatusCard extends StatelessWidget {
                 ),
                 const SizedBox(width: 12),
 
-                // 3. 锁屏活跃
+                // 3. 锁屏活跃与今日亮屏时长
                 Expanded(
-                  child: _buildMetricTile(
-                    icon: (snapshot?.screenLocked ?? false)
-                        ? Icons.lock_outline_rounded
-                        : Icons.lock_open_rounded,
-                    iconColor: (snapshot?.screenLocked ?? false)
-                        ? AppTheme.textMuted
-                        : AppTheme.accentEmerald,
-                    label: '屏幕状态',
-                    value: (snapshot?.screenLocked ?? false) ? '息屏锁屏' : '活跃亮屏',
-                    subValue: (snapshot?.screenLocked ?? false) ? '待机休眠' : '前台使用',
-                  ),
+                  child: () {
+                    final isLocked = snapshot?.screenLocked ?? false;
+                    final screenMins = snapshot?.screenTimeMinutes;
+                    final String subValue;
+                    if (screenMins != null) {
+                      final h = screenMins ~/ 60;
+                      final m = screenMins % 60;
+                      subValue = h > 0 ? '今日 $h时$m分' : '今日 $m分钟';
+                    } else {
+                      subValue = isLocked ? '待机休眠' : '前台使用';
+                    }
+
+                    return _buildMetricTile(
+                      icon: isLocked
+                          ? Icons.lock_outline_rounded
+                          : Icons.lock_open_rounded,
+                      iconColor: isLocked
+                          ? AppTheme.textMuted
+                          : AppTheme.accentEmerald,
+                      label: '屏幕状态',
+                      value: isLocked ? '息屏锁屏' : '活跃亮屏',
+                      subValue: subValue,
+                    );
+                  }(),
                 ),
               ],
             ),

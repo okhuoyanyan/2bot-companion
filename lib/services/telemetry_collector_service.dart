@@ -66,6 +66,7 @@ class TelemetryCollectorService {
     Map<String, dynamic>? nextAlarm;
     int? screenTimeMinutes;
     bool? isIgnoringBatteryOptimizations;
+    bool? hasUsagePermission;
 
     try {
       final nativeData =
@@ -83,6 +84,7 @@ class TelemetryCollectorService {
         screenTimeMinutes = (nativeData['screenTimeMinutes'] as num?)?.toInt();
         isIgnoringBatteryOptimizations =
             nativeData['isIgnoringBatteryOptimizations'] as bool?;
+        hasUsagePermission = nativeData['hasUsagePermission'] as bool?;
       }
     } catch (_) {
       // 优雅静默降级为 null，确保原有电量、WiFi、屏幕状态 100% 稳定采集
@@ -108,6 +110,7 @@ class TelemetryCollectorService {
       nextAlarm: nextAlarm,
       screenTimeMinutes: screenTimeMinutes,
       isIgnoringBatteryOptimizations: isIgnoringBatteryOptimizations,
+      hasUsagePermission: hasUsagePermission,
     );
   }
 
@@ -115,6 +118,16 @@ class TelemetryCollectorService {
   static Future<bool> requestLocationPermission() async {
     final status = await Permission.location.request();
     return status.isGranted;
+  }
+
+  /// 检查是否拥有屏幕与软件使用情况访问权限
+  static Future<bool> hasUsagePermission() async {
+    try {
+      final res = await _channel.invokeMethod<bool>('hasUsagePermission');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// 一键触发系统电池优化白名单申请弹窗
@@ -135,6 +148,16 @@ class TelemetryCollectorService {
   static Future<bool> requestActivityPermission() async {
     try {
       final status = await Permission.activityRecognition.request();
+      return status.isGranted;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 动态申请 Android 13+ 通知权限 (常驻保活必需)
+  static Future<bool> requestNotificationPermission() async {
+    try {
+      final status = await Permission.notification.request();
       return status.isGranted;
     } catch (_) {
       return false;

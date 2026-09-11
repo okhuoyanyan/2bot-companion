@@ -61,6 +61,7 @@ class DeviceTelemetry {
   final Map<String, dynamic>? nextAlarm; // {'triggerTime': int, 'formatted': String}
   final int? screenTimeMinutes;
   final bool? isIgnoringBatteryOptimizations;
+  final bool? hasUsagePermission;
 
   DeviceTelemetry({
     required this.battery,
@@ -76,6 +77,7 @@ class DeviceTelemetry {
     this.nextAlarm,
     this.screenTimeMinutes,
     this.isIgnoringBatteryOptimizations,
+    this.hasUsagePermission,
   });
 
   Map<String, dynamic> toJson() => {
@@ -93,6 +95,7 @@ class DeviceTelemetry {
     if (screenTimeMinutes != null) 'screenTimeMinutes': screenTimeMinutes,
     if (isIgnoringBatteryOptimizations != null)
       'isIgnoringBatteryOptimizations': isIgnoringBatteryOptimizations,
+    if (hasUsagePermission != null) 'hasUsagePermission': hasUsagePermission,
   };
 
   factory DeviceTelemetry.fromJson(Map<String, dynamic> json) {
@@ -112,11 +115,12 @@ class DeviceTelemetry {
           : null,
       screenTimeMinutes: (json['screenTimeMinutes'] as num?)?.toInt(),
       isIgnoringBatteryOptimizations: json['isIgnoringBatteryOptimizations'] as bool?,
+      hasUsagePermission: json['hasUsagePermission'] as bool?,
     );
   }
 
   @override
   String toString() {
-    return 'DeviceTelemetry(battery: ${battery.level}%, charging: ${battery.isCharging}, wifi: ${wifi.ssid.isNotEmpty ? wifi.ssid : "None"}, screenLocked: $screenLocked, app: $foregroundApp, stepsToday: $stepsToday, ringer: $ringerMode, dnd: $isDnd, music: $isMusicActive, btAudio: $isBluetoothAudio, nextAlarm: ${nextAlarm?['formatted']}, screenTime: ${screenTimeMinutes}m, batteryOptIgnored: $isIgnoringBatteryOptimizations)';
+    return 'DeviceTelemetry(battery: ${battery.level}%, charging: ${battery.isCharging}, wifi: ${wifi.ssid.isNotEmpty ? wifi.ssid : "None"}, screenLocked: $screenLocked, app: $foregroundApp, stepsToday: $stepsToday, ringer: $ringerMode, dnd: $isDnd, music: $isMusicActive, btAudio: $isBluetoothAudio, nextAlarm: ${nextAlarm?['formatted']}, screenTime: ${screenTimeMinutes}m, batteryOptIgnored: $isIgnoringBatteryOptimizations, usagePerm: $hasUsagePermission)';
   }
 }

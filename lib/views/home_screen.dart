@@ -32,6 +32,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _hasLocationPermission = true;
   bool _isIgnoringBatteryOptimizations = true;
   bool _hasActivityPermission = true;
+  bool _hasUsagePermission = true;
+  bool _hasNotificationPermission = true;
 
   StreamSubscription<BatteryState>? _batterySubscription;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -58,6 +60,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _refreshLocalSnapshot();
       _checkLocationPermission();
       _checkActivityPermission();
+      _checkUsagePermission();
+      _checkNotificationPermission();
       _checkServiceStatus();
     }
   }
@@ -67,6 +71,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _settings = StorageService.loadSettings();
     _checkLocationPermission();
     _checkActivityPermission();
+    _checkUsagePermission();
+    _checkNotificationPermission();
     _checkServiceStatus();
     await _refreshLocalSnapshot();
   }
@@ -101,6 +107,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// 检查使用情况访问权限 (屏幕使用时长统计必需)
+  Future<void> _checkUsagePermission() async {
+    final granted = await TelemetryCollectorService.hasUsagePermission();
+    if (mounted) {
+      setState(() {
+        _hasUsagePermission = granted;
+      });
+    }
+  }
+
+  /// 检查通知发送权限 (Android 13+ 前台保活必需)
+  Future<void> _checkNotificationPermission() async {
+    final granted = await Permission.notification.isGranted;
+    if (mounted) {
+      setState(() {
+        _hasNotificationPermission = granted;
+      });
+    }
+  }
+
   /// 配置双驱动事件监听 (充放电插拔、WiFi 连接切换即时触发上报)
   void _setupEventDrivenListeners() {
     // 1. 电池状态改变监听
@@ -130,6 +156,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _isIgnoringBatteryOptimizations =
                 snap.isIgnoringBatteryOptimizations!;
           }
+          if (snap.hasUsagePermission != null) {
+            _hasUsagePermission = snap.hasUsagePermission!;
+          }
           _settings = StorageService.loadSettings();
         });
       }
@@ -151,6 +180,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           if (snap.isIgnoringBatteryOptimizations != null) {
             _isIgnoringBatteryOptimizations =
                 snap.isIgnoringBatteryOptimizations!;
+          }
+          if (snap.hasUsagePermission != null) {
+            _hasUsagePermission = snap.hasUsagePermission!;
           }
           _settings = StorageService.loadSettings();
         });
@@ -174,6 +206,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         if (snap.isIgnoringBatteryOptimizations != null) {
           _isIgnoringBatteryOptimizations =
               snap.isIgnoringBatteryOptimizations!;
+        }
+        if (snap.hasUsagePermission != null) {
+          _hasUsagePermission = snap.hasUsagePermission!;
         }
         _settings = StorageService.loadSettings();
       });
@@ -280,6 +315,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// 申请使用情况访问权限 (直达系统设置页)
+  Future<void> _handleRequestUsagePermission() async {
+    await TelemetryCollectorService.openUsageSettings();
+    await _checkUsagePermission();
+    await _refreshLocalSnapshot();
+  }
+
+  /// 申请通知发送权限 (保活必需)
+  Future<void> _handleRequestNotificationPermission() async {
+    final ok = await TelemetryCollectorService.requestNotificationPermission();
+    if (mounted) {
+      setState(() => _hasNotificationPermission = ok);
+      if (ok) {
+        _refreshLocalSnapshot();
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -308,7 +361,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 borderRadius: BorderRadius.circular(6),
               ),
               child: const Text(
-                'v1.1.0',
+                'v1.2.0',
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
@@ -396,11 +449,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               hasLocationPermission: _hasLocationPermission,
               isIgnoringBatteryOptimizations: _isIgnoringBatteryOptimizations,
               hasActivityPermission: _hasActivityPermission,
+              hasUsagePermission: _hasUsagePermission,
+              hasNotificationPermission: _hasNotificationPermission,
+              batteryLevel: _snapshot?.batteryLevel,
+              isCharging: _snapshot?.isCharging ?? false,
               onToggleService: _handleToggleService,
               onTestReport: _handleManualTestReport,
               onRequestPermission: _handleRequestPermission,
               onRequestBatteryOptimization: _handleRequestBatteryOptimization,
               onRequestActivityPermission: _handleRequestActivityPermission,
+              onRequestUsagePermission: _handleRequestUsagePermission,
+              onRequestNotificationPermission: _handleRequestNotificationPermission,
             ),
 
             // 3. 云端通信与中继配置卡片
