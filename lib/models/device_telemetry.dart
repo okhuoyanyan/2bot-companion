@@ -63,6 +63,10 @@ class DeviceTelemetry {
   final bool? isIgnoringBatteryOptimizations;
   final bool? hasUsagePermission;
 
+  // Convenience getters
+  int get batteryLevel => battery.level;
+  bool get isCharging => battery.isCharging;
+
   DeviceTelemetry({
     required this.battery,
     required this.wifi,
