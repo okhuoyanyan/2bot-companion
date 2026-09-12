@@ -268,7 +268,7 @@ class MainActivity : FlutterActivity(), SensorEventListener {
             "isDnd" to isDnd
         )
 
-        // 4. Next Alarm
+        // 4. Next Alarm (仅采纳系统官方时钟/闹钟应用，严格排除日历、第三方后台保活心跳)
         val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
         val nextAlarmClock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && alarmManager != null) {
             alarmManager.nextAlarmClock
@@ -279,21 +279,66 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         val nextAlarm: Map<String, Any?>? = if (nextAlarmClock != null) {
             val triggerTime = nextAlarmClock.triggerTime
             val now = System.currentTimeMillis()
-            val triggerCal = Calendar.getInstance().apply { timeInMillis = triggerTime }
-            val nowCal = Calendar.getInstance().apply { timeInMillis = now }
 
-            val isTomorrow = (triggerCal.get(Calendar.YEAR) == nowCal.get(Calendar.YEAR) &&
-                    triggerCal.get(Calendar.DAY_OF_YEAR) == nowCal.get(Calendar.DAY_OF_YEAR) + 1)
-            val isToday = (triggerCal.get(Calendar.YEAR) == nowCal.get(Calendar.YEAR) &&
-                    triggerCal.get(Calendar.DAY_OF_YEAR) == nowCal.get(Calendar.DAY_OF_YEAR))
+            // 提取设置此闹钟的 App 包名
+            val creatorPackage = nextAlarmClock.showIntent?.creatorPackage ?: ""
+            val lowerPkg = creatorPackage.lowercase(Locale.ROOT)
 
-            val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(triggerTime))
-            val formatted = when {
-                isToday -> timeFormat
-                isTomorrow -> "明天 $timeFormat"
-                else -> SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(triggerTime))
+            // 解析系统默认时钟应用
+            val defaultClockPkg = try {
+                val clockIntent = Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS)
+                packageManager.resolveActivity(clockIntent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.packageName ?: ""
+            } catch (_: Exception) { "" }
+
+            val setAlarmPkg = try {
+                val setIntent = Intent(android.provider.AlarmClock.ACTION_SET_ALARM)
+                packageManager.resolveActivity(setIntent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.packageName ?: ""
+            } catch (_: Exception) { "" }
+
+            // 严格黑名单排除：日历、日程、社交、备忘录、天气、后台推送心跳
+            val isExcluded = lowerPkg.contains("calendar") ||
+                    lowerPkg.contains("schedule") ||
+                    lowerPkg.contains("tencent") ||
+                    lowerPkg.contains("wechat") ||
+                    lowerPkg.contains("dingtalk") ||
+                    lowerPkg.contains("weather") ||
+                    lowerPkg.contains("reminder") ||
+                    lowerPkg.contains("memo") ||
+                    lowerPkg.contains("notes")
+
+            // 严格白名单判定：系统默认时钟应用或已知主流厂商官方时钟应用
+            val isSystemClock = !isExcluded && (
+                    (creatorPackage.isNotEmpty() && (creatorPackage == defaultClockPkg || creatorPackage == setAlarmPkg)) ||
+                    lowerPkg.contains("deskclock") ||
+                    lowerPkg.contains("alarmclock") ||
+                    lowerPkg.contains("clockpackage") ||
+                    lowerPkg.endsWith(".clock")
+            )
+
+            // 若不是系统时钟，或者时间已过期，直接丢弃
+            if (!isSystemClock || triggerTime <= now) {
+                null
+            } else {
+                val triggerCal = Calendar.getInstance().apply { timeInMillis = triggerTime }
+                val nowCal = Calendar.getInstance().apply { timeInMillis = now }
+
+                val isTomorrow = (triggerCal.get(Calendar.YEAR) == nowCal.get(Calendar.YEAR) &&
+                        triggerCal.get(Calendar.DAY_OF_YEAR) == nowCal.get(Calendar.DAY_OF_YEAR) + 1)
+                val isToday = (triggerCal.get(Calendar.YEAR) == nowCal.get(Calendar.YEAR) &&
+                        triggerCal.get(Calendar.DAY_OF_YEAR) == nowCal.get(Calendar.DAY_OF_YEAR))
+
+                val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(triggerTime))
+                val formatted = when {
+                    isToday -> timeFormat
+                    isTomorrow -> "明天 $timeFormat"
+                    else -> SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(triggerTime))
+                }
+                mapOf(
+                    "triggerTime" to triggerTime,
+                    "formatted" to formatted,
+                    "package" to creatorPackage
+                )
             }
-            mapOf("triggerTime" to triggerTime, "formatted" to formatted)
         } else {
             null
         }
