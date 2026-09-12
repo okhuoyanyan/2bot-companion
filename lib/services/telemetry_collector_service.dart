@@ -67,6 +67,7 @@ class TelemetryCollectorService {
     int? screenTimeMinutes;
     bool? isIgnoringBatteryOptimizations;
     bool? hasUsagePermission;
+    LocationInfo? location;
 
     try {
       final nativeData =
@@ -85,6 +86,21 @@ class TelemetryCollectorService {
         isIgnoringBatteryOptimizations =
             nativeData['isIgnoringBatteryOptimizations'] as bool?;
         hasUsagePermission = nativeData['hasUsagePermission'] as bool?;
+
+        // 6. 原生双轨 WiFi SSID 兜底 (若 network_info_plus 获取失败，使用 Android 原生提取)
+        final nativeSsid = nativeData['nativeWifiSsid'] as String?;
+        if (wifiSsid.isEmpty && nativeSsid != null && nativeSsid.isNotEmpty) {
+          wifiSsid = nativeSsid;
+        }
+
+        // 7. GPS 经纬度位置信息解析 (v1.3.0)
+        if (nativeData['location'] != null) {
+          try {
+            location = LocationInfo.fromJson(
+              Map<String, dynamic>.from(nativeData['location'] as Map),
+            );
+          } catch (_) {}
+        }
       }
     } catch (_) {
       // 优雅静默降级为 null，确保原有电量、WiFi、屏幕状态 100% 稳定采集
@@ -111,6 +127,7 @@ class TelemetryCollectorService {
       screenTimeMinutes: screenTimeMinutes,
       isIgnoringBatteryOptimizations: isIgnoringBatteryOptimizations,
       hasUsagePermission: hasUsagePermission,
+      location: location,
     );
   }
 

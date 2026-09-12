@@ -12,9 +12,16 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
@@ -35,10 +42,24 @@ class MainActivity : FlutterActivity(), SensorEventListener {
     private var stepSensor: Sensor? = null
     private var currentTotalSteps: Int? = null
 
+    private var locationManager: LocationManager? = null
+    private var lastLocation: Location? = null
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            lastLocation = location
+        }
+        @Deprecated("Deprecated in Java")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         stepSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
     }
 
     override fun onResume() {
@@ -46,6 +67,12 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         stepSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
+        registerLocationUpdates()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        unregisterLocationUpdates()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -80,6 +107,13 @@ class MainActivity : FlutterActivity(), SensorEventListener {
                         result.success(checkUsagePermission())
                     } catch (e: Exception) {
                         result.error("USAGE_PERM_ERROR", e.localizedMessage, null)
+                    }
+                }
+                "getLocation" -> {
+                    try {
+                        result.success(collectLocation())
+                    } catch (e: Exception) {
+                        result.error("LOCATION_ERROR", e.localizedMessage, null)
                     }
                 }
                 else -> result.notImplemented()
@@ -302,7 +336,117 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         }
         map["screenTimeMinutes"] = screenTimeMinutes
 
+        // 7. Location (GPS / Network)
+        map["location"] = collectLocation()
+
+        // 8. Native WiFi SSID (Bypasses Flutter plugin limitations on Chinese ROMs)
+        map["nativeWifiSsid"] = collectNativeWifiSsid()
+
         return map
+    }
+
+    private fun registerLocationUpdates() {
+        val lm = locationManager ?: return
+        val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine && !hasCoarse) return
+
+        try {
+            if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 10000L, 10f, locationListener)
+            }
+            if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 10000L, 10f, locationListener)
+            }
+            val gpsLoc = try { lm.getLastKnownLocation(LocationManager.GPS_PROVIDER) } catch (_: Exception) { null }
+            val netLoc = try { lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) } catch (_: Exception) { null }
+            val passiveLoc = try { lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER) } catch (_: Exception) { null }
+
+            val best = listOfNotNull(lastLocation, gpsLoc, netLoc, passiveLoc).maxByOrNull { it.time }
+            if (best != null) {
+                lastLocation = best
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun unregisterLocationUpdates() {
+        try {
+            locationManager?.removeUpdates(locationListener)
+        } catch (_: Exception) {}
+    }
+
+    private fun collectLocation(): Map<String, Any?>? {
+        val lm = locationManager ?: return null
+        val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine && !hasCoarse) return null
+
+        try {
+            val gpsLoc = try { lm.getLastKnownLocation(LocationManager.GPS_PROVIDER) } catch (_: Exception) { null }
+            val netLoc = try { lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) } catch (_: Exception) { null }
+            val passiveLoc = try { lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER) } catch (_: Exception) { null }
+
+            val candidates = listOfNotNull(lastLocation, gpsLoc, netLoc, passiveLoc)
+            if (candidates.isEmpty()) return null
+
+            val best = candidates.maxByOrNull { it.time } ?: return null
+
+            return mapOf(
+                "latitude" to best.latitude,
+                "longitude" to best.longitude,
+                "accuracy" to best.accuracy.toDouble(),
+                "altitude" to best.altitude,
+                "speed" to best.speed.toDouble(),
+                "bearing" to best.bearing.toDouble(),
+                "provider" to (best.provider ?: "unknown"),
+                "time" to best.time
+            )
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun collectNativeWifiSsid(): String? {
+        val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine && !hasCoarse) return null
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val activeNetwork = connManager?.activeNetwork
+                if (activeNetwork != null) {
+                    val caps = connManager.getNetworkCapabilities(activeNetwork)
+                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                        val wifiInfo = caps.transportInfo as? WifiInfo
+                        if (wifiInfo != null) {
+                            var ssid = wifiInfo.ssid
+                            if (ssid != null) {
+                                if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length >= 2) {
+                                    ssid = ssid.substring(1, ssid.length - 1)
+                                }
+                                if (ssid.isNotEmpty() && ssid != "<unknown ssid>") {
+                                    return ssid
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val info = wifiManager?.connectionInfo
+            var ssid = info?.ssid
+            if (ssid != null) {
+                if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length >= 2) {
+                    ssid = ssid.substring(1, ssid.length - 1)
+                }
+                if (ssid.isNotEmpty() && ssid != "<unknown ssid>") {
+                    return ssid
+                }
+            }
+        } catch (_: Exception) {}
+        return null
     }
 
     private fun checkUsagePermission(): Boolean {

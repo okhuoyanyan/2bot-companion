@@ -258,7 +258,7 @@ class QuickActions extends StatelessWidget {
                 const SizedBox(width: 10),
                 const Expanded(
                   child: Text(
-                    '读取 WiFi 名称需开启系统定位权限',
+                    '获取 GPS 经纬度与 WiFi 名称需开启位置权限',
                     style: TextStyle(
                       fontSize: 12,
                       color: AppTheme.warningAmber,

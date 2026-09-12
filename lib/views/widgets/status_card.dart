@@ -280,6 +280,87 @@ class StatusCard extends StatelessWidget {
                 ),
               ],
             ),
+            if (snapshot?.location != null) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppTheme.cardBorder, width: 0.8),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.location_on_rounded,
+                        size: 20, color: AppTheme.primaryCyan),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Text(
+                                'GPS 定位坐标',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: AppTheme.textMuted,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 1),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.primaryCyan.withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  snapshot!.location!.provider?.toUpperCase() ?? 'GPS',
+                                  style: const TextStyle(
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.bold,
+                                    color: AppTheme.primaryCyan,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            '${snapshot!.location!.latitude.toStringAsFixed(6)}°, ${snapshot!.location!.longitude.toStringAsFixed(6)}°',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: AppTheme.textPrimary,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (snapshot!.location!.accuracy != null)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: AppTheme.cardSurface,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: AppTheme.cardBorder),
+                        ),
+                        child: Text(
+                          '±${snapshot!.location!.accuracy!.toStringAsFixed(0)}m',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: AppTheme.accentEmerald,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 18),
             const Divider(color: AppTheme.cardBorder, height: 1),
             const SizedBox(height: 14),
