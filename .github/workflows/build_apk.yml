@@ -63,6 +63,30 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: 📝 Extract Release Notes from CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ -f CHANGELOG.md ]; then
+            python3 -c "
+          import sys, re
+          tag = sys.argv[1]
+          with open('CHANGELOG.md', 'r', encoding='utf-8') as f:
+              content = f.read()
+          pattern = r'## \[' + re.escape(tag) + r'\][^\n]*\n(.*?)(?=\n## \[|\Z)'
+          match = re.search(pattern, content, re.DOTALL)
+          if match:
+              notes = match.group(1).strip()
+              with open('RELEASE_BODY.md', 'w', encoding='utf-8') as out:
+                  out.write(f'# 2BOT 伴侣端 {tag} 发布说明\n\n' + notes + '\n\n---\n### 📦 安装包直链下载\n直接下载下方附件中的 `app-release.apk` 即可在 Android 手机直接安装使用。')
+          else:
+              with open('RELEASE_BODY.md', 'w', encoding='utf-8') as out:
+                  out.write(f'# 2BOT 伴侣端 {tag}\n\n100% 纯血开源、0 广告、超低功耗设备状态感知客户端。\n\n直接下载下方附件中的 `app-release.apk` 即可安装使用。')
+          " "$TAG"
+          else
+            echo "2BOT 伴侣端 $TAG 发布" > RELEASE_BODY.md
+          fi
+
       - name: 🌟 Create GitHub Release (On Version Tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -71,13 +95,7 @@ jobs:
             build/app/outputs/flutter-apk/app-release.apk
             build/app/outputs/flutter-apk/${{ steps.prep.outputs.apk_name }}
           name: 2BOT 伴侣端 ${{ github.ref_name }}
-          body: |
-            ### 2BOT 官方 Android 专属轻量伴侣端 (`2bot-companion`) 发布
-            - **版本标号**：${{ github.ref_name }}
-            - **构建时间**：${{ steps.prep.outputs.build_time }}
-            - **核心特性**：100% 纯血开源、0 广告、0 商业 SDK、超低功耗设备状态上报与生命脉搏双驱动保活。
-            
-            直接下载下方的 `app-release.apk` 即可在 Android 手机上直接安装使用！
+          body_path: RELEASE_BODY.md
           draft: false
           prerelease: false
         env:
