@@ -36,18 +36,18 @@ class TelemetryCollectorService {
       wifiConnected = connectivityResult.contains(ConnectivityResult.wifi);
 
       if (wifiConnected) {
-        // Android 10+ 需具备定位权限方能提取 SSID
-        final hasLocationPerm = await Permission.location.isGranted;
-        if (hasLocationPerm) {
+        try {
           final rawSsid = await _networkInfo.getWifiName();
           if (rawSsid != null) {
             // 清理 Android 可能包裹的双引号以及异常未知标识
-            wifiSsid = rawSsid.replaceAll('"', '').trim();
-            if (wifiSsid == '<unknown ssid>' || wifiSsid == '0x') {
-              wifiSsid = '';
+            final cleaned = rawSsid.replaceAll('"', '').trim();
+            if (cleaned.isNotEmpty &&
+                cleaned != '<unknown ssid>' &&
+                cleaned != '0x') {
+              wifiSsid = cleaned;
             }
           }
-        }
+        } catch (_) {}
       }
     } catch (_) {}
 
@@ -87,10 +87,11 @@ class TelemetryCollectorService {
             nativeData['isIgnoringBatteryOptimizations'] as bool?;
         hasUsagePermission = nativeData['hasUsagePermission'] as bool?;
 
-        // 6. 原生双轨 WiFi SSID 兜底 (若 network_info_plus 获取失败，使用 Android 原生提取)
+        // 6. 原生双轨 WiFi SSID 兜底 (突破 Android 12+ / TargetSdk 35 脱敏限制)
         final nativeSsid = nativeData['nativeWifiSsid'] as String?;
-        if (wifiSsid.isEmpty && nativeSsid != null && nativeSsid.isNotEmpty) {
+        if (nativeSsid != null && nativeSsid.isNotEmpty) {
           wifiSsid = nativeSsid;
+          wifiConnected = true;
         }
 
         // 7. GPS 经纬度位置信息解析 (v1.3.0)

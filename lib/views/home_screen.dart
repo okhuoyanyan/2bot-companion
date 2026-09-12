@@ -361,7 +361,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 borderRadius: BorderRadius.circular(6),
               ),
               child: const Text(
-                'v1.3.0',
+                'v1.3.1',
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,

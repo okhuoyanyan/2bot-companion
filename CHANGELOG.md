@@ -2,6 +2,18 @@
 
 本文档记录 2BOT 官方 Android 专属轻量伴侣端的所有重要版本迭代与更新细节。
 
+## [v1.3.1] - 2026-09-12
+
+### 📶 突破 Android 12+ / TargetSdk 35 脱敏限制，实现真实 WiFi SSID 毫秒级捕获
+
+- **Kotlin 底层引入 `FLAG_INCLUDE_LOCATION_INFO` 网络监听器**：
+  - 针对 TargetSdk 35（Android 15）及 Android 12+ 对同步查询 `getNetworkCapabilities()` 与 `getConnectionInfo()` 的硬脱敏（默认强制返回 `<unknown ssid>`）机制，全面重构底层网络感知架构；
+  - 挂载官方 `ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO)` 监听器，并在应用启动与前台活跃时主动探测，系统底层放行未脱敏的真实 WiFi SSID；
+  - 建立原子级内存缓存，一旦网络连通即刻解析并持久驻留，彻底根治国内各厂商定制系统下 SSID 被掩盖置空的问题。
+- **重构 Flutter 层网络感知通道**：
+  - 彻底移除对 `Permission.location.isGranted` 的过度防御拦截，避免 Android 11+“仅在使用中允许”权限被 Flutter 误判为未授权的问题；
+  - 强化双轨兜底逻辑：若原生监听捕获到有效 SSID，无条件同步校正 WiFi 连接状态，杜绝界面与服务端状态断层。
+
 ---
 
 ## [v1.3.0] - 2026-09-12

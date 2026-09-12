@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.3.0+4
+version: 1.3.1+5
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

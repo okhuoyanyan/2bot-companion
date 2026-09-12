@@ -18,7 +18,9 @@ import android.location.LocationManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
@@ -45,6 +47,9 @@ class MainActivity : FlutterActivity(), SensorEventListener {
     private var locationManager: LocationManager? = null
     private var lastLocation: Location? = null
 
+    private var currentWifiSsid: String? = null
+    private var wifiNetworkCallback: ConnectivityManager.NetworkCallback? = null
+
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
             lastLocation = location
@@ -60,6 +65,7 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         stepSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         locationManager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        registerWifiNetworkCallback()
     }
 
     override fun onResume() {
@@ -68,11 +74,18 @@ class MainActivity : FlutterActivity(), SensorEventListener {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
         registerLocationUpdates()
+        registerWifiNetworkCallback()
     }
 
     override fun onPause() {
         super.onPause()
         unregisterLocationUpdates()
+        unregisterWifiNetworkCallback()
+    }
+
+    override fun onDestroy() {
+        unregisterWifiNetworkCallback()
+        super.onDestroy()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -406,47 +419,106 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         }
     }
 
-    private fun collectNativeWifiSsid(): String? {
+    private fun registerWifiNetworkCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        if (!hasFine && !hasCoarse) return null
+        if (!hasFine && !hasCoarse) return
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val activeNetwork = connManager?.activeNetwork
-                if (activeNetwork != null) {
-                    val caps = connManager.getNetworkCapabilities(activeNetwork)
-                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                        val wifiInfo = caps.transportInfo as? WifiInfo
-                        if (wifiInfo != null) {
-                            var ssid = wifiInfo.ssid
-                            if (ssid != null) {
-                                if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length >= 2) {
-                                    ssid = ssid.substring(1, ssid.length - 1)
-                                }
-                                if (ssid.isNotEmpty() && ssid != "<unknown ssid>") {
-                                    return ssid
-                                }
-                            }
+            // Immediately probe current connection
+            val activeNetwork = cm.activeNetwork
+            if (activeNetwork != null) {
+                val caps = cm.getNetworkCapabilities(activeNetwork)
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    val wifiInfo = caps.transportInfo as? WifiInfo
+                    extractSsid(wifiInfo)?.let { currentWifiSsid = it }
+                }
+            }
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            extractSsid(wm?.connectionInfo)?.let { currentWifiSsid = it }
+
+            // Register asynchronous NetworkCallback
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    wifiNetworkCallback = object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+                        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                            val wifiInfo = caps.transportInfo as? WifiInfo
+                            extractSsid(wifiInfo)?.let { currentWifiSsid = it }
                         }
+                        override fun onLost(network: Network) {
+                            currentWifiSsid = null
+                        }
+                    }
+                    cm.registerNetworkCallback(request, wifiNetworkCallback!!)
+                    return
+                } catch (_: Exception) {}
+            }
+
+            wifiNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    val wifiInfo = caps.transportInfo as? WifiInfo
+                    extractSsid(wifiInfo)?.let { currentWifiSsid = it }
+                }
+                override fun onLost(network: Network) {
+                    currentWifiSsid = null
+                }
+            }
+            cm.registerNetworkCallback(request, wifiNetworkCallback!!)
+        } catch (_: Exception) {}
+    }
+
+    private fun unregisterWifiNetworkCallback() {
+        try {
+            wifiNetworkCallback?.let {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                cm?.unregisterNetworkCallback(it)
+            }
+        } catch (_: Exception) {}
+        wifiNetworkCallback = null
+    }
+
+    private fun extractSsid(wifiInfo: WifiInfo?): String? {
+        if (wifiInfo == null) return null
+        var ssid = wifiInfo.ssid ?: return null
+        if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length >= 2) {
+            ssid = ssid.substring(1, ssid.length - 1)
+        }
+        return if (ssid.isNotEmpty() && ssid != "<unknown ssid>" && ssid != "0x") ssid else null
+    }
+
+    private fun collectNativeWifiSsid(): String? {
+        if (!currentWifiSsid.isNullOrEmpty()) {
+            return currentWifiSsid
+        }
+
+        try {
+            val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val activeNetwork = connManager?.activeNetwork
+            if (activeNetwork != null) {
+                val caps = connManager.getNetworkCapabilities(activeNetwork)
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    val wifiInfo = caps.transportInfo as? WifiInfo
+                    extractSsid(wifiInfo)?.let {
+                        currentWifiSsid = it
+                        return it
                     }
                 }
             }
 
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             val info = wifiManager?.connectionInfo
-            var ssid = info?.ssid
-            if (ssid != null) {
-                if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length >= 2) {
-                    ssid = ssid.substring(1, ssid.length - 1)
-                }
-                if (ssid.isNotEmpty() && ssid != "<unknown ssid>") {
-                    return ssid
-                }
+            extractSsid(info)?.let {
+                currentWifiSsid = it
+                return it
             }
         } catch (_: Exception) {}
-        return null
+
+        return currentWifiSsid
     }
 
     private fun checkUsagePermission(): Boolean {
