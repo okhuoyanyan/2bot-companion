@@ -64,7 +64,7 @@ jobs:
           flutter test 2>&1 | tee /tmp/test.log
           code=${PIPESTATUS[0]}
           if [ $code -ne 0 ]; then
-            grep -m 12 -E "Failed to load|Error:|error •" /tmp/test.log | while IFS= read -r l; do echo "::error::$l"; done
+            grep -m 12 -E "Failed to load|Error:|error •|Expected:|Actual:|\[E\]|Test failed|Which:" /tmp/test.log | while IFS= read -r l; do echo "::error::$l"; done
           fi
           exit $code
 
