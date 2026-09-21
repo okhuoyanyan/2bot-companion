@@ -90,7 +90,17 @@ jobs:
           fi
 
       - name: 🔨 Build Release APK
-        run: flutter build apk --release
+        run: |
+          set +e
+          flutter build apk --release 2>&1 | tee /tmp/build.log
+          code=${PIPESTATUS[0]}
+          if [ $code -ne 0 ]; then
+            # 公开失败详情（同 §六 模式）：Actions 原始日志需登录，注解面板公开可读
+            grep -m 12 -E "FAILURE|Execution failed|Keystore|keystore|GradleException|Caused by|error:" /tmp/build.log | while IFS= read -r l; do echo "::error::$l"; done
+            echo "::error::---- gradle 构建日志尾部（兜底公开） ----"
+            grep -v '✅' /tmp/build.log | tail -n 30 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $code
 
       # WO-36-RELEASE §1：签名指纹公开核验（教训 14 ——「已用新密钥」不能是自述，
       # 必须有免登录可见的公开证据）。预期指纹由管理员侧 keystore 独立核对。
