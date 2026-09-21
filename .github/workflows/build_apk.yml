@@ -77,11 +77,15 @@ jobs:
         run: |
           if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
             echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
+            # 注：本 keystore 为 openssl 生成的 PKCS12 —— **PKCS12 只有一个口令**，
+            # `openssl pkcs12 -export` 的 -passout 同时用于整库完整性与私钥加密，不存在独立密钥口令。
+            # 故 keyPassword 必须与 storePassword 同值；ANDROID_KEY_PASSWORD 已不再被使用
+            # （若日后改用 keytool 生成支持双口令的 JKS，可恢复为 secrets.ANDROID_KEY_PASSWORD）。
             cat > android/key.properties <<EOF
           storeFile=upload-keystore.jks
           storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
           keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          keyPassword=${{ secrets.ANDROID_STORE_PASSWORD }}
           EOF
             echo "✅ 已注入新 keystore（WO-36 密钥轮换生效）"
           else
