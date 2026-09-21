@@ -43,6 +43,11 @@ jobs:
       - name: 📦 Install Flutter Dependencies
         run: flutter pub get
 
+      # WO-36-MOBILE-CI-FIX §四：静态分析前置 —— 类型/编译错误在此给出**精确到行**的报错，
+      # 避免重蹈 run #22「0 tests passed, 2 failed」这类无细节的加载失败
+      - name: 🔎 Static Analysis
+        run: flutter analyze --no-fatal-infos
+
       # WO-36 §3.3：Dart 单测进 CI（协议帧 / 重试 / dot-stuffing / ENC1 跨语言 KAT）
       - name: 🧪 Run Dart Unit Tests
         run: flutter test

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:encrypt/encrypt.dart' as enc;
 
@@ -27,13 +28,16 @@ class MailProtocol {
   }
 
   /// 校验并归一化 32 字节 hex 密钥；非法返回 null（调用方据此放弃本封，**严禁明文降级**）
-  static List<int>? normalizeKeyHex(String keyHex) {
+  ///
+  /// 返回 `Uint8List?`：`encrypt` 5.0.3 的 `Key`/`IV`/`Encrypted` 构造签名均要求 `Uint8List`，
+  /// 转换点集中在本函数，避免散落的类型强转。
+  static Uint8List? normalizeKeyHex(String keyHex) {
     final trimmed = keyHex.trim();
     if (trimmed.length != keyByteLength * 2) return null;
     if (!RegExp(r'^[0-9a-fA-F]+$').hasMatch(trimmed)) return null;
-    final out = <int>[];
-    for (var i = 0; i < trimmed.length; i += 2) {
-      out.add(int.parse(trimmed.substring(i, i + 2), radix: 16));
+    final out = Uint8List(keyByteLength);
+    for (var i = 0; i < keyByteLength; i++) {
+      out[i] = int.parse(trimmed.substring(i * 2, i * 2 + 2), radix: 16);
     }
     return out;
   }
@@ -45,8 +49,9 @@ class MailProtocol {
     final keyBytes = normalizeKeyHex(keyHex);
     if (keyBytes == null) return null;
 
-    final ivBytes = ivOverride ??
-        List<int>.generate(ivByteLength, (_) => _secureRandomByte());
+    final ivBytes = Uint8List.fromList(
+      ivOverride ?? List<int>.generate(ivByteLength, (_) => _secureRandomByte()),
+    );
     if (ivBytes.length != ivByteLength) return null;
 
     try {
@@ -85,7 +90,7 @@ class MailProtocol {
 
       final encrypter = enc.Encrypter(enc.AES(enc.Key(keyBytes), mode: enc.AESMode.gcm));
       final plain = encrypter.decryptBytes(
-        enc.Encrypted(<int>[...ct, ...tag]),
+        enc.Encrypted(Uint8List.fromList(<int>[...ct, ...tag])),
         iv: enc.IV(ivBytes),
       );
       return utf8.decode(plain);
