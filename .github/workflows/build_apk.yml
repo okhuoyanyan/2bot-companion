@@ -66,9 +66,9 @@ jobs:
           if [ $code -ne 0 ]; then
             # 先按已知模式精提（命中则逐条注解）
             grep -m 12 -E "Failed to load|Error:|error •|Expected:|Actual:|\[E\]|Test failed|Which:" /tmp/test.log | while IFS= read -r l; do echo "::error::$l"; done
-            # 兜底：无论措辞如何，无条件公开日志尾部 30 行（Actions 原始日志需登录，注解面板公开可读）
-            echo "::error::---- flutter test 日志尾部（兜底全量公开） ----"
-            tail -n 30 /tmp/test.log | while IFS= read -r l; do echo "::error::$l"; done
+            # 兜底：剔除「通过用例」摘要行后 dump 尾部 —— 剩余的即为失败块（Actions 原始日志需登录，注解公开可读）
+            echo "::error::---- flutter test 失败块（已剔除 ✅ 通过行） ----"
+            grep -v '✅' /tmp/test.log | tail -n 40 | while IFS= read -r l; do echo "::error::$l"; done
           fi
           exit $code
 
