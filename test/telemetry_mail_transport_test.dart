@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bot_companion/services/telemetry_mail_transport.dart';
@@ -43,7 +45,10 @@ void main() {
       expect(sent[0], equals('EHLO 2bot-companion'));
       expect(sent[1], equals('AUTH LOGIN'));
       expect(sent[2], equals('Zml4dHVyZUBleGFtcGxlLmludmFsaWQ='), reason: '应为 base64 账号');
-      expect(sent[3], equals('RklYVFVSRUtDT0RF'), reason: '应为 base64 授权码');
+      // 授权码行：硬编码字面量易手打错（CI #29 即栽在 RUtD/RS1D 一个字符上），
+      // 故既锁定字面量，又反向解码自校验 —— 双保险，任一侧错都爆红。
+      expect(sent[3], equals('RklYVFVSRS1DT0RF'), reason: '应为 base64 授权码');
+      expect(utf8.decode(base64.decode(sent[3])), equals('FIXTURE-CODE'), reason: 'base64 必须可还原回授权码原文');
       expect(sent[4], equals('MAIL FROM:<fixture@example.invalid>'));
       expect(sent[5], equals('RCPT TO:<fixture@example.invalid>'));
       expect(sent[6], equals('DATA'));
