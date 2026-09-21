@@ -85,11 +85,35 @@ jobs:
           EOF
             echo "✅ 已注入新 keystore（WO-36 密钥轮换生效）"
           else
-            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64 —— 回退使用仓库内旧 keystore。旧密钥永久视为泄露，请尽快完成轮换（§3.3）！"
+            echo "::error::未配置 ANDROID_KEYSTORE_BASE64 —— release 签名无法进行。旧 keystore 已彻底退出签名链（永久视为泄露），本工作流不再提供任何回退路径。请在仓库 Settings → Secrets and variables → Actions 配置 ANDROID_KEYSTORE_BASE64 / ANDROID_STORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD 后重试。"
+            exit 1
           fi
 
       - name: 🔨 Build Release APK
         run: flutter build apk --release
+
+      # WO-36-RELEASE §1：签名指纹公开核验（教训 14 ——「已用新密钥」不能是自述，
+      # 必须有免登录可见的公开证据）。预期指纹由管理员侧 keystore 独立核对。
+      - name: 🔍 Verify APK Signing Fingerprint
+        run: |
+          set +e
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          echo "::notice::APK 签名证书指纹（SHA256）："
+          keytool -printcert -jarfile "$APK" 2>&1 | tee /tmp/cert.log
+          FP=$(grep -i "SHA256:" /tmp/cert.log | head -1 | sed 's/.*SHA256: //' | tr -d '\r')
+          echo "::notice::SHA256 = ${FP}"
+          echo "### 🔐 APK 签名指纹（SHA256）" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${FP}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "预期: 84:16:0A:1A:43:AB:7F:C4:EE:E7:E7:9D:84:A5:F2:FA:AC:23:6D:D0:C6:F6:B6:38:D6:EB:08:5A:CA:51:7C:55" >> $GITHUB_STEP_SUMMARY
+          EXPECTED="84:16:0A:1A:43:AB:7F:C4:EE:E7:E7:9D:84:A5:F2:FA:AC:23:6D:D0:C6:F6:B6:38:D6:EB:08:5A:CA:51:7C:55"
+          if [ "$FP" = "$EXPECTED" ]; then
+            echo "::notice::✅ 签名指纹与预期一致 —— 确认由新 KEY 签发"
+          else
+            echo "::error::签名指纹与预期不一致！实际 ${FP}，预期 ${EXPECTED} —— 可能仍在使用旧密钥或 Secrets 配置有误，请勿分发。"
+            exit 1
+          fi
 
       - name: 🏷️ Prepare APK Artifact Name
         id: prep

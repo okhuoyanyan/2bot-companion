@@ -70,19 +70,24 @@ android {
                 keyAlias keystoreProperties.getProperty('keyAlias')
                 keyPassword keystoreProperties.getProperty('keyPassword')
             } else {
-                // 回退兼容：未注入 key.properties 时沿用仓库内旧 keystore（旧密钥永久视为泄露，
-                // 仅供密钥轮换收口前的过渡联调；轮换完成后本分支随 git rm --cached 一并移除）
-                storeFile file('twobot-release.jks')
-                storePassword 'twobot123'
-                keyAlias 'twobot'
-                keyPassword 'twobot123'
+                // WO-36-RELEASE §1：旧 keystore 已彻底退出签名链（永久视为泄露）。
+                // 缺 key.properties 一律**显式失败**，杜绝任何静默回退到旧密钥的可能。
+                throw new GradleException(
+                    "缺少 android/key.properties —— 无法完成 release 签名。\n" +
+                    "CI 环境：请在仓库 Settings → Secrets and variables → Actions 配置 " +
+                    "ANDROID_KEYSTORE_BASE64 / ANDROID_STORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD，" +
+                    "workflow 会据其生成 key.properties 与 keystore 文件。\n" +
+                    "本地环境：请在 android/key.properties 填入 storeFile / storeType / storePassword / keyAlias / keyPassword。"
+                )
             }
         }
     }
 
     buildTypes {
         release {
-            signingConfig file('twobot-release.jks').exists() ? signingConfigs.release : signingConfigs.debug
+            // WO-36-RELEASE §1：签名配置恒为 release（key.properties 缺失时已于 signingConfigs 内显式失败，
+            // 不再存在"旧 keystore 在则 release、否则退 debug"的静默降级路径）
+            signingConfig signingConfigs.release
             minifyEnabled false
             shrinkResources false
         }
