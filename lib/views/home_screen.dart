@@ -276,7 +276,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     // 若当前前台服务正在运行，热重启服务以应用新频率
     if (_isServiceRunning) {
-      await BackgroundTaskService.startService(interval);
+      await BackgroundTaskService.startService(values.intervalMinutes);
     }
 
     if (!mounted) return;

@@ -218,7 +218,9 @@ class SmtpMailer {
     ).timeout(timeout);
 
     final iterator = StreamIterator<String>(
-      socket.transform(utf8.decoder).transform(const LineSplitter()),
+      // cast 必要：SecureSocket 是 Stream<Uint8List>，而 utf8.decoder 是
+      // StreamTransformer<List<int>, String>，因逆变不可直接赋给 StreamTransformer<Uint8List, _>。
+      socket.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter()),
     );
 
     try {
