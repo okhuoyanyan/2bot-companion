@@ -36,7 +36,9 @@ void main() {
       sent.add(s.onResponseLine('250 OK')!);
       sent.add(s.onResponseLine('354 End data with <CR><LF>.<CR><LF>')!);
       sent.add(s.onResponseLine('250 OK queued')!);
-      sent.add(s.onResponseLine('221 Bye')!);
+      // 221 终态：会话结束，状态机正确地返回 null（无后续命令）——不得用 `!`
+      expect(s.onResponseLine('221 Bye'), isNull, reason: '221 终态后不应再产出命令');
+      expect(s.done, isTrue);
 
       expect(sent[0], equals('EHLO 2bot-companion'));
       expect(sent[1], equals('AUTH LOGIN'));
