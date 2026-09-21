@@ -12,7 +12,18 @@ class AppConstants {
   // 上报频率可选列表（分钟）
   static const List<int> availableIntervals = [5, 10, 15, 30];
 
-  // SharedPreferences 键名
+  // ============================================================
+  // WO-36 传输层双模：relay（旧 HTTP 中继，原样保留 = 回滚能力）/ mail（QQ 邮箱信道）
+  // ============================================================
+  static const String transportRelay = 'relay';
+  static const String transportMail = 'mail';
+
+  /// 邮件主题前缀，须与 NAS 侧 config.deviceTelemetry.mail.subjectPrefix 逐字一致
+  static const String defaultSubjectPrefix = 'X-2BOT-TEL';
+  static const String defaultSmtpHost = 'smtp.qq.com';
+  static const int defaultSmtpPort = 465;
+
+  // SharedPreferences 键名（非敏感配置）
   static const String keyRelayUrl = 'pref_relay_url';
   static const String keyDeviceToken = 'pref_device_token';
   static const String keyIntervalMinutes = 'pref_interval_minutes';
@@ -20,6 +31,14 @@ class AppConstants {
   static const String keyLastReportTime = 'pref_last_report_time';
   static const String keyLastReportStatus = 'pref_last_report_status';
   static const String keyLastErrorMessage = 'pref_last_error_message';
+  static const String keyTransportMode = 'pref_transport_mode';
+  static const String keyMailAccount = 'pref_mail_account';
+  static const String keyMailRecipient = 'pref_mail_recipient';
+  static const String keyMailSubjectPrefix = 'pref_mail_subject_prefix';
+
+  // 安全存储键名（flutter_secure_storage；**授权码与加密密钥严禁明文落 SharedPreferences**）
+  static const String secKeyMailAuthCode = 'sec_mail_auth_code';
+  static const String secKeyMailCryptKey = 'sec_mail_crypt_key';
 
   // 前台服务通知配置
   static const String notificationChannelId = '2bot_companion_channel';

@@ -257,11 +257,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   /// 保存设置
-  Future<void> _handleSaveConfig(String url, String token, int interval) async {
+  ///
+  /// WO-36：入参收敛为 [ConfigFormValues]（relay 旧字段 + 传输模式 + 邮箱参数）。
+  /// 邮箱凭据留空表示「保持既有不变」，由 StorageService 侧按 null 语义处理，
+  /// 故此处对空串直接传 null，避免误清空安全存储中已配置的授权码/密钥。
+  Future<void> _handleSaveConfig(ConfigFormValues values) async {
     await StorageService.saveConfig(
-      relayUrl: url,
-      deviceToken: token,
-      intervalMinutes: interval,
+      relayUrl: values.relayUrl,
+      deviceToken: values.deviceToken,
+      intervalMinutes: values.intervalMinutes,
+      transportMode: values.transportMode,
+      mailAccount: values.mailAccount,
+      mailRecipient: values.mailRecipient,
+      mailSubjectPrefix: values.mailSubjectPrefix,
+      mailAuthCode: values.mailAuthCode.isEmpty ? null : values.mailAuthCode,
+      mailCryptKey: values.mailCryptKey.isEmpty ? null : values.mailCryptKey,
     );
 
     // 若当前前台服务正在运行，热重启服务以应用新频率
@@ -462,11 +472,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               onRequestNotificationPermission: _handleRequestNotificationPermission,
             ),
 
-            // 3. 云端通信与中继配置卡片
+            // 3. 传输信道与上报配置卡片（WO-36：relay / 邮箱双模）
             ConfigCard(
-              initialRelayUrl: _settings.relayUrl,
-              initialToken: _settings.deviceToken,
-              initialIntervalMinutes: _settings.intervalMinutes,
+              initialSettings: _settings,
               onSave: _handleSaveConfig,
             ),
 

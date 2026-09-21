@@ -48,3 +48,12 @@ app.*.map.json
 /android/gradlew
 /android/gradlew.bat
 /android/gradle/wrapper/gradle-wrapper.jar
+
+# WO-36 签名密钥轮换：keystore 与两级密码一律不进仓库
+# （旧密钥永久视为泄露；新密钥经 GitHub Secrets 在 CI 注入生成 key.properties）
+# 注：仓库中已存在的 android/app/twobot-release.jks 仍被跟踪——按 §3.3 顺序，
+#    待 Secrets 配置完成、CI 构建验证通过后再执行 `git rm --cached` 摘除。
+key.properties
+/android/key.properties
+*.jks
+*.keystore

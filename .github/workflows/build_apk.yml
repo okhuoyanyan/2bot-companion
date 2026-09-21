@@ -43,6 +43,26 @@ jobs:
       - name: 📦 Install Flutter Dependencies
         run: flutter pub get
 
+      # WO-36 §3.3：Dart 单测进 CI（协议帧 / 重试 / dot-stuffing / ENC1 跨语言 KAT）
+      - name: 🧪 Run Dart Unit Tests
+        run: flutter test
+
+      # WO-36 §3.3：签名凭据经 GitHub Secrets 注入，keystore 与 key.properties 均不落仓库
+      - name: 🔐 Inject Signing Credentials (from Secrets)
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
+            cat > android/key.properties <<EOF
+          storeFile=upload-keystore.jks
+          storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+            echo "✅ 已注入新 keystore（WO-36 密钥轮换生效）"
+          else
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64 —— 回退使用仓库内旧 keystore。旧密钥永久视为泄露，请尽快完成轮换（§3.3）！"
+          fi
+
       - name: 🔨 Build Release APK
         run: flutter build apk --release
 

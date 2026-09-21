@@ -22,6 +22,15 @@ if (flutterVersionName == null) {
     flutterVersionName = '1.0.0'
 }
 
+// WO-36 §3.3：签名凭据从 key.properties 读取（该文件由 CI 依 GitHub Secrets 在构建期生成，已被 .gitignore 排除）
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('key.properties')
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withReader('UTF-8') { reader ->
+        keystoreProperties.load(reader)
+    }
+}
+
 android {
     namespace "com.twobot.companion"
     compileSdk 35
@@ -50,10 +59,24 @@ android {
 
     signingConfigs {
         release {
-            storeFile file('twobot-release.jks')
-            storePassword 'twobot123'
-            keyAlias 'twobot'
-            keyPassword 'twobot123'
+            // WO-36 §3.3：优先从 CI 注入的 key.properties 读取（密钥经 GitHub Secrets 下发，
+            // keystore 文件由 workflow 在构建期生成，二者均不落仓库）。
+            def storeFilePath = keystoreProperties.getProperty('storeFile')
+            if (storeFilePath != null) {
+                storeFile file(storeFilePath)
+                // WO-36 §3.3.1：新密钥由 openssl 生成 PKCS12；此处显式声明以免受 JDK 默认 storeType 漂移影响
+                storeType keystoreProperties.getProperty('storeType') ?: 'PKCS12'
+                storePassword keystoreProperties.getProperty('storePassword')
+                keyAlias keystoreProperties.getProperty('keyAlias')
+                keyPassword keystoreProperties.getProperty('keyPassword')
+            } else {
+                // 回退兼容：未注入 key.properties 时沿用仓库内旧 keystore（旧密钥永久视为泄露，
+                // 仅供密钥轮换收口前的过渡联调；轮换完成后本分支随 git rm --cached 一并移除）
+                storeFile file('twobot-release.jks')
+                storePassword 'twobot123'
+                keyAlias 'twobot'
+                keyPassword 'twobot123'
+            }
         }
     }
 
