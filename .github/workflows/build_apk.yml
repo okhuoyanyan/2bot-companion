@@ -43,14 +43,30 @@ jobs:
       - name: 📦 Install Flutter Dependencies
         run: flutter pub get
 
-      # WO-36-MOBILE-CI-FIX §四：静态分析前置 —— 类型/编译错误在此给出**精确到行**的报错，
-      # 避免重蹈 run #22「0 tests passed, 2 failed」这类无细节的加载失败
-      - name: 🔎 Static Analysis
-        run: flutter analyze --no-fatal-infos
+      # WO-36-MOBILE-CI-FIX §六(a)：静态分析**只让真错误致命**（--no-fatal-warnings/--no-fatal-infos）。
+      # 比 `|| true` 更正确：保留"编译错误必须拦住构建"的能力，同时不被存量告警阻塞。
+      # 失败时把 error 行以 ::error:: 注解公开输出（Actions 原始日志需登录，注解面板公开可读）。
+      - name: 🔎 Static Analysis (仅错误致命)
+        run: |
+          set +e
+          flutter analyze --no-fatal-warnings --no-fatal-infos 2>&1 | tee /tmp/analyze.log
+          code=${PIPESTATUS[0]}
+          if [ $code -ne 0 ]; then
+            grep -m 12 -E "^\s*error" /tmp/analyze.log | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $code
 
       # WO-36 §3.3：Dart 单测进 CI（协议帧 / 重试 / dot-stuffing / ENC1 跨语言 KAT）
+      # WO-36-MOBILE-CI-FIX §六(b)：失败详情同样以 ::error:: 注解公开输出，解决"日志需登录"的可观测性盲区。
       - name: 🧪 Run Dart Unit Tests
-        run: flutter test
+        run: |
+          set +e
+          flutter test 2>&1 | tee /tmp/test.log
+          code=${PIPESTATUS[0]}
+          if [ $code -ne 0 ]; then
+            grep -m 12 -E "Failed to load|Error:|error •" /tmp/test.log | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $code
 
       # WO-36 §3.3：签名凭据经 GitHub Secrets 注入，keystore 与 key.properties 均不落仓库
       - name: 🔐 Inject Signing Credentials (from Secrets)
