@@ -91,6 +91,32 @@ class LocationInfo {
   }
 }
 
+/// 应用前台使用时长摘要条目 (WO-37 新增)
+class AppUsageItem {
+  final String app;
+  final int minutes;
+
+  AppUsageItem({
+    required this.app,
+    required this.minutes,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'app': app,
+    'minutes': minutes,
+  };
+
+  factory AppUsageItem.fromJson(Map<String, dynamic> json) {
+    return AppUsageItem(
+      app: json['app'] as String? ?? '',
+      minutes: (json['minutes'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  @override
+  String toString() => '$app: ${minutes}m';
+}
+
 /// 2BOT 官方标准设备快照模型 (SSOT)
 class DeviceTelemetry {
   final BatteryInfo battery;
@@ -113,6 +139,10 @@ class DeviceTelemetry {
   // v1.3.0 新增地理位置字段
   final LocationInfo? location;
 
+  // WO-37 新增前台应用时间窗摘要与地点标注字典 (全部支持可空向后兼容)
+  final List<AppUsageItem>? usageSummary;
+  final Map<String, String>? placeLabels;
+
   // Convenience getters
   int get batteryLevel => battery.level;
   bool get isCharging => battery.isCharging;
@@ -133,6 +163,8 @@ class DeviceTelemetry {
     this.isIgnoringBatteryOptimizations,
     this.hasUsagePermission,
     this.location,
+    this.usageSummary,
+    this.placeLabels,
   });
 
   Map<String, dynamic> toJson() => {
@@ -152,6 +184,9 @@ class DeviceTelemetry {
       'isIgnoringBatteryOptimizations': isIgnoringBatteryOptimizations,
     if (hasUsagePermission != null) 'hasUsagePermission': hasUsagePermission,
     if (location != null) 'location': location!.toJson(),
+    if (usageSummary != null)
+      'usageSummary': usageSummary!.map((e) => e.toJson()).toList(),
+    if (placeLabels != null) 'placeLabels': placeLabels,
   };
 
   factory DeviceTelemetry.fromJson(Map<String, dynamic> json) {
@@ -175,11 +210,19 @@ class DeviceTelemetry {
       location: json['location'] != null
           ? LocationInfo.fromJson(Map<String, dynamic>.from(json['location'] as Map))
           : null,
+      usageSummary: json['usageSummary'] != null
+          ? (json['usageSummary'] as List<dynamic>)
+              .map((e) => AppUsageItem.fromJson(Map<String, dynamic>.from(e as Map)))
+              .toList()
+          : null,
+      placeLabels: json['placeLabels'] != null
+          ? Map<String, String>.from(json['placeLabels'] as Map)
+          : null,
     );
   }
 
   @override
   String toString() {
-    return 'DeviceTelemetry(battery: ${battery.level}%, charging: ${battery.isCharging}, wifi: ${wifi.ssid.isNotEmpty ? wifi.ssid : "None"}, screenLocked: $screenLocked, app: $foregroundApp, stepsToday: $stepsToday, ringer: $ringerMode, dnd: $isDnd, music: $isMusicActive, btAudio: $isBluetoothAudio, nextAlarm: ${nextAlarm?['formatted']}, screenTime: ${screenTimeMinutes}m, batteryOptIgnored: $isIgnoringBatteryOptimizations, usagePerm: $hasUsagePermission, location: $location)';
+    return 'DeviceTelemetry(battery: ${battery.level}%, charging: ${battery.isCharging}, wifi: ${wifi.ssid.isNotEmpty ? wifi.ssid : "None"}, screenLocked: $screenLocked, app: $foregroundApp, stepsToday: $stepsToday, ringer: $ringerMode, dnd: $isDnd, music: $isMusicActive, btAudio: $isBluetoothAudio, nextAlarm: ${nextAlarm?['formatted']}, screenTime: ${screenTimeMinutes}m, batteryOptIgnored: $isIgnoringBatteryOptimizations, usagePerm: $hasUsagePermission, location: $location, usageSummary: $usageSummary, placeLabels: $placeLabels)';
   }
 }

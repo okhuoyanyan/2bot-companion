@@ -2,6 +2,28 @@
 
 本文档记录 2BOT 官方 Android 专属轻量伴侣端的所有重要版本迭代与更新细节。
 
+## [v1.5.0] - 2026-09-22
+
+### ⚡ 上报体系重构：事件驱动 + 节流调度器 + 字段真实化与地点标注
+
+- **🚫 全面取消定时周期上报**：前台保活服务移除 `ForegroundTaskEventAction.repeat` 周期回调，彻底转向事件驱动与节流调度（`ForegroundTaskEventAction.nothing()`）。
+- **⏱️ 节流调度器（90 / 180 / 600 秒）**：
+  - 白名单事件（到家/离家、电量低至 20%/10%、服务启动重启、手动测试）：立即发送，不受节流窗口约束；
+  - 非白名单事件（解锁、锁屏、应用切换、充放电切换、音乐启停、蓝牙连接、步数里程碑）：窗口内标脏合并为 1 次发送最新快照；
+  - 失败处理纪律：发送失败仅记录并等下次事件，**严禁引入定时重试**（杜绝变相复活周期上报）；
+  - 静默保活超时：无任何事件超过指定小时（默认 6 小时，0 为关闭）单发一次保活元事件，配合 Android 原生 `AlarmManager.setAndAllowWhileIdle` 硬件唤醒兜底，区分手机安静与通道离线。
+- **🎯 核心字段真值化**：
+  - `foregroundApp`：原生 `UsageStatsManager.queryEvents` 获取最近前台活跃包名，经 `PackageManager.getApplicationLabel` 获取本地化应用名（如“哔哩哔哩”），取不到时回退包名；
+  - `screenLocked`：原生 `KeyguardManager.isKeyguardLocked` 主导检测，API 22+ `isDeviceLocked` 兜底，`!PowerManager.isInteractive` 最终兜底，彻底终结 `!isAppForeground` 伪推导。
+- **📊 新增 `usageSummary`（前台应用时间窗时长摘要）**：
+  - 统计最近上报窗口内 Top-5 应用前台时长（基于 `totalTimeInForeground` 差分）；
+  - 持久化差分基线：基线缺失（首次启动、服务重启、存储被清）时**严格省略该字段（null）**，绝不退化为累计值，防止假事实污染画像。
+- **🏷️ 新增地点标注与 WiFi 发现收录**：
+  - 本地自动去重记录已连接的 WiFi SSID 历史（首次与末次出现时间）；
+  - 新增「地点标注」设置卡，支持为已记录或手动添加的 SSID 分配「家 / 公司 / 自定义」标签，随报文 `placeLabels` 字段同步给 NAS 地点图鉴。
+- **⚙️ 触发事件全面独立开关化**：设置页提供 11 项事件独立启用/禁用开关、三档节流窗口与静默超时配置。
+- **🔒 信道判定判据收紧（`isChannelReady`）**：mail 模式下 `mailCryptKey` 必须为有效 64 位十六进制字符串（32 字节），空 key 判为未就绪。
+
 ## [v1.4.1] - 2026-09-22
 
 ### 🎨 信道状态 UI 修正与模式感知收敛

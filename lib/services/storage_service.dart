@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -47,6 +49,24 @@ class StorageService {
       } catch (_) {}
     }
 
+    Map<String, bool>? eventSwitches;
+    final switchesJson = p.getString(AppConstants.keyEventSwitches);
+    if (switchesJson != null && switchesJson.isNotEmpty) {
+      try {
+        final decoded = json.decode(switchesJson) as Map<String, dynamic>;
+        eventSwitches = decoded.map((k, v) => MapEntry(k, v == true));
+      } catch (_) {}
+    }
+
+    Map<String, String>? placeLabels;
+    final placeLabelsJson = p.getString(AppConstants.keyPlaceLabels);
+    if (placeLabelsJson != null && placeLabelsJson.isNotEmpty) {
+      try {
+        final decoded = json.decode(placeLabelsJson) as Map<String, dynamic>;
+        placeLabels = decoded.map((k, v) => MapEntry(k, v.toString()));
+      } catch (_) {}
+    }
+
     return AppSettings(
       relayUrl: p.getString(AppConstants.keyRelayUrl) ?? AppConstants.defaultRelayUrl,
       deviceToken: p.getString(AppConstants.keyDeviceToken) ?? AppConstants.defaultDeviceToken,
@@ -61,6 +81,10 @@ class StorageService {
       mailSubjectPrefix: p.getString(AppConstants.keyMailSubjectPrefix) ?? AppConstants.defaultSubjectPrefix,
       mailAuthCode: _mailAuthCode,
       mailCryptKey: _mailCryptKey,
+      throttleIntervalSeconds: p.getInt(AppConstants.keyThrottleSeconds) ?? AppConstants.defaultThrottleSeconds,
+      silenceTimeoutHours: p.getInt(AppConstants.keySilenceTimeoutHours) ?? AppConstants.defaultSilenceTimeoutHours,
+      eventSwitches: eventSwitches,
+      placeLabels: placeLabels,
     );
   }
 
@@ -109,6 +133,64 @@ class StorageService {
   /// 更新前台服务运行开关
   static Future<void> setServiceEnabled(bool enabled) async {
     await prefs.setBool(AppConstants.keyServiceEnabled, enabled);
+  }
+
+  /// 保存 WO-37 节流调度与事件开关配置
+  static Future<void> saveThrottleAndEventConfig({
+    required int throttleIntervalSeconds,
+    required int silenceTimeoutHours,
+    required Map<String, bool> eventSwitches,
+  }) async {
+    final p = prefs;
+    await p.setInt(AppConstants.keyThrottleSeconds, throttleIntervalSeconds);
+    await p.setInt(AppConstants.keySilenceTimeoutHours, silenceTimeoutHours);
+    await p.setString(AppConstants.keyEventSwitches, json.encode(eventSwitches));
+  }
+
+  /// 保存 WO-37 地点标注字典（SSID -> 地点标签）
+  static Future<void> savePlaceLabels(Map<String, String> placeLabels) async {
+    final p = prefs;
+    await p.setString(AppConstants.keyPlaceLabels, json.encode(placeLabels));
+  }
+
+  /// 记录发现的 WiFi SSID（带首次与末次出现时间，用于地点标注点选列表）
+  static Future<void> recordSsidSeen(String ssid) async {
+    final trimmed = ssid.trim();
+    if (trimmed.isEmpty || trimmed == '<unknown ssid>' || trimmed == '0x') {
+      return;
+    }
+    final p = prefs;
+    Map<String, dynamic> records = {};
+    final raw = p.getString(AppConstants.keyRecordedSsids);
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        records = json.decode(raw) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+
+    final nowIso = DateTime.now().toIso8601String();
+    if (records.containsKey(trimmed)) {
+      final item = Map<String, dynamic>.from(records[trimmed] as Map);
+      item['lastSeen'] = nowIso;
+      records[trimmed] = item;
+    } else {
+      records[trimmed] = {
+        'firstSeen': nowIso,
+        'lastSeen': nowIso,
+      };
+    }
+    await p.setString(AppConstants.keyRecordedSsids, json.encode(records));
+  }
+
+  /// 读取已记录的 WiFi SSID 列表
+  static Map<String, dynamic> getRecordedSsids() {
+    final raw = prefs.getString(AppConstants.keyRecordedSsids);
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        return json.decode(raw) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    return {};
   }
 
   /// 记录上报状态与时间

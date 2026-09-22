@@ -28,7 +28,7 @@ void main() {
       expect(settings.isChannelReady, isTrue);
     });
 
-    test('象限 1 变体：mail 完整且未指定加密 key（留空）-> 就绪', () {
+    test('象限 1 变体：mail 完整且未指定加密 key（留空）-> 未就绪', () {
       final settings = AppSettings(
         transportMode: AppConstants.transportMail,
         mailAccount: 'user@example.com',
@@ -36,7 +36,7 @@ void main() {
         mailCryptKey: '',
       );
       expect(settings.isMailMode, isTrue);
-      expect(settings.isChannelReady, isTrue);
+      expect(settings.isChannelReady, isFalse);
     });
 
     // ------------------------------------------------------------

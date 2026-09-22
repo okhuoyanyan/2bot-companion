@@ -32,6 +32,32 @@ class AppSettings {
   /// AES-256-GCM 密钥，64 个 hex 字符（安全存储；内存态）
   String mailCryptKey;
 
+  /// WO-37 节流窗口时长（秒）：90 / 180 / 600（默认 90）
+  int throttleIntervalSeconds;
+
+  /// WO-37 静默保活超时（小时）：默认 6，0 为关闭
+  int silenceTimeoutHours;
+
+  /// WO-37 事件独立开关字典
+  Map<String, bool> eventSwitches;
+
+  /// WO-37 地点标注字典（SSID -> 地点标签，如 {"Home_5G": "家", "Company": "公司"}）
+  Map<String, String> placeLabels;
+
+  static Map<String, bool> get defaultEventSwitches => {
+    'unlock': true,
+    'lock': true,
+    'app_switch': true,
+    'location': true,
+    'power': true,
+    'battery_threshold': true,
+    'battery_full': true,
+    'music': true,
+    'bluetooth': true,
+    'steps': true,
+    'silence_timeout': true,
+  };
+
   AppSettings({
     this.relayUrl = AppConstants.defaultRelayUrl,
     this.deviceToken = AppConstants.defaultDeviceToken,
@@ -46,7 +72,12 @@ class AppSettings {
     this.mailSubjectPrefix = AppConstants.defaultSubjectPrefix,
     this.mailAuthCode = '',
     this.mailCryptKey = '',
-  });
+    this.throttleIntervalSeconds = AppConstants.defaultThrottleSeconds,
+    this.silenceTimeoutHours = AppConstants.defaultSilenceTimeoutHours,
+    Map<String, bool>? eventSwitches,
+    Map<String, String>? placeLabels,
+  })  : eventSwitches = eventSwitches ?? Map.from(defaultEventSwitches),
+        placeLabels = placeLabels ?? {};
 
   /// 当前是否走邮箱信道
   bool get isMailMode => transportMode == AppConstants.transportMail;
@@ -60,7 +91,7 @@ class AppSettings {
 
   /// 当前选定通信信道是否已配置就绪（UI 引导横幅显隐与健康度判定标准）
   ///
-  /// - mail 模式：mailAccount 与 mailAuthCode 非空；若配置了 mailCryptKey，必须为 64 位 hex
+  /// - mail 模式：mailAccount 与 mailAuthCode 非空；mailCryptKey 必须为 64 位 hex（判据收紧）
   /// - relay 模式：维持既有口径（deviceToken 非空 且 relayUrl 非默认占位且非空）
   bool get isChannelReady {
     if (isMailMode) {
@@ -68,7 +99,7 @@ class AppSettings {
         return false;
       }
       final key = mailCryptKey.trim();
-      if (key.isNotEmpty && !_hex64Regex.hasMatch(key)) {
+      if (!_hex64Regex.hasMatch(key)) {
         return false;
       }
       return true;
@@ -95,6 +126,10 @@ class AppSettings {
     String? mailSubjectPrefix,
     String? mailAuthCode,
     String? mailCryptKey,
+    int? throttleIntervalSeconds,
+    int? silenceTimeoutHours,
+    Map<String, bool>? eventSwitches,
+    Map<String, String>? placeLabels,
   }) {
     return AppSettings(
       relayUrl: relayUrl ?? this.relayUrl,
@@ -110,6 +145,11 @@ class AppSettings {
       mailSubjectPrefix: mailSubjectPrefix ?? this.mailSubjectPrefix,
       mailAuthCode: mailAuthCode ?? this.mailAuthCode,
       mailCryptKey: mailCryptKey ?? this.mailCryptKey,
+      throttleIntervalSeconds:
+          throttleIntervalSeconds ?? this.throttleIntervalSeconds,
+      silenceTimeoutHours: silenceTimeoutHours ?? this.silenceTimeoutHours,
+      eventSwitches: eventSwitches ?? Map.from(this.eventSwitches),
+      placeLabels: placeLabels ?? Map.from(this.placeLabels),
     );
   }
 }

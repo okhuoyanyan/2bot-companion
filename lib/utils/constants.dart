@@ -23,10 +23,23 @@ class AppConstants {
   static const String defaultSmtpHost = 'smtp.qq.com';
   static const int defaultSmtpPort = 465;
 
+  // ============================================================
+  // WO-37 上报体系重构：事件驱动、节流调度器与地点标注常量
+  // ============================================================
+  static const int defaultThrottleSeconds = 90;
+  static const List<int> availableThrottleSeconds = [90, 180, 600];
+
+  static const int defaultSilenceTimeoutHours = 6;
+
   // SharedPreferences 键名（非敏感配置）
   static const String keyRelayUrl = 'pref_relay_url';
   static const String keyDeviceToken = 'pref_device_token';
   static const String keyIntervalMinutes = 'pref_interval_minutes';
+  static const String keyThrottleSeconds = 'pref_throttle_seconds';
+  static const String keySilenceTimeoutHours = 'pref_silence_timeout_hours';
+  static const String keyEventSwitches = 'pref_event_switches';
+  static const String keyPlaceLabels = 'pref_place_labels';
+  static const String keyRecordedSsids = 'pref_recorded_ssids';
   static const String keyServiceEnabled = 'pref_service_enabled';
   static const String keyLastReportTime = 'pref_last_report_time';
   static const String keyLastReportStatus = 'pref_last_report_status';

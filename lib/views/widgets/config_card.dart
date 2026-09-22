@@ -3,7 +3,7 @@ import '../../models/app_settings.dart';
 import '../../utils/constants.dart';
 import '../../utils/theme.dart';
 
-/// 配置表单提交值（WO-36：在 relay 旧字段之外扩展传输模式与邮箱参数）
+/// 配置表单提交值（WO-36：扩展传输模式与邮箱参数；WO-37：扩展节流档位、静默保活与事件开关）
 class ConfigFormValues {
   final String relayUrl;
   final String deviceToken;
@@ -14,6 +14,9 @@ class ConfigFormValues {
   final String mailSubjectPrefix;
   final String mailAuthCode;
   final String mailCryptKey;
+  final int throttleIntervalSeconds;
+  final int silenceTimeoutHours;
+  final Map<String, bool> eventSwitches;
 
   const ConfigFormValues({
     required this.relayUrl,
@@ -25,6 +28,9 @@ class ConfigFormValues {
     required this.mailSubjectPrefix,
     required this.mailAuthCode,
     required this.mailCryptKey,
+    required this.throttleIntervalSeconds,
+    required this.silenceTimeoutHours,
+    required this.eventSwitches,
   });
 }
 
@@ -51,8 +57,10 @@ class _ConfigCardState extends State<ConfigCard> {
   late final TextEditingController _mailAuthCodeController;
   late final TextEditingController _mailKeyController;
   late final TextEditingController _subjectPrefixController;
-  late int _selectedInterval;
+  late final TextEditingController _silenceHoursController;
+  late int _selectedThrottleSeconds;
   late String _transportMode;
+  late Map<String, bool> _eventSwitches;
   bool _obscureToken = true;
   bool _obscureAuthCode = true;
   bool _obscureKey = true;
@@ -70,8 +78,11 @@ class _ConfigCardState extends State<ConfigCard> {
     _mailAuthCodeController = TextEditingController(text: s.mailAuthCode);
     _mailKeyController = TextEditingController(text: s.mailCryptKey);
     _subjectPrefixController = TextEditingController(text: s.mailSubjectPrefix);
-    _selectedInterval = s.intervalMinutes;
+    _silenceHoursController =
+        TextEditingController(text: s.silenceTimeoutHours.toString());
+    _selectedThrottleSeconds = s.throttleIntervalSeconds;
     _transportMode = s.transportMode;
+    _eventSwitches = Map<String, bool>.from(s.eventSwitches);
   }
 
   @override
@@ -83,6 +94,7 @@ class _ConfigCardState extends State<ConfigCard> {
     _mailAuthCodeController.dispose();
     _mailKeyController.dispose();
     _subjectPrefixController.dispose();
+    _silenceHoursController.dispose();
     super.dispose();
   }
 
@@ -91,7 +103,10 @@ class _ConfigCardState extends State<ConfigCard> {
       _urlController.text = AppConstants.defaultRelayUrl;
       _tokenController.text = AppConstants.defaultDeviceToken;
       _subjectPrefixController.text = AppConstants.defaultSubjectPrefix;
-      _selectedInterval = AppConstants.defaultIntervalMinutes;
+      _selectedThrottleSeconds = AppConstants.defaultThrottleSeconds;
+      _silenceHoursController.text =
+          AppConstants.defaultSilenceTimeoutHours.toString();
+      _eventSwitches = Map<String, bool>.from(AppSettings.defaultEventSwitches);
       // 邮箱凭据刻意不参与「恢复默认」——避免误清空管理员已配置的密钥
     });
   }
@@ -106,6 +121,8 @@ class _ConfigCardState extends State<ConfigCard> {
     final mailAccount = _mailAccountController.text.trim();
     final mailKey = _mailKeyController.text.trim();
     final authCode = _mailAuthCodeController.text.trim();
+    final silenceHours = int.tryParse(_silenceHoursController.text.trim()) ??
+        AppConstants.defaultSilenceTimeoutHours;
 
     if (_isMailMode) {
       // 邮箱模式的必填校验（relay 字段保留但不再强校验）
@@ -139,7 +156,7 @@ class _ConfigCardState extends State<ConfigCard> {
     widget.onSave(ConfigFormValues(
       relayUrl: url,
       deviceToken: token,
-      intervalMinutes: _selectedInterval,
+      intervalMinutes: AppConstants.defaultIntervalMinutes,
       transportMode: _transportMode,
       mailAccount: mailAccount,
       mailRecipient: _mailRecipientController.text.trim(),
@@ -149,6 +166,9 @@ class _ConfigCardState extends State<ConfigCard> {
       // 留空 = 保持既有凭据不变（避免 UI 未回显时误清空）
       mailAuthCode: authCode,
       mailCryptKey: mailKey,
+      throttleIntervalSeconds: _selectedThrottleSeconds,
+      silenceTimeoutHours: silenceHours,
+      eventSwitches: _eventSwitches,
     ));
   }
 
@@ -181,6 +201,46 @@ class _ConfigCardState extends State<ConfigCard> {
         ),
       ),
     );
+  }
+
+  List<Widget> _buildEventSwitchList() {
+    final list = [
+      {'key': 'unlock', 'title': '屏幕解锁', 'desc': '用户解锁进入桌面'},
+      {'key': 'lock', 'title': '屏幕锁屏', 'desc': '息屏或进入锁屏状态'},
+      {'key': 'app_switch', 'title': '应用切换', 'desc': '当前活跃前台应用变更'},
+      {'key': 'location', 'title': '到家/离家', 'desc': 'WiFi SSID 切换 (白名单立即发送)'},
+      {'key': 'power', 'title': '充放电切换', 'desc': '连接充电器或断开电源'},
+      {'key': 'battery_threshold', 'title': '电量阈值跨档', 'desc': '跨过 80% / 20% / 10% (≤20% 立即发)'},
+      {'key': 'battery_full', 'title': '充电完成', 'desc': '电量充至 100%'},
+      {'key': 'music', 'title': '音乐启停', 'desc': '媒体播放器开始或停止播放'},
+      {'key': 'bluetooth', 'title': '蓝牙音频接断', 'desc': '蓝牙音频设备连接或断开'},
+      {'key': 'steps', 'title': '步数里程碑', 'desc': '当日累计步数每跨 500 步'},
+      {'key': 'silence_timeout', 'title': '静默保活超时', 'desc': '长期无事件保活上报'},
+    ];
+
+    return list.map((item) {
+      final key = item['key']!;
+      final enabled = _eventSwitches[key] ?? true;
+      return SwitchListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
+        dense: true,
+        title: Text(
+          item['title']!,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: AppTheme.textPrimary),
+        ),
+        subtitle: Text(
+          item['desc']!,
+          style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
+        ),
+        activeColor: AppTheme.primaryCyan,
+        value: enabled,
+        onChanged: (val) {
+          setState(() {
+            _eventSwitches[key] = val;
+          });
+        },
+      );
+    }).toList();
   }
 
   @override
@@ -335,18 +395,26 @@ class _ConfigCardState extends State<ConfigCard> {
             ],
             const SizedBox(height: 18),
 
-            // 定时频率选择
+            // ============ WO-37 节流调度窗口时长 ============
             const Text(
-              '保底心跳频率 (定时静默上报)',
+              '节流调度窗口时长 (WO-37)',
               style: TextStyle(fontSize: 13, color: AppTheme.textSecondary, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '非白名单事件在此窗口内合并为 1 次发送；白名单（到家/离家、电量≤20%、服务启动）无视窗口立即上报。',
+              style: TextStyle(fontSize: 11, color: AppTheme.textMuted, height: 1.4),
             ),
             const SizedBox(height: 10),
             Wrap(
               spacing: 8,
-              children: AppConstants.availableIntervals.map((mins) {
-                final isSelected = (_selectedInterval == mins);
+              children: AppConstants.throttleOptions.map((secs) {
+                final isSelected = (_selectedThrottleSeconds == secs);
+                final label = secs == 90
+                    ? '90 秒 (默认)'
+                    : (secs == 180 ? '180 秒 (3分钟)' : '600 秒 (10分钟)');
                 return ChoiceChip(
-                  label: Text('$mins 分钟'),
+                  label: Text(label),
                   selected: isSelected,
                   selectedColor: AppTheme.primaryCyan.withOpacity(0.2),
                   backgroundColor: const Color(0xFF0F172A),
@@ -361,12 +429,51 @@ class _ConfigCardState extends State<ConfigCard> {
                   onSelected: (selected) {
                     if (selected) {
                       setState(() {
-                        _selectedInterval = mins;
+                        _selectedThrottleSeconds = secs;
                       });
                     }
                   },
                 );
               }).toList(),
+            ),
+            const SizedBox(height: 18),
+
+            // ============ WO-37 静默保活超时 ============
+            TextField(
+              controller: _silenceHoursController,
+              keyboardType: TextInputType.number,
+              style: const TextStyle(fontSize: 13, fontFamily: 'monospace', color: AppTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: '静默保活超时（小时）',
+                hintText: '默认 6，填 0 为关闭',
+                helperText: '长期无事件时单发保活元事件，区分手机安静与通道离线（严禁周期心跳）',
+                helperMaxLines: 2,
+                prefixIcon: Icon(Icons.hourglass_empty_rounded, size: 20, color: AppTheme.textSecondary),
+              ),
+            ),
+            const SizedBox(height: 18),
+
+            // ============ WO-37 11 项事件独立触发开关 ============
+            Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                initiallyExpanded: false,
+                leading: const Icon(Icons.toggle_on_outlined, color: AppTheme.primaryCyan, size: 20),
+                title: const Text(
+                  '事件触发独立开关 (11 项)',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: AppTheme.textPrimary,
+                  ),
+                ),
+                subtitle: const Text(
+                  '按需启用或屏蔽特定感知事件',
+                  style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                ),
+                children: _buildEventSwitchList(),
+              ),
             ),
             const SizedBox(height: 20),
 

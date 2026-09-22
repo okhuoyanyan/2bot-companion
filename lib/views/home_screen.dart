@@ -12,6 +12,7 @@ import '../services/telemetry_collector_service.dart';
 import '../services/telemetry_uploader_service.dart';
 import '../utils/theme.dart';
 import 'widgets/config_card.dart';
+import 'widgets/place_labels_card.dart';
 import 'widgets/quick_actions.dart';
 import 'widgets/status_card.dart';
 
@@ -274,7 +275,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       mailCryptKey: values.mailCryptKey.isEmpty ? null : values.mailCryptKey,
     );
 
-    // 若当前前台服务正在运行，热重启服务以应用新频率
+    await StorageService.saveThrottleAndEventConfig(
+      throttleIntervalSeconds: values.throttleIntervalSeconds,
+      silenceTimeoutHours: values.silenceTimeoutHours,
+      eventSwitches: values.eventSwitches,
+    );
+
+    // 若当前前台服务正在运行，热重启服务以应用新配置
     if (_isServiceRunning) {
       await BackgroundTaskService.startService(values.intervalMinutes);
     }
@@ -371,7 +378,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 borderRadius: BorderRadius.circular(6),
               ),
               child: const Text(
-                'v1.3.1',
+                'v1.5.0',
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
@@ -480,6 +487,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ConfigCard(
               initialSettings: _settings,
               onSave: _handleSaveConfig,
+            ),
+
+            // 4. 地点标注卡片（WO-37：家 / 公司 / 自定义）
+            PlaceLabelsCard(
+              initialPlaceLabels: _settings.placeLabels,
+              onUpdated: () {
+                setState(() {
+                  _settings = StorageService.loadSettings();
+                });
+              },
             ),
 
             const SizedBox(height: 12),

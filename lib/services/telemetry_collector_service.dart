@@ -51,13 +51,12 @@ class TelemetryCollectorService {
       }
     } catch (_) {}
 
-    // 3. 锁屏状态推断 (前台活跃为 false，后台运行且锁屏广播为 true)
-    final bool screenLocked = !isAppForeground;
+    // 3. 锁屏状态与前台应用（默认兜底值，原生支持时由 nativeData 覆盖真值）
+    bool screenLocked = !isAppForeground;
+    String foregroundApp = isAppForeground ? '2bot-companion' : 'None';
+    List<AppUsageItem>? usageSummary;
 
-    // 4. 前台应用名称（纯血开源零侵入，默认上报 None 或自身）
-    final String foregroundApp = isAppForeground ? '2bot-companion' : 'None';
-
-    // 5. 采集 Android 原生底层传感器与系统状态 (v1.1.0 新增)
+    // 5. 采集 Android 原生底层传感器与系统状态 (v1.1.0 新增，v1.5.0 扩展真值化)
     int? stepsToday;
     String? ringerMode;
     bool? isDnd;
@@ -102,10 +101,45 @@ class TelemetryCollectorService {
             );
           } catch (_) {}
         }
+
+        // 8. WO-37 锁屏状态真值 (KeyguardManager)
+        if (nativeData['screenLocked'] is bool) {
+          screenLocked = nativeData['screenLocked'] as bool;
+        }
+
+        // 9. WO-37 前台应用真值 (UsageStatsManager)
+        final rawForeground = nativeData['foregroundApp'] as String?;
+        if (rawForeground != null && rawForeground.isNotEmpty) {
+          foregroundApp = rawForeground;
+        }
+
+        // 10. WO-37 时间窗前台应用时长摘要 (差分增量 Top-5)
+        if (nativeData['usageSummary'] is List) {
+          try {
+            usageSummary = (nativeData['usageSummary'] as List<dynamic>)
+                .map((e) => AppUsageItem.fromJson(Map<String, dynamic>.from(e as Map)))
+                .toList();
+          } catch (_) {}
+        }
       }
     } catch (_) {
-      // 优雅静默降级为 null，确保原有电量、WiFi、屏幕状态 100% 稳定采集
+      // 优雅静默降级，确保原有电量、WiFi、屏幕状态 100% 稳定采集
     }
+
+    // 11. 记录 WiFi SSID 出现历史并注入地点标签 (WO-37)
+    if (wifiSsid.isNotEmpty) {
+      try {
+        await StorageService.recordSsidSeen(wifiSsid);
+      } catch (_) {}
+    }
+
+    Map<String, String>? placeLabels;
+    try {
+      final labels = StorageService.loadSettings().placeLabels;
+      if (labels.isNotEmpty) {
+        placeLabels = labels;
+      }
+    } catch (_) {}
 
     return DeviceTelemetry(
       battery: BatteryInfo(
@@ -129,7 +163,16 @@ class TelemetryCollectorService {
       isIgnoringBatteryOptimizations: isIgnoringBatteryOptimizations,
       hasUsagePermission: hasUsagePermission,
       location: location,
+      usageSummary: usageSummary,
+      placeLabels: placeLabels,
     );
+  }
+
+  /// 调度 Android 原生 AlarmManager 单发静默保活
+  static Future<void> scheduleSilenceKeepalive(int hours) async {
+    try {
+      await _channel.invokeMethod('scheduleSilenceKeepalive', {'hours': hours});
+    } catch (_) {}
   }
 
   /// 动态申请 Android WiFi SSID 所需的位置权限

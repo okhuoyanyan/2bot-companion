@@ -3,7 +3,9 @@ package com.twobot.companion
 import android.Manifest
 import android.app.AlarmManager
 import android.app.AppOpsManager
+import android.app.KeyguardManager
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -127,6 +129,15 @@ class MainActivity : FlutterActivity(), SensorEventListener {
                         result.success(collectLocation())
                     } catch (e: Exception) {
                         result.error("LOCATION_ERROR", e.localizedMessage, null)
+                    }
+                }
+                "scheduleSilenceKeepalive" -> {
+                    try {
+                        val hours = (call.argument<Number>("hours"))?.toInt() ?: 6
+                        scheduleSilenceKeepalive(hours)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("ALARM_ERROR", e.localizedMessage, null)
                     }
                 }
                 else -> result.notImplemented()
@@ -400,7 +411,150 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         // 8. Native WiFi SSID (Bypasses Flutter plugin limitations on Chinese ROMs)
         map["nativeWifiSsid"] = collectNativeWifiSsid()
 
+        // 9. WO-37 Screen Lock State (真实锁屏真值，KeyguardManager.isKeyguardLocked 为主)
+        val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val screenLocked: Boolean = if (keyguardManager != null) {
+            keyguardManager.isKeyguardLocked
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1 && keyguardManager != null) {
+            keyguardManager.isDeviceLocked
+        } else {
+            !(powerManager?.isInteractive ?: true)
+        }
+        map["screenLocked"] = screenLocked
+
+        // 10. WO-37 Foreground App Real Value (UsageStatsManager.queryEvents 取最近前台活跃 App)
+        var foregroundApp: String? = null
+        if (hasUsagePermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                if (usageStatsManager != null) {
+                    val now = System.currentTimeMillis()
+                    val events = usageStatsManager.queryEvents(now - 60000L, now)
+                    var lastPkg: String? = null
+                    val event = android.app.usage.UsageEvents.Event()
+                    while (events.hasNextEvent()) {
+                        events.getNextEvent(event)
+                        val isResume = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            event.eventType == android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED
+                        } else {
+                            event.eventType == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND
+                        }
+                        if (isResume) {
+                            lastPkg = event.packageName
+                        }
+                    }
+                    if (lastPkg != null) {
+                        foregroundApp = try {
+                            val appInfo = packageManager.getApplicationInfo(lastPkg, 0)
+                            packageManager.getApplicationLabel(appInfo).toString()
+                        } catch (_: Exception) {
+                            lastPkg
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        map["foregroundApp"] = foregroundApp
+
+        // 11. WO-37 Usage Summary (Top-5 应用时间窗时长差分；基线缺失时直接省略为 null)
+        var usageSummary: List<Map<String, Any>>? = null
+        if (hasUsagePermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                if (usageStatsManager != null) {
+                    val now = System.currentTimeMillis()
+                    val prefs = getSharedPreferences("usage_baseline_prefs", Context.MODE_PRIVATE)
+                    val lastTs = prefs.getLong("last_ts", 0L)
+                    val lastBootTime = now - android.os.SystemClock.elapsedRealtime()
+                    val savedBootTime = prefs.getLong("boot_time", 0L)
+
+                    // 检查基线是否存在且有效（同一次开机周期且时间在 24 小时内）
+                    val hasValidBaseline = lastTs > 0L && Math.abs(savedBootTime - lastBootTime) < 10000L && (now - lastTs) < 24 * 3600000L
+
+                    val stats = usageStatsManager.queryUsageStats(
+                        UsageStatsManager.INTERVAL_DAILY,
+                        now - 3600000L * 24,
+                        now
+                    )
+
+                    val currentTotals = HashMap<String, Long>()
+                    if (stats != null) {
+                        for (u in stats) {
+                            if (u.packageName != null && u.totalTimeInForeground > 0L) {
+                                currentTotals[u.packageName] = (currentTotals[u.packageName] ?: 0L) + u.totalTimeInForeground
+                            }
+                        }
+                    }
+
+                    if (hasValidBaseline) {
+                        val deltas = ArrayList<Pair<String, Int>>()
+                        for ((pkg, curTime) in currentTotals) {
+                            val baseTime = prefs.getLong("pkg_$pkg", -1L)
+                            if (baseTime >= 0L) {
+                                val deltaMs = curTime - baseTime
+                                val minutes = (deltaMs / 60000L).toInt()
+                                if (minutes > 0) {
+                                    val label = try {
+                                        val info = packageManager.getApplicationInfo(pkg, 0)
+                                        packageManager.getApplicationLabel(info).toString()
+                                    } catch (_: Exception) {
+                                        pkg
+                                    }
+                                    deltas.add(Pair(label, minutes))
+                                }
+                            }
+                        }
+
+                        deltas.sortByDescending { it.second }
+                        val top5 = deltas.take(5).map {
+                            mapOf("app" to it.first, "minutes" to it.second)
+                        }
+                        usageSummary = top5
+                    } else {
+                        // 修正 1：基线缺失（首次/重启/重装）直接省略该字段，绝不退化为累计值
+                        usageSummary = null
+                    }
+
+                    // 更新保存当前基线
+                    val editor = prefs.edit().clear()
+                    editor.putLong("last_ts", now)
+                    editor.putLong("boot_time", lastBootTime)
+                    for ((pkg, curTime) in currentTotals) {
+                        editor.putLong("pkg_$pkg", curTime)
+                    }
+                    editor.apply()
+                }
+            } catch (_: Exception) {
+                usageSummary = null
+            }
+        }
+        map["usageSummary"] = usageSummary
+
         return map
+    }
+
+    private fun scheduleSilenceKeepalive(hours: Int) {
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = "com.twobot.companion.SILENCE_KEEPALIVE_ACTION"
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val pendingIntent = PendingIntent.getActivity(this, 1001, intent, flags)
+
+        if (hours <= 0) {
+            alarmManager.cancel(pendingIntent)
+        } else {
+            val triggerTime = System.currentTimeMillis() + hours * 3600000L
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent)
+            } else {
+                alarmManager.set(AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent)
+            }
+        }
     }
 
     private fun registerLocationUpdates() {
