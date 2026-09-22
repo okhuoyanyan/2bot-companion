@@ -5,6 +5,7 @@ import '../../utils/theme.dart';
 class QuickActions extends StatelessWidget {
   final bool isServiceRunning;
   final bool isReporting;
+  final bool isMailMode;
   final bool hasLocationPermission;
   final bool isIgnoringBatteryOptimizations;
   final bool hasActivityPermission;
@@ -24,6 +25,7 @@ class QuickActions extends StatelessWidget {
     super.key,
     required this.isServiceRunning,
     required this.isReporting,
+    this.isMailMode = false,
     required this.hasLocationPermission,
     this.isIgnoringBatteryOptimizations = true,
     this.hasActivityPermission = true,
@@ -345,7 +347,9 @@ class QuickActions extends StatelessWidget {
                           )
                         : const Icon(Icons.send_rounded, size: 18),
                     label: Text(
-                      isReporting ? '正在向云端中继推送...' : '立即测试上报一次',
+                      isReporting
+                          ? (isMailMode ? '正在经邮箱上报...' : '正在向云端中继推送...')
+                          : '立即测试上报一次',
                       style: const TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.bold,

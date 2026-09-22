@@ -55,6 +55,32 @@ class AppSettings {
   String get effectiveMailRecipient =>
       mailRecipient.trim().isEmpty ? mailAccount.trim() : mailRecipient.trim();
 
+  /// 64 位十六进制字符串正则（AES-256-GCM 密钥，32 字节）
+  static final RegExp _hex64Regex = RegExp(r'^[0-9a-fA-F]{64}$');
+
+  /// 当前选定通信信道是否已配置就绪（UI 引导横幅显隐与健康度判定标准）
+  ///
+  /// - mail 模式：mailAccount 与 mailAuthCode 非空；若配置了 mailCryptKey，必须为 64 位 hex
+  /// - relay 模式：维持既有口径（deviceToken 非空 且 relayUrl 非默认占位且非空）
+  bool get isChannelReady {
+    if (isMailMode) {
+      if (mailAccount.trim().isEmpty || mailAuthCode.trim().isEmpty) {
+        return false;
+      }
+      final key = mailCryptKey.trim();
+      if (key.isNotEmpty && !_hex64Regex.hasMatch(key)) {
+        return false;
+      }
+      return true;
+    } else {
+      final token = deviceToken.trim();
+      final url = relayUrl.trim();
+      return token.isNotEmpty &&
+          url.isNotEmpty &&
+          !url.contains('your-relay-service');
+    }
+  }
+
   AppSettings copyWith({
     String? relayUrl,
     String? deviceToken,

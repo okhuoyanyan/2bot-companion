@@ -290,7 +290,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           children: [
             Icon(Icons.check_circle_outline_rounded, color: AppTheme.accentEmerald, size: 20),
             SizedBox(width: 10),
-            Text('中继与心跳配置已成功持久化保存！'),
+            Text('通信信道配置已成功持久化保存！'),
           ],
         ),
       ),
@@ -398,8 +398,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           padding: const EdgeInsets.symmetric(vertical: 12),
           children: [
             // 0. 未配置密钥/端点引导横幅
-            if (_settings.deviceToken.isEmpty ||
-                _settings.relayUrl.contains('your-relay-service'))
+            if (!_settings.isChannelReady)
               Container(
                 margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
                 padding: const EdgeInsets.all(14),
@@ -410,27 +409,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     color: AppTheme.warningAmber.withOpacity(0.4),
                   ),
                 ),
-                child: const Row(
+                child: Row(
                   children: [
-                    Icon(Icons.lock_clock_outlined,
+                    const Icon(Icons.lock_clock_outlined,
                         color: AppTheme.warningAmber, size: 24),
-                    SizedBox(width: 12),
+                    const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '尚未配置云端中继密钥',
-                            style: TextStyle(
+                            _settings.isMailMode
+                                ? '尚未配置邮箱信道参数'
+                                : '尚未配置云端中继密钥',
+                            style: const TextStyle(
                               fontSize: 13,
                               fontWeight: FontWeight.bold,
                               color: AppTheme.warningAmber,
                             ),
                           ),
-                          SizedBox(height: 4),
+                          const SizedBox(height: 4),
                           Text(
-                            '请在下方【云端通信与中继设置】中填入您自己部署的中继 URL 与私有 Token 即可开启自动上报。',
-                            style: TextStyle(
+                            _settings.isMailMode
+                                ? '请在下方【传输信道与上报设置】中填入您的邮箱账号与 SMTP 授权码即可开启自动上报。'
+                                : '请在下方【传输信道与上报设置】中填入您自己部署的中继 URL 与私有 Token 即可开启自动上报。',
+                            style: const TextStyle(
                               fontSize: 11,
                               color: AppTheme.textSecondary,
                               height: 1.4,
@@ -456,6 +459,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             QuickActions(
               isServiceRunning: _isServiceRunning,
               isReporting: _isReporting,
+              isMailMode: _settings.isMailMode,
               hasLocationPermission: _hasLocationPermission,
               isIgnoringBatteryOptimizations: _isIgnoringBatteryOptimizations,
               hasActivityPermission: _hasActivityPermission,
@@ -514,20 +518,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Text('关于 2BOT 伴侣端', style: TextStyle(fontSize: 16)),
           ],
         ),
-        content: const Column(
+        content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
+            const Text(
               '2bot-companion 是为 2BOT-NEW 双智能体管家定制的专属 Android 伴侣应用。',
               style: TextStyle(fontSize: 13, height: 1.5, color: AppTheme.textSecondary),
             ),
-            SizedBox(height: 12),
+            const SizedBox(height: 12),
             Text(
               '• 纯血开源：0 商业广告、0 追踪 SDK、极致轻量\n'
               '• 双驱动上报：插拔充放电/网络切换即时触发 + 定时保底\n'
-              '• 隐私安全：所有数据仅流经您指定的个人 Vercel 中继',
-              style: TextStyle(fontSize: 12, height: 1.6, color: AppTheme.textMuted),
+              '• 隐私安全：${_settings.isMailMode ? "数据经端到端加密后经邮箱投递" : "所有数据仅流经您指定的个人自建中继"}',
+              style: const TextStyle(fontSize: 12, height: 1.6, color: AppTheme.textMuted),
             ),
           ],
         ),
