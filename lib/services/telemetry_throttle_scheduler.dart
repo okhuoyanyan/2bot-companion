@@ -255,8 +255,20 @@ class TelemetryThrottleScheduler {
   }
 
   /// 状态差分扫描器（供前台保活服务每 30s 周期性调用，检测事件状态翻转）
-  Future<void> evaluateStateChange(DeviceTelemetry current) async {
-    final settings = StorageService.loadSettings();
+  Future<void> evaluateStateChange(
+    DeviceTelemetry current, {
+    AppSettings? settingsOverride,
+  }) async {
+    AppSettings settings;
+    if (settingsOverride != null) {
+      settings = settingsOverride;
+    } else {
+      try {
+        settings = StorageService.loadSettings();
+      } catch (_) {
+        settings = AppSettings();
+      }
+    }
 
     // 1. 解锁 / 锁屏翻转
     if (_lastReportedScreenLocked != null &&

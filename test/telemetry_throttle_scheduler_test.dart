@@ -1,7 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:bot_companion/models/app_settings.dart';
 import 'package:bot_companion/models/device_telemetry.dart';
+import 'package:bot_companion/services/storage_service.dart';
 import 'package:bot_companion/services/telemetry_throttle_scheduler.dart';
 import 'package:bot_companion/services/telemetry_uploader_service.dart';
 
@@ -41,7 +43,10 @@ void main() {
   late UploadResult uploadReturnValue;
   late int silenceScheduledHours;
 
-  setUp(() {
+  setUp(() async {
+    SharedPreferences.setMockInitialValues({});
+    await StorageService.init();
+
     scheduler = TelemetryThrottleScheduler.instance;
     scheduler.resetForTest();
     uploadCount = 0;
@@ -219,7 +224,7 @@ void main() {
 
       // 499 -> 500 步：跨过 500 步里程碑 (0 -> 1)，触发 steps 事件
       final snap500 = createMockSnapshot(stepsToday: 500);
-      await scheduler.evaluateStateChange(snap500);
+      await scheduler.evaluateStateChange(snap500, settingsOverride: settings);
       // 因处于 90s 节流窗口，steps 被标脏合并
       expect(scheduler.isDirty, isTrue);
 
@@ -230,7 +235,7 @@ void main() {
 
       // 500 -> 501 步：同属于第 1 档（500~/500 == 1 == 501~/500），防重不触发
       final snap501 = createMockSnapshot(stepsToday: 501);
-      await scheduler.evaluateStateChange(snap501);
+      await scheduler.evaluateStateChange(snap501, settingsOverride: settings);
       expect(scheduler.isDirty, isFalse);
     });
 
@@ -247,12 +252,12 @@ void main() {
 
       // 85% -> 80%：跨过 80 档（非白名单，处于节流窗口内 -> 标脏）
       final snap80 = createMockSnapshot(batteryLevel: 80);
-      await scheduler.evaluateStateChange(snap80);
+      await scheduler.evaluateStateChange(snap80, settingsOverride: settings);
       expect(scheduler.isDirty, isTrue);
 
       // 80% -> 20%：跨过 20 档（白名单 -> 立即上报）
       final snap20 = createMockSnapshot(batteryLevel: 20);
-      await scheduler.evaluateStateChange(snap20);
+      await scheduler.evaluateStateChange(snap20, settingsOverride: settings);
       expect(uploadCount, equals(2));
       expect(scheduler.isDirty, isFalse);
     });
