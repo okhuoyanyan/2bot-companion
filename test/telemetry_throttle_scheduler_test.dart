@@ -216,6 +216,9 @@ void main() {
       final settings = AppSettings(throttleIntervalSeconds: 90);
 
       // 基线状态建立：499 步
+      final snap499 = createMockSnapshot(stepsToday: 499);
+      scheduler.snapshotCollector =
+          ({bool isAppForeground = false}) async => snap499;
       await scheduler.triggerEvent(
         TelemetryTrigger.manual,
         settingsOverride: settings,
@@ -228,7 +231,9 @@ void main() {
       // 因处于 90s 节流窗口，steps 被标脏合并
       expect(scheduler.isDirty, isTrue);
 
-      // 重置脏状态以模拟窗口结束
+      // 模拟窗口到期并完成 500 步快照上报，基线确立为 500
+      scheduler.snapshotCollector =
+          ({bool isAppForeground = false}) async => snap500;
       scheduler.resetForTest();
       await scheduler.triggerEvent(TelemetryTrigger.manual, settingsOverride: settings);
       expect(uploadCount, equals(2));
