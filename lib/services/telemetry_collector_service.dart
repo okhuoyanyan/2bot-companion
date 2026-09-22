@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../models/device_telemetry.dart';
+import 'storage_service.dart';
 
 /// 设备物理状态采集服务
 class TelemetryCollectorService {

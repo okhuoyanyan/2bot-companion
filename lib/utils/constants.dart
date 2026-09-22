@@ -28,6 +28,7 @@ class AppConstants {
   // ============================================================
   static const int defaultThrottleSeconds = 90;
   static const List<int> availableThrottleSeconds = [90, 180, 600];
+  static const List<int> throttleOptions = availableThrottleSeconds;
 
   static const int defaultSilenceTimeoutHours = 6;
 

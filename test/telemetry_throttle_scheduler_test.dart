@@ -20,9 +20,10 @@ DeviceTelemetry createMockSnapshot({
 }) {
   return DeviceTelemetry(
     battery: BatteryInfo(level: batteryLevel, isCharging: isCharging),
-    wifi: WifiInfo(connected: wifiSsid != null, ssid: wifiSsid),
+    wifi: WifiInfo(connected: wifiSsid != null, ssid: wifiSsid ?? ''),
     screenLocked: screenLocked,
     foregroundApp: foregroundApp,
+    timestamp: DateTime.now().millisecondsSinceEpoch,
     isMusicActive: isMusicActive,
     isBluetoothAudio: isBluetoothAudio,
     stepsToday: stepsToday,
@@ -45,7 +46,11 @@ void main() {
     scheduler.resetForTest();
     uploadCount = 0;
     uploadedSnapshots = [];
-    uploadReturnValue = const UploadResult(success: true, mode: 'test');
+    uploadReturnValue = UploadResult(
+      success: true,
+      statusCode: 200,
+      message: 'OK',
+    );
     silenceScheduledHours = -1;
 
     scheduler.snapshotCollector = ({bool isAppForeground = false}) async {
@@ -136,10 +141,10 @@ void main() {
 
     test('3. 发送失败时仅递增连续失败计数，严禁引入定时重试', () async {
       final settings = AppSettings();
-      uploadReturnValue = const UploadResult(
+      uploadReturnValue = UploadResult(
         success: false,
-        error: 'Network timeout',
-        mode: 'test',
+        statusCode: 500,
+        message: 'Network timeout',
       );
 
       await scheduler.triggerEvent(
@@ -206,7 +211,6 @@ void main() {
       final settings = AppSettings(throttleIntervalSeconds: 90);
 
       // 基线状态建立：499 步
-      final snap499 = createMockSnapshot(stepsToday: 499);
       await scheduler.triggerEvent(
         TelemetryTrigger.manual,
         settingsOverride: settings,
@@ -262,6 +266,7 @@ void main() {
         wifi: WifiInfo(connected: true, ssid: 'Home'),
         screenLocked: true,
         foregroundApp: 'None',
+        timestamp: 1726999999000,
         usageSummary: null,
       );
       final json1 = snapWithoutUsage.toJson();
@@ -273,9 +278,10 @@ void main() {
         wifi: WifiInfo(connected: true, ssid: 'Home'),
         screenLocked: false,
         foregroundApp: '哔哩哔哩',
+        timestamp: 1726999999000,
         usageSummary: [
-          const AppUsageItem(app: '哔哩哔哩', minutes: 8),
-          const AppUsageItem(app: '微信', minutes: 3),
+          AppUsageItem(app: '哔哩哔哩', minutes: 8),
+          AppUsageItem(app: '微信', minutes: 3),
         ],
       );
       final json2 = snapWithUsage.toJson();
@@ -299,6 +305,7 @@ void main() {
         wifi: WifiInfo(connected: true, ssid: 'Home_WiFi'),
         screenLocked: false,
         foregroundApp: '网易云音乐',
+        timestamp: 1726999999000,
         placeLabels: {
           'Home_WiFi': '家',
           'Company_Office': '公司',
@@ -318,9 +325,10 @@ void main() {
     test('screenLocked 与 foregroundApp 读写真实值', () {
       final snap = DeviceTelemetry(
         battery: BatteryInfo(level: 70, isCharging: false),
-        wifi: WifiInfo(connected: false),
+        wifi: WifiInfo(connected: false, ssid: ''),
         screenLocked: false, // 真实解锁
         foregroundApp: '王者荣耀', // 真实前台应用
+        timestamp: 1726999999000,
       );
 
       final json = snap.toJson();
