@@ -84,6 +84,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // 调试版与正式版**并存**：两者签名不同、包名若相同会互相覆盖安装。
+            // 加 .debug 后缀后，本地开发用的调试包可安装在手机上而不影响正式版（正式版继续承担日常遥测）。
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
         release {
             // WO-36-RELEASE §1：签名配置恒为 release（key.properties 缺失时已于 signingConfigs 内显式失败，
             // 不再存在"旧 keystore 在则 release、否则退 debug"的静默降级路径）
