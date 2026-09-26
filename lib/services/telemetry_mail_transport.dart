@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:meta/meta.dart';
+
 import 'telemetry_mail_protocol.dart';
 
 /// ============================================================================
@@ -18,7 +20,15 @@ class MailSendResult {
   final String message;
   final int attempts;
 
-  MailSendResult({required this.success, required this.message, required this.attempts});
+  /// WO-69 追补：服务端明确限流（QQ 535 等）——调度层据此进入有界冷却
+  final bool rateLimited;
+
+  MailSendResult({
+    required this.success,
+    required this.message,
+    required this.attempts,
+    this.rateLimited = false,
+  });
 }
 
 /// 邮箱模式的连接与凭据参数（凭据来自 flutter_secure_storage，绝不落明文 SharedPreferences）
@@ -67,6 +77,11 @@ class SmtpSession {
 
   bool done = false;
   String? failure;
+
+  /// WO-69 追补整改：正文（DATA 载荷）是否已送出。
+  /// 一旦送出，投递结果即「不确定但不可重试」——服务端可能已入队；
+  /// 重试同一 payload = 重复投递（触发 QQ 535 限流的直接来源，架构师 2026-09-27 急件）。
+  bool messageTransmitted = false;
 
   int _step = 0;
   int _expected = 220;
@@ -126,6 +141,7 @@ class SmtpSession {
         _step = 8;
         _expected = 250;
         transcript.add('<message body ${message.length} chars>');
+        messageTransmitted = true; // 正文出网即不可重试（WO-69 追补：防同 payload 重复投递）
         return '$message\r\n.\r\n';
       case 8: // 250 → QUIT
         _step = 9;
@@ -156,7 +172,36 @@ class SmtpMailer {
   /// 退避节奏（§3.1：失败退避重试 2 次，1s / 3s，三次皆败才记失败）
   static const List<Duration> retryBackoff = <Duration>[Duration(seconds: 1), Duration(seconds: 3)];
 
-  /// 发送一封邮件；任何一次尝试成功即返回。
+  /// WO-69 追补：两次 SMTP 会话的最小间隔（同秒连发是 535 的直接触发器）。
+  /// 仅约束**本 isolate**；跨 isolate 由调度层载荷去重兜底。
+  static const Duration minSessionGap = Duration(seconds: 3);
+
+  /// 限流特征（QQ 535 文案多变，按码与关键词双判）
+  static final RegExp _rateLimitPattern =
+      RegExp(r'\b535\b|too many|frequently|frequency|limit', caseSensitive: false);
+
+  // 测试注入钩子（生产零改动）
+  static DateTime Function() nowProvider = DateTime.now;
+  static Future<void> Function(Duration) delayProvider = Future<void>.delayed;
+  @visibleForTesting
+  static Future<Socket> Function(String host, int port, Duration timeout)?
+      socketFactoryForTest;
+
+  static DateTime? _lastAttemptAt;
+
+  /// 测试辅助：清空发送节流状态（仅测试使用）
+  @visibleForTesting
+  static void resetForTest() {
+    _lastAttemptAt = null;
+  }
+
+  /// 发送一封邮件。
+  ///
+  /// WO-69 追补整改（架构师急件 2026-09-27）重试纪律：
+  ///  1. 正文送出后（[SmtpSession.messageTransmitted]）任何失败一律**不重试**——
+  ///     服务端可能已入队，重试同一 payload = 重复投递；按成功返回（宁可少确认不可重发）；
+  ///  2. 服务端限流（535 等）→ 标记 [MailSendResult.rateLimited]，调度层冷却；
+  ///  3. 两次会话强制 ≥ [minSessionGap]（有界），杜绝同秒并发会话。
   static Future<MailSendResult> send({
     required MailAccountConfig config,
     required String subject,
@@ -171,12 +216,31 @@ class SmtpMailer {
       body: body,
     );
 
+    // 最小会话间隔（有界等待，防同秒连发）
+    final last = _lastAttemptAt;
+    if (last != null) {
+      final since = nowProvider().difference(last);
+      if (since < minSessionGap) {
+        await delayProvider(minSessionGap - since);
+      }
+    }
+    _lastAttemptAt = nowProvider();
+
     final totalAttempts = backoff.length + 1;
     String lastError = '未知错误';
+    bool lastRateLimited = false;
 
     for (var attempt = 1; attempt <= totalAttempts; attempt++) {
+      final session = SmtpSession(
+        clientName: '2bot-companion',
+        account: config.account,
+        authCode: config.authCode,
+        from: config.account,
+        to: config.effectiveRecipient,
+        message: message,
+      );
       try {
-        await _sendOnce(config: config, message: message, timeout: connectTimeout);
+        await _sendOnce(config: config, session: session, timeout: connectTimeout);
         return MailSendResult(
           success: true,
           message: '邮箱上报成功 (SMTP ${config.smtpHost}:${config.smtpPort})',
@@ -184,8 +248,14 @@ class SmtpMailer {
         );
       } catch (e) {
         lastError = e.toString();
+        lastRateLimited = _rateLimitPattern.hasMatch(lastError);
+        // 正文已出网：结果不可判定 → 严禁重试（重发同 payload 触发 535）。
+        // 按成功返回让调度层推进水位（NAS 以最新快照为准，确认丢失无害）。
+        final resolved = resolveSendFailure(session, lastError, attempt, lastRateLimited);
+        if (resolved != null) return resolved;
         if (attempt <= backoff.length) {
-          await Future<void>.delayed(backoff[attempt - 1]);
+          await delayProvider(backoff[attempt - 1]);
+          _lastAttemptAt = nowProvider();
         }
       }
     }
@@ -194,28 +264,35 @@ class SmtpMailer {
       success: false,
       message: '邮箱上报失败（已重试 ${totalAttempts - 1} 次）: $lastError',
       attempts: totalAttempts,
+      rateLimited: lastRateLimited,
     );
+  }
+
+  /// WO-69 追补②：失败处置决策（纯函数，单测覆盖）。
+  /// 返回 null = 允许重试；非 null = 终止重试并按该结果返回。
+  @visibleForTesting
+  static MailSendResult? resolveSendFailure(
+      SmtpSession session, String error, int attempt, bool rateLimited) {
+    if (session.messageTransmitted) {
+      return MailSendResult(
+        success: true,
+        message: '邮箱上报已投递（DATA 后响应未确认，防重复投递不重试）：$error',
+        attempts: attempt,
+        rateLimited: rateLimited,
+      );
+    }
+    return null;
   }
 
   static Future<void> _sendOnce({
     required MailAccountConfig config,
-    required String message,
+    required SmtpSession session,
     required Duration timeout,
   }) async {
-    final session = SmtpSession(
-      clientName: '2bot-companion',
-      account: config.account,
-      authCode: config.authCode,
-      from: config.account,
-      to: config.effectiveRecipient,
-      message: message,
-    );
-
-    final socket = await SecureSocket.connect(
-      config.smtpHost,
-      config.smtpPort,
-      timeout: timeout,
-    ).timeout(timeout);
+    final socket = await (socketFactoryForTest != null
+        ? socketFactoryForTest!(config.smtpHost, config.smtpPort, timeout)
+        : SecureSocket.connect(config.smtpHost, config.smtpPort, timeout: timeout)
+            .timeout(timeout));
 
     final iterator = StreamIterator<String>(
       // cast 必要：SecureSocket 是 Stream<Uint8List>，而 utf8.decoder 是

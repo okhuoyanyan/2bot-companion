@@ -144,7 +144,9 @@ void main() {
       expect(scheduler.isDirty, isTrue);
     });
 
-    test('3. 发送失败时仅递增连续失败计数，严禁引入定时重试', () async {
+    test('3. 发送失败进入有界冷却：冷却内事件延后、期满恢复（WO-69 追补②；仍无定时重试）', () async {
+      // 追补整改依据：架构师急件 2026-09-27 ②「上报必须去重 + 有界退避」——
+      // 旧契约「失败后每次事件仍立即尝试」在 QQ 535 场景下构成自锁风暴，已被取代。
       final settings = AppSettings();
       uploadReturnValue = UploadResult(
         success: false,
@@ -162,12 +164,24 @@ void main() {
       // 距上次成功上报时间仍为空
       expect(scheduler.lastSendTime, isNull);
 
-      // 再次失败
+      // 冷却期内再次触发（manual 白名单也被冷却闸拦下）-> 延后，不产生第二次尝试
       await scheduler.triggerEvent(
         TelemetryTrigger.manual,
         settingsOverride: settings,
       );
-      expect(uploadCount, equals(2));
+      expect(uploadCount, equals(1), reason: '失败冷却期内不得再次尝试（防 535 自锁）');
+      expect(scheduler.consecutiveFailures, equals(1));
+      expect(scheduler.cooldownSkippedCount, equals(1));
+      expect(scheduler.isDirty, isTrue, reason: '被延后的事件保持标脏，冷却期满由该事件带出');
+
+      // 冷却期满（快进时钟 31 秒）-> 被延后的事件恢复尝试
+      final base = DateTime.now();
+      scheduler.nowProvider = () => base.add(const Duration(seconds: 31));
+      await scheduler.triggerEvent(
+        TelemetryTrigger.manual,
+        settingsOverride: settings,
+      );
+      expect(uploadCount, equals(2), reason: '冷却期满后事件恢复尝试');
       expect(scheduler.consecutiveFailures, equals(2));
     });
 

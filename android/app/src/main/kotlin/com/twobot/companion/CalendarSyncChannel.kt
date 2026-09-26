@@ -104,8 +104,16 @@ object CalendarSyncChannel : MethodChannel.MethodCallHandler {
                 w.post {
                     try {
                         val summary = upsertAll(events)
+                        // WO-69 追补整改（急件⑤②）：logcat 观测点——后台 isolate 经
+                        // MethodChannel 真实到达 Kotlin 的直接证据
+                        android.util.Log.d(
+                            "WO69",
+                            "upsertEvents via ${if (Looper.myLooper() == Looper.getMainLooper()) "main" else "worker"} -> " +
+                                "applied=${summary["applied"]} skipped=${summary["skipped"]} deleted=${summary["deleted"]}"
+                        )
                         main.post { result.success(summary) }
                     } catch (e: Exception) {
+                        android.util.Log.e("WO69", "upsertEvents failed", e)
                         main.post {
                             result.error("CALENDAR_ERROR", safeMessage(e), null)
                         }
@@ -154,15 +162,22 @@ object CalendarSyncChannel : MethodChannel.MethodCallHandler {
             put(CalendarContract.Calendars.VISIBLE, 1)
             put(CalendarContract.Calendars.SYNC_EVENTS, 1)
         }
-        // 本地日历标准插入形态：非 sync-adapter + 自有账号身份（不注册 AccountManager）
+        // WO-69 追补整改（急件⑤①）：真机实证非 sync-adapter 形态插入被 provider 拒绝
+        // （系统日历未见「2BOT 日历」）。改用 asSyncAdapter URI——本地日历创建的
+        // 标准配方（Etar/ICSdroid 同款）；provider 不校验 AccountManager 账户实体存在性。
         val insertUri = calendarsUri.buildUpon()
-            .appendQueryParameter(CalendarContract.CALLER_IS_SYNCADAPTER, "false")
+            .appendQueryParameter(CalendarContract.CALLER_IS_SYNCADAPTER, "true")
             .appendQueryParameter(CalendarContract.Calendars.ACCOUNT_NAME, ACCOUNT_NAME)
             .appendQueryParameter(CalendarContract.Calendars.ACCOUNT_TYPE, ACCOUNT_TYPE)
             .build()
         val uri = resolver.insert(insertUri, values)
-            ?: throw IllegalStateException("创建自建日历失败（provider 返回空）")
-        return ContentUris.parseId(uri)
+        if (uri == null) {
+            android.util.Log.e("WO69", "ensureCalendarId: provider 返回空（插入被拒）")
+            throw IllegalStateException("创建自建日历失败（provider 返回空）")
+        }
+        val calId = ContentUris.parseId(uri)
+        android.util.Log.d("WO69", "ensureCalendarId ok: calendarId=$calId")
+        return calId
     }
 
     /** 批量幂等 upsert / 取消删除。返回摘要。 */

@@ -190,10 +190,14 @@ class CalendarSyncService {
   /// 单次拉取节拍常量（暴露给测试与上层观测）
   static const Duration idleBeat = Duration(minutes: 25);
   static const Duration fallbackPollInterval = Duration(minutes: 15);
-  static const List<Duration> shortBackoff = [
-    Duration(seconds: 1),
-    Duration(seconds: 3),
-    Duration(seconds: 10),
+
+  /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
+  /// 实证：通道写失败 → 水位线卡死 → 本服务 1s/3s/10s 重连风暴 → QQ 风控 →
+  /// 连累遥测 SMTP 535。现改为 60s / 300s / 15min（封顶 15min）。
+  static const List<Duration> sessionBackoff = [
+    Duration(seconds: 60),
+    Duration(minutes: 5),
+    Duration(minutes: 15),
   ];
 
   bool get isRunning => _running;
@@ -265,15 +269,15 @@ class CalendarSyncService {
         if (_stopRequested) return;
         _consecutiveFailures++;
         debugPrint('[WO69] 会话失败（第 $_consecutiveFailures 次）：${_safeMessage(e)}');
-        // 退避：前 3 次 1s/3s/10s（快速恢复），之后一律 15 分钟兜底节奏（防风控防耗电）
-        final wait = _consecutiveFailures <= shortBackoff.length
-            ? shortBackoff[_consecutiveFailures - 1]
+        // 有界退避：60s / 5min / 15min（封顶 15min）。严禁秒级热重试（急件解耦）。
+        final wait = _consecutiveFailures <= sessionBackoff.length
+            ? sessionBackoff[_consecutiveFailures - 1]
             : fallbackPollInterval;
         _mode = 'backoff';
         _setStatus(
           mode: 'backoff',
           result: 'error',
-          error: '连接/同步失败（第 $_consecutiveFailures 次）：${_safeMessage(e)}',
+          error: '连接/同步失败（第 $_consecutiveFailures 次，$_formatWait(wait)后重试）：${_safeMessage(e)}',
         );
         if (await _sleep(wait)) return;
       }
@@ -468,6 +472,11 @@ class CalendarSyncService {
       'description': e.description,
       'cancelled': e.cancelled,
     };
+  }
+
+  String _formatWait(Duration d) {
+    if (d.inMinutes >= 1) return d.inMinutes >= 15 ? '15 分钟' : '${d.inMinutes} 分钟';
+    return '${d.inSeconds} 秒';
   }
 
   /// 分片睡眠：可被 stop() 及时打断。返回 true = 已请求停止。

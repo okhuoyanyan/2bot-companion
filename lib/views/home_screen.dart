@@ -9,6 +9,7 @@ import '../models/device_telemetry.dart';
 import '../services/background_task_service.dart';
 import '../services/storage_service.dart';
 import '../services/telemetry_collector_service.dart';
+import '../services/telemetry_throttle_scheduler.dart';
 import '../services/telemetry_uploader_service.dart';
 import '../utils/theme.dart';
 import 'widgets/config_card.dart';
@@ -171,10 +172,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// 事件驱动型静默自动上报
   Future<void> _triggerSilentReport() async {
     try {
+      // WO-69 追补整改：原裸调 upload 绕过调度器（充放电时电量流秒级连跳 → 每跳一封，
+      // 是同秒突发簇的直接来源之一）。统一收口到节流/去重/冷却纪律下（非白名单路径）。
+      await TelemetryThrottleScheduler.instance.triggerTelemetryRefresh();
+      // UI 快照本地刷新保持原语义（不发送，仅展示）
       final snap = await TelemetryCollectorService.collectSnapshot(
         isAppForeground: true,
       );
-      await TelemetryUploaderService.upload(snap);
       if (mounted) {
         setState(() {
           _snapshot = snap;

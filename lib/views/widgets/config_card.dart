@@ -181,19 +181,29 @@ class _ConfigCardState extends State<ConfigCard> {
     ));
   }
 
-  /// WO-69：日历同步状态行（读实时状态；SharedPreferences 内存态读取，代价可忽略）
+  /// WO-69：日历同步状态行（读实时状态；SharedPreferences 内存态读取，代价可忽略）。
+  /// 追补整改④：显式展示运行模式与【失败原因全文】——只显示"失败"无法定位问题。
   Widget _buildCalendarSyncStatus() {
     final state = StorageService.loadCalendarSyncState();
     final lastSyncAt = state['lastSyncAt'] as String?;
     final lastResult = state['lastResult'] as String?;
     final lastError = state['lastError'] as String?;
     final lastApplied = state['lastApplied'] as int?;
+    final mode = (state['mode'] as String?) ?? '';
+
+    const modeTexts = {
+      'idle': '推送在线 (IDLE)',
+      'poll': '兜底轮询 (15 分钟)',
+      'backoff': '故障退避中',
+      'off': '未运行',
+    };
+    final modeText = modeTexts[mode] ?? (mode.isEmpty ? '' : '模式:$mode');
 
     final Widget statusLine;
     if (lastSyncAt == null || lastSyncAt.isEmpty) {
-      statusLine = const Text(
-        '尚未同步过',
-        style: TextStyle(fontSize: 10, color: AppTheme.textMuted),
+      statusLine = Text(
+        modeText.isEmpty ? '尚未同步过' : '尚未同步过 · $modeText',
+        style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
       );
     } else {
       final at = _formatSyncTime(lastSyncAt);
@@ -201,8 +211,9 @@ class _ConfigCardState extends State<ConfigCard> {
       final resultText = (lastResult == 'ok' || lastResult == null)
           ? '同步成功$applied'
           : (lastResult == 'partial' ? '部分成功$applied' : '失败');
+      final suffix = modeText.isEmpty ? '' : ' · $modeText';
       statusLine = Text(
-        '上次同步：$at · $resultText',
+        '上次同步：$at · $resultText$suffix',
         style: TextStyle(
           fontSize: 10,
           color: (lastResult == 'ok' || lastResult == null)
@@ -211,14 +222,15 @@ class _ConfigCardState extends State<ConfigCard> {
         ),
       );
     }
+    // 失败原因全文（追补④：不得只显示"失败"）；可展开看完整栈意文本
     final errorLine = (lastError == null || lastError.isEmpty)
         ? const SizedBox.shrink()
         : Padding(
             padding: const EdgeInsets.only(top: 2),
             child: Text(
-              lastError,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
+              '失败原因：$lastError',
+              maxLines: 4,
+              overflow: TextOverflow.fade,
               style: const TextStyle(fontSize: 10, color: AppTheme.warningAmber),
             ),
           );

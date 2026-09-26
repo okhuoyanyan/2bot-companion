@@ -1,10 +1,32 @@
 import 'dart:async';
+import 'dart:convert';
+
+import 'package:meta/meta.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_settings.dart';
 import '../models/device_telemetry.dart';
 import 'storage_service.dart';
 import 'telemetry_collector_service.dart';
 import 'telemetry_uploader_service.dart';
+
+/// WO-69 追补：载荷指纹（FNV-1a 64，零依赖；去重窗口内防碰撞够用）。
+/// **必须剔除 timestamp**——快照每次采集都换新时间戳，不去除则同状态永不命中去重。
+String fnv1a64Hex(String s) {
+  var h = 0xcbf29ce484222325;
+  for (final cu in s.codeUnits) {
+    h ^= cu & 0xff;
+    h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+    h ^= (cu >> 8) & 0xff;
+    h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+  }
+  return h.toRadixString(16).padLeft(16, '0');
+}
+
+String telemetryFingerprint(DeviceTelemetry t) {
+  final json = t.toJson()..remove('timestamp');
+  return fnv1a64Hex(jsonEncode(json));
+}
 
 /// 上报触发事件类型 (WO-37 §1)
 enum TelemetryTrigger {
@@ -41,6 +63,10 @@ class TelemetryThrottleScheduler {
       TelemetryThrottleScheduler._internal();
   static TelemetryThrottleScheduler get instance => _instance;
 
+  /// 跨 isolate 投递指纹持久化键（SharedPreferencesAsync 直读平台层）
+  static const String _keyLastDeliveredFp = 'pref_last_delivered_fp';
+  static const String _keyLastDeliveredAtMs = 'pref_last_delivered_at_ms';
+
   TelemetryThrottleScheduler._internal();
 
   // 依赖注入钩子 (供单测 mock)
@@ -48,6 +74,10 @@ class TelemetryThrottleScheduler {
   Future<UploadResult> Function(DeviceTelemetry)? uploader;
   void Function(int hours)? silenceScheduler;
   void Function(String text)? notificationUpdater;
+
+  /// WO-69 追补：时钟注入（单测不真等冷却）
+  @visibleForTesting
+  DateTime Function() nowProvider = DateTime.now;
 
   DateTime? _lastSendTime;
   bool _isDirty = false;
@@ -57,6 +87,44 @@ class TelemetryThrottleScheduler {
   Timer? _silenceTimer;
   int _consecutiveFailures = 0;
   bool _isSending = false;
+
+  // ── WO-69 追补整改（架构师急件 2026-09-27）──────────────────────
+  // 真机确证：开日历同步 → 遥测同秒 4 封突发簇（日历通道写失败 → 水位线卡死 →
+  // IMAP 重试风暴 → QQ 风控 → 遥测 SMTP 535 → 失败不推进水位自锁）。三道闸：
+  //   闸1 载荷去重：同一状态快照（剔除 timestamp 后指纹一致）窗口内绝不重复投递；
+  //       指纹经 SharedPreferencesAsync 跨 isolate 共享（主/任务 isolate 双入口同闸）；
+  //   闸2 失败有界冷却：尝试时间即记录，连续失败按 30s/60s/120s（封顶 300s）冷却，
+  //       期间只标脏不发送——杜绝 535 自锁环；
+  //   闸3 发送层最小会话间隔（SmtpMailer.minSessionGap=3s，transport 层）。
+  static const Duration dedupWindow = Duration(minutes: 10);
+  static const Duration minDeliverGap = Duration(seconds: 5);
+  final Map<String, DateTime> _recentPayloadFingerprints = <String, DateTime>{};
+  DateTime? _lastAttemptTime;
+  int dedupSkippedCount = 0;
+  int cooldownSkippedCount = 0;
+
+  /// 有界冷却时长：连续失败 1/2/3+ 次 → 30s/60s/120s（封顶 300s，防 535 期间猛打）
+  Duration cooldownFor(int consecutiveFailures) {
+    if (consecutiveFailures <= 0) return Duration.zero;
+    if (consecutiveFailures == 1) return const Duration(seconds: 30);
+    if (consecutiveFailures == 2) return const Duration(seconds: 60);
+    return const Duration(seconds: 120);
+  }
+
+  /// 处于失败冷却期（尝试后未成功的保护窗）？
+  bool _inFailureCooldown(DateTime now) {
+    final last = _lastAttemptTime;
+    if (last == null || _consecutiveFailures <= 0) return false;
+    final cooldown = cooldownFor(_consecutiveFailures);
+    return now.difference(last) < cooldown;
+  }
+
+  /// 前台事件驱动刷新入口（home_screen 电池/网络流监听专用）。
+  /// WO-69 追补：原 `_triggerSilentReport` **裸调 upload 绕过调度器**——充放电时
+  /// 电量流秒级连跳 → 每跳一封。现统一收口到节流/去重/冷却纪律下（非白名单路径）。
+  Future<void> triggerTelemetryRefresh() async {
+    await triggerEvent(TelemetryTrigger.appSwitch, skipEventSwitchCheck: true);
+  }
 
   // 状态追踪器 (用于差分触发检测)
   int? _lastReportedBatteryLevel;
@@ -84,6 +152,11 @@ class TelemetryThrottleScheduler {
     _lastDirtyBatteryLevel = null;
     _consecutiveFailures = 0;
     _isSending = false;
+    _recentPayloadFingerprints.clear();
+    _persistedDeliveredFingerprint = null;
+    _lastAttemptTime = null;
+    dedupSkippedCount = 0;
+    cooldownSkippedCount = 0;
     _lastReportedBatteryLevel = null;
     _lastReportedCharging = null;
     _lastReportedScreenLocked = null;
@@ -125,24 +198,31 @@ class TelemetryThrottleScheduler {
     TelemetryTrigger trigger, {
     int? batteryLevel,
     AppSettings? settingsOverride,
+    bool skipEventSwitchCheck = false,
   }) async {
     final settings = settingsOverride ?? StorageService.loadSettings();
 
-    // 1. 检查事件开关
-    if (!isTriggerEnabled(trigger, settings)) {
+    // 跨 isolate 投递标记懒加载（闸1 的另一半：主/任务 isolate 双入口同闸）
+    // ignore: unawaited_futures
+    ensureCrossIsolateMarkLoaded();
+
+    // 1. 检查事件开关（内部刷新入口跳过——它不是独立事件，是状态刷新）
+    if (!skipEventSwitchCheck && !isTriggerEnabled(trigger, settings)) {
       return;
     }
 
     final whitelisted = isWhitelisted(trigger, batteryLevel: batteryLevel);
     final throttleWindow = Duration(seconds: settings.throttleIntervalSeconds);
-    final now = DateTime.now();
+    // 时钟统一走 nowProvider（WO-69 追补：窗口/去重/冷却同一注入时钟，测试可快进）
+    final now = nowProvider();
 
     // 2. 白名单事件：立即发送
     if (whitelisted) {
       _coalesceTimer?.cancel();
       _coalesceTimer = null;
       _isDirty = false;
-      await _dispatchReport(trigger: trigger, settings: settings);
+      await _dispatchReport(
+          trigger: trigger, settings: settings, whitelisted: whitelisted);
       return;
     }
 
@@ -156,7 +236,8 @@ class TelemetryThrottleScheduler {
       _coalesceTimer?.cancel();
       _coalesceTimer = null;
       _isDirty = false;
-      await _dispatchReport(trigger: trigger, settings: settings);
+      await _dispatchReport(
+          trigger: trigger, settings: settings, whitelisted: whitelisted);
     } else {
       // 处于限流窗口内 -> 标脏并在窗口剩余时间结束时合并发一次
       if (_coalesceTimer == null) {
@@ -172,6 +253,7 @@ class TelemetryThrottleScheduler {
               await _dispatchReport(
                 trigger: trig,
                 settings: settingsOverride ?? StorageService.loadSettings(),
+                whitelisted: isWhitelisted(trig, batteryLevel: _lastDirtyBatteryLevel),
               );
             }
           },
@@ -180,26 +262,74 @@ class TelemetryThrottleScheduler {
     }
   }
 
-  /// 执行快照采集与上报
+  /// 执行快照采集与上报（WO-69 追补：闸1 去重 + 闸2 冷却统一收口于此）
   Future<UploadResult?> _dispatchReport({
     required TelemetryTrigger trigger,
     required AppSettings settings,
+    bool whitelisted = false,
   }) async {
     if (_isSending) return null;
-    _isSending = true;
+    final now = nowProvider();
 
+    // ── 闸2：失败有界冷却 ── 连续失败期间只标脏 + 延后到冷却结束（单发延后，
+    // 非周期重试），杜绝「535 → 不推进水位 → 每次事件都立即发」的自锁环。
+    if (_inFailureCooldown(now)) {
+      cooldownSkippedCount++;
+      _isDirty = true;
+      _lastDirtyTrigger = trigger;
+      final last = _lastAttemptTime!;
+      var remaining = cooldownFor(_consecutiveFailures) - now.difference(last);
+      if (remaining < Duration.zero) remaining = Duration.zero;
+      _coalesceTimer?.cancel();
+      _coalesceTimer = Timer(remaining, () async {
+        _coalesceTimer = null;
+        if (_isDirty) {
+          final trig = _lastDirtyTrigger ?? trigger;
+          _isDirty = false;
+          await _dispatchReport(
+            trigger: trig,
+            settings: settings,
+            whitelisted: whitelisted,
+          );
+        }
+      });
+      return null;
+    }
+
+    // ── 闸1a：载荷去重（本 isolate 内存槽，快路径）──
+    _isSending = true;
+    _lastAttemptTime = now; // 尝试即记录（成败都算），冷却只对「未成功」生效
+    DeviceTelemetry snapshot;
     try {
       final collector = snapshotCollector ??
           TelemetryCollectorService.collectSnapshot;
-      final uploaderFunc = uploader ?? TelemetryUploaderService.upload;
+      snapshot = await collector(isAppForeground: false);
 
-      final snapshot = await collector(isAppForeground: false);
+      final fingerprint = telemetryFingerprint(snapshot);
+      // 手动上报 / 静默保活豁免去重：保活的本意就是「无变化也要报」，
+      // 否则 NAS 无法区分手机安静与通道离线（WO-37 契约）
+      if (_dedupApplies(trigger, whitelisted) &&
+          _isDuplicatePayload(fingerprint, now)) {
+        dedupSkippedCount++;
+        _lastSendTime = now; // 内容已在信箱：视同已上报，推进窗口基线
+        _updateLastState(snapshot);
+        notificationUpdater?.call('载荷未变化，去重跳过发送');
+        return UploadResult(
+          success: true,
+          statusCode: 200,
+          message: '去重跳过（同载荷窗口内已投递）',
+        );
+      }
+
+      final uploaderFunc = uploader ?? TelemetryUploaderService.upload;
       final result = await uploaderFunc(snapshot);
 
       if (result.success) {
-        _lastSendTime = DateTime.now();
+        _lastSendTime = nowProvider();
         _consecutiveFailures = 0;
         _updateLastState(snapshot);
+        // 指纹跨 isolate 持久化（SharedPreferencesAsync 直读平台层，绕过每 isolate 缓存）
+        await _persistDeliveredFingerprint(fingerprint, nowProvider());
 
         // 重排单发静默保活到期检查 (WO-37 §2.2 & 裁定 2)
         _rearmSilenceTimeout(settings.silenceTimeoutHours);
@@ -209,7 +339,7 @@ class TelemetryThrottleScheduler {
         );
       } else {
         _consecutiveFailures++;
-        // 失败仅记录，等下次事件再试 —— 严禁引入定时重试
+        // 失败仅记录 + 闸2 冷却，等下次事件再试 —— 严禁引入定时重试
       }
       return result;
     } catch (_) {
@@ -218,6 +348,63 @@ class TelemetryThrottleScheduler {
     } finally {
       _isSending = false;
     }
+  }
+
+  /// 命中既有去重指纹？内存槽 → 跨 isolate 持久层顺序检查。
+  bool _isDuplicatePayload(String fingerprint, DateTime now) {
+    final memAt = _recentPayloadFingerprints[fingerprint];
+    if (memAt != null && now.difference(memAt) < dedupWindow) return true;
+    final persisted = _persistedDeliveredFingerprint;
+    if (persisted != null &&
+        persisted.fp == fingerprint &&
+        now.difference(persisted.at) < dedupWindow) {
+      return true;
+    }
+    return false;
+  }
+
+  /// 去重适用面：**仅非白名单合并路径**。
+  /// 白名单事件（location/电量阈值≤20/manual/serviceRestart）语义上必须送达
+  /// （SSID 翻转/跨档/重启信号），判定须用调用点带 batteryLevel 的结果；
+  /// 静默保活豁免——保活的本意就是「无变化也要报」，否则 NAS 无法区分
+  /// 手机安静与通道离线（WO-37 契约）。
+  bool _dedupApplies(TelemetryTrigger trigger, bool whitelisted) =>
+      !whitelisted && trigger != TelemetryTrigger.silenceTimeout;
+
+  ({String fp, DateTime at})? _persistedDeliveredFingerprint;
+
+  Future<void> _persistDeliveredFingerprint(String fp, DateTime at) async {
+    _recentPayloadFingerprints[fp] = at;
+    // 有界化（防长期运行内存爬升）
+    while (_recentPayloadFingerprints.length > 16) {
+      final oldest = _recentPayloadFingerprints.entries
+          .reduce((a, b) => a.value.isBefore(b.value) ? a : b);
+      _recentPayloadFingerprints.remove(oldest.key);
+    }
+    _persistedDeliveredFingerprint = (fp: fp, at: at);
+    try {
+      // SharedPreferencesAsync：每次读写直通平台层——跨 isolate（主/任务）一致可见
+      final asyncPrefs = SharedPreferencesAsync();
+      await asyncPrefs.setString(_keyLastDeliveredFp, fp);
+      await asyncPrefs.setInt(
+          _keyLastDeliveredAtMs, at.millisecondsSinceEpoch);
+    } catch (_) {
+      // 持久层不可用仅退化为本 isolate 内存去重，不阻断上报
+    }
+  }
+
+  /// 发送前读取跨 isolate 投递标记（懒加载一次；发送频率低，代价可忽略）
+  Future<void> ensureCrossIsolateMarkLoaded() async {
+    if (_persistedDeliveredFingerprint != null) return;
+    try {
+      final asyncPrefs = SharedPreferencesAsync();
+      final fp = await asyncPrefs.getString(_keyLastDeliveredFp);
+      final ms = await asyncPrefs.getInt(_keyLastDeliveredAtMs);
+      if (fp != null && ms != null) {
+        _persistedDeliveredFingerprint =
+            (fp: fp, at: DateTime.fromMillisecondsSinceEpoch(ms));
+      }
+    } catch (_) {}
   }
 
   /// 更新状态快照比对基线
