@@ -54,6 +54,31 @@ class AppConstants {
   static const String secKeyMailAuthCode = 'sec_mail_auth_code';
   static const String secKeyMailCryptKey = 'sec_mail_crypt_key';
 
+  // ============================================================
+  // WO-69 日历自动同步（自写 IMAP IDLE 拉取 ICS → 自建本地日历）
+  // ============================================================
+  /// 日历投递邮件主题前缀（WO-68-SPEC §7 冻结契约默认值，与 NAS 侧 calendar.delivery.subjectPrefix 默认值逐字一致）
+  static const String calSubjectPrefix = 'X-2BOT-CAL-';
+  static const String defaultImapHost = 'imap.qq.com';
+  static const int defaultImapPort = 993;
+
+  /// 自建本地日历身份（严禁触碰用户其它日历：Kotlin 侧一切查询以 calendar_id 收敛）
+  static const String calendarAccountName = '2bot';
+  static const String calendarAccountType = '2bot.local';
+  static const String calendarDisplayName = '2BOT 日历';
+
+  /// 日历写入 MethodChannel（主引擎与后台任务引擎各挂一份，见 CalendarSyncChannel）
+  static const String calendarChannelName = 'com.twobot.companion/calendar_sync';
+
+  // SharedPreferences 键名（非敏感配置）
+  static const String keyCalendarSyncEnabled = 'pref_calendar_sync_enabled';
+  /// UID 水位线 JSON：{uidValidity, lastProcessedUid}（QQ flag 落不上 → "已处理"语义必须自建，与 NAS 同口径）
+  static const String keyCalendarWatermark = 'pref_calendar_watermark';
+  /// 同步状态 JSON：{lastSyncAt, lastResult, lastError, mode}（设置页展示）
+  static const String keyCalendarSyncState = 'pref_calendar_sync_state';
+  /// 幂等版本台账 JSON：{uid: {sequence, lastModifiedMs}}（Dart 侧判新旧，Kotlin 保持薄封装）
+  static const String keyCalendarEventLedger = 'pref_calendar_event_ledger';
+
   // 前台服务通知配置
   static const String notificationChannelId = '2bot_companion_channel';
   static const String notificationChannelName = '2BOT 伴侣后台保活服务';

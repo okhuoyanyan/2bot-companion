@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
 
+    <!-- WO-69 日历自动同步：仅读写自建本地日历 (ACCOUNT_TYPE=2bot.local)，严禁触碰用户其它日历 -->
+    <uses-permission android:name="android.permission.READ_CALENDAR"/>
+    <uses-permission android:name="android.permission.WRITE_CALENDAR"/>
+
     <!-- Android 10+ 步数传感器所需活动识别权限 -->
     <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION"/>
     <!-- 检查与管理勿扰模式 (DND) 必需 -->

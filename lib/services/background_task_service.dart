@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import '../utils/constants.dart';
+import 'calendar_sync_service.dart';
 import 'storage_service.dart';
 import 'telemetry_collector_service.dart';
 import 'telemetry_throttle_scheduler.dart';
@@ -44,6 +45,11 @@ class CompanionTaskHandler extends TaskHandler {
         );
         await TelemetryThrottleScheduler.instance.evaluateStateChange(snapshot);
       } catch (_) {}
+
+      // WO-69 日历自动同步 tick（独立 try/catch：任何异常绝不影响遥测主线）
+      try {
+        await CalendarSyncService.instance.tick();
+      } catch (_) {}
     });
   }
 
@@ -56,6 +62,9 @@ class CompanionTaskHandler extends TaskHandler {
   Future<void> onDestroy(DateTime timestamp) async {
     _statePollTimer?.cancel();
     _statePollTimer = null;
+    try {
+      await CalendarSyncService.instance.stop();
+    } catch (_) {}
   }
 }
 

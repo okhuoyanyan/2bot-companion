@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 import '../../models/app_settings.dart';
+import '../../services/storage_service.dart';
 import '../../utils/constants.dart';
 import '../../utils/theme.dart';
 
@@ -17,6 +21,7 @@ class ConfigFormValues {
   final int throttleIntervalSeconds;
   final int silenceTimeoutHours;
   final Map<String, bool> eventSwitches;
+  final bool calendarSyncEnabled;
 
   const ConfigFormValues({
     required this.relayUrl,
@@ -31,6 +36,7 @@ class ConfigFormValues {
     required this.throttleIntervalSeconds,
     required this.silenceTimeoutHours,
     required this.eventSwitches,
+    required this.calendarSyncEnabled,
   });
 }
 
@@ -61,6 +67,7 @@ class _ConfigCardState extends State<ConfigCard> {
   late int _selectedThrottleSeconds;
   late String _transportMode;
   late Map<String, bool> _eventSwitches;
+  late bool _calendarSyncEnabled;
   bool _obscureToken = true;
   bool _obscureAuthCode = true;
   bool _obscureKey = true;
@@ -83,6 +90,7 @@ class _ConfigCardState extends State<ConfigCard> {
     _selectedThrottleSeconds = s.throttleIntervalSeconds;
     _transportMode = s.transportMode;
     _eventSwitches = Map<String, bool>.from(s.eventSwitches);
+    _calendarSyncEnabled = s.calendarSyncEnabled;
   }
 
   @override
@@ -169,7 +177,64 @@ class _ConfigCardState extends State<ConfigCard> {
       throttleIntervalSeconds: _selectedThrottleSeconds,
       silenceTimeoutHours: silenceHours,
       eventSwitches: _eventSwitches,
+      calendarSyncEnabled: _calendarSyncEnabled,
     ));
+  }
+
+  /// WO-69：日历同步状态行（读实时状态；SharedPreferences 内存态读取，代价可忽略）
+  Widget _buildCalendarSyncStatus() {
+    final state = StorageService.loadCalendarSyncState();
+    final lastSyncAt = state['lastSyncAt'] as String?;
+    final lastResult = state['lastResult'] as String?;
+    final lastError = state['lastError'] as String?;
+    final lastApplied = state['lastApplied'] as int?;
+
+    final Widget statusLine;
+    if (lastSyncAt == null || lastSyncAt.isEmpty) {
+      statusLine = const Text(
+        '尚未同步过',
+        style: TextStyle(fontSize: 10, color: AppTheme.textMuted),
+      );
+    } else {
+      final at = _formatSyncTime(lastSyncAt);
+      final applied = lastApplied != null ? '（应用 $lastApplied 条）' : '';
+      final resultText = (lastResult == 'ok' || lastResult == null)
+          ? '同步成功$applied'
+          : (lastResult == 'partial' ? '部分成功$applied' : '失败');
+      statusLine = Text(
+        '上次同步：$at · $resultText',
+        style: TextStyle(
+          fontSize: 10,
+          color: (lastResult == 'ok' || lastResult == null)
+              ? AppTheme.textMuted
+              : AppTheme.warningAmber,
+        ),
+      );
+    }
+    final errorLine = (lastError == null || lastError.isEmpty)
+        ? const SizedBox.shrink()
+        : Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(
+              lastError,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 10, color: AppTheme.warningAmber),
+            ),
+          );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [statusLine, errorLine],
+    );
+  }
+
+  String _formatSyncTime(String iso) {
+    try {
+      final dt = DateTime.parse(iso);
+      return DateFormat('MM-dd HH:mm:ss').format(dt);
+    } catch (_) {
+      return iso;
+    }
   }
 
   Widget _secretField({
@@ -474,6 +539,44 @@ class _ConfigCardState extends State<ConfigCard> {
                 ),
                 children: _buildEventSwitchList(),
               ),
+            ),
+            const SizedBox(height: 20),
+
+            // ============ WO-69 日历自动同步（默认关，与 NAS 侧对称）============
+            SwitchListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
+              dense: true,
+              activeColor: AppTheme.primaryCyan,
+              title: const Text(
+                '日历自动同步 (WO-69)',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.textPrimary,
+                ),
+              ),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '自动从邮箱拉取 NAS 投递的日程并写入系统日历「2BOT 日历」（零操作、零公网）',
+                    style: TextStyle(fontSize: 10, color: AppTheme.textMuted),
+                  ),
+                  _buildCalendarSyncStatus(),
+                ],
+              ),
+              value: _calendarSyncEnabled,
+              onChanged: (val) async {
+                if (val) {
+                  // 运行时申请（READ+WRITE_CALENDAR 一组）；拒绝则明确提示且不生效
+                  final status = await Permission.calendar.request();
+                  if (!status.isGranted) {
+                    _toast('⚠️ 日历权限被拒绝，无法开启自动同步（不影响其它功能）');
+                    return;
+                  }
+                }
+                setState(() => _calendarSyncEnabled = val);
+              },
             ),
             const SizedBox(height: 20),
 

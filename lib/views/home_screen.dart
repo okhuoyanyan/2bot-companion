@@ -281,6 +281,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       eventSwitches: values.eventSwitches,
     );
 
+    // WO-69：日历自动同步开关（服务若在运行，下方统一热重启即生效）
+    await StorageService.setCalendarSyncEnabled(values.calendarSyncEnabled);
+
     // 若当前前台服务正在运行，热重启服务以应用新配置
     if (_isServiceRunning) {
       await BackgroundTaskService.startService(values.intervalMinutes);
