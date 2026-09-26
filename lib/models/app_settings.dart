@@ -44,6 +44,9 @@ class AppSettings {
   /// WO-37 地点标注字典（SSID -> 地点标签，如 {"Home_5G": "家", "Company": "公司"}）
   Map<String, String> placeLabels;
 
+  /// WO-69 日历自动同步开关（默认关，与 NAS 侧 calendar.delivery.enabled=false 对称）
+  bool calendarSyncEnabled;
+
   static Map<String, bool> get defaultEventSwitches => {
     'unlock': true,
     'lock': true,
@@ -76,6 +79,7 @@ class AppSettings {
     this.silenceTimeoutHours = AppConstants.defaultSilenceTimeoutHours,
     Map<String, bool>? eventSwitches,
     Map<String, String>? placeLabels,
+    this.calendarSyncEnabled = false,
   })  : eventSwitches = eventSwitches ?? Map.from(defaultEventSwitches),
         placeLabels = placeLabels ?? {};
 
@@ -130,6 +134,7 @@ class AppSettings {
     int? silenceTimeoutHours,
     Map<String, bool>? eventSwitches,
     Map<String, String>? placeLabels,
+    bool? calendarSyncEnabled,
   }) {
     return AppSettings(
       relayUrl: relayUrl ?? this.relayUrl,
@@ -148,6 +153,7 @@ class AppSettings {
       throttleIntervalSeconds:
           throttleIntervalSeconds ?? this.throttleIntervalSeconds,
       silenceTimeoutHours: silenceTimeoutHours ?? this.silenceTimeoutHours,
+      calendarSyncEnabled: calendarSyncEnabled ?? this.calendarSyncEnabled,
       eventSwitches: eventSwitches ?? Map.from(this.eventSwitches),
       placeLabels: placeLabels ?? Map.from(this.placeLabels),
     );

@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:meta/meta.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_settings.dart';
@@ -17,6 +18,14 @@ class StorageService {
   static const FlutterSecureStorage _secure = FlutterSecureStorage();
   static String _mailAuthCode = '';
   static String _mailCryptKey = '';
+
+  /// 测试辅助：清空静态缓存（WO-69 单测隔离用；生产代码严禁调用）
+  @visibleForTesting
+  static void resetForTest() {
+    _prefs = null;
+    _mailAuthCode = '';
+    _mailCryptKey = '';
+  }
 
   static Future<void> init() async {
     _prefs ??= await SharedPreferences.getInstance();
@@ -85,6 +94,8 @@ class StorageService {
       silenceTimeoutHours: p.getInt(AppConstants.keySilenceTimeoutHours) ?? AppConstants.defaultSilenceTimeoutHours,
       eventSwitches: eventSwitches,
       placeLabels: placeLabels,
+      calendarSyncEnabled:
+          p.getBool(AppConstants.keyCalendarSyncEnabled) ?? false,
     );
   }
 
@@ -191,6 +202,89 @@ class StorageService {
       } catch (_) {}
     }
     return {};
+  }
+
+  // ============================================================
+  // WO-69 日历自动同步：开关 / UID 水位线 / 同步状态 / 幂等版本台账
+  // （凭据零新增：授权码复用既有 secKeyMailAuthCode，绝不另存副本）
+  // ============================================================
+
+  /// 更新日历自动同步开关
+  static Future<void> setCalendarSyncEnabled(bool enabled) async {
+    await prefs.setBool(AppConstants.keyCalendarSyncEnabled, enabled);
+  }
+
+  /// 读取 UID 水位线；缺失/损坏一律回落全量首扫语义（与 NAS 侧同口径）
+  static ({int? uidValidity, int lastProcessedUid}) loadCalendarWatermark() {
+    final raw = prefs.getString(AppConstants.keyCalendarWatermark);
+    if (raw == null || raw.isEmpty) {
+      return (uidValidity: null, lastProcessedUid: 0);
+    }
+    try {
+      final decoded = json.decode(raw) as Map<String, dynamic>;
+      return (
+        uidValidity: decoded['uidValidity'] == null
+            ? null
+            : int.tryParse('${decoded['uidValidity']}'),
+        lastProcessedUid: int.tryParse('${decoded['lastProcessedUid']}') ?? 0,
+      );
+    } catch (_) {
+      return (uidValidity: null, lastProcessedUid: 0);
+    }
+  }
+
+  /// 原子写水位线（单键整体覆写；SharedPreferences 无 tmp+rename，靠单键不变式保一致）
+  static Future<void> saveCalendarWatermark({
+    required int? uidValidity,
+    required int lastProcessedUid,
+  }) async {
+    await prefs.setString(
+      AppConstants.keyCalendarWatermark,
+      json.encode({
+        'uidValidity': uidValidity,
+        'lastProcessedUid': lastProcessedUid,
+      }),
+    );
+  }
+
+  /// 读取同步状态（设置页展示：上次同步时间/结果）
+  static Map<String, dynamic> loadCalendarSyncState() {
+    final raw = prefs.getString(AppConstants.keyCalendarSyncState);
+    if (raw == null || raw.isEmpty) return {};
+    try {
+      final decoded = json.decode(raw);
+      return decoded is Map<String, dynamic> ? decoded : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<void> saveCalendarSyncState(Map<String, dynamic> state) async {
+    await prefs.setString(
+      AppConstants.keyCalendarSyncState,
+      json.encode(state),
+    );
+  }
+
+  /// 读取幂等版本台账 {uid: {sequence, lastModifiedMs, cancelled}}
+  static Map<String, Map<String, dynamic>> loadCalendarEventLedger() {
+    final raw = prefs.getString(AppConstants.keyCalendarEventLedger);
+    if (raw == null || raw.isEmpty) return {};
+    try {
+      final decoded = json.decode(raw) as Map<String, dynamic>;
+      return decoded.map((k, v) =>
+          MapEntry(k, (v as Map).cast<String, dynamic>()));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<void> saveCalendarEventLedger(
+      Map<String, Map<String, dynamic>> ledger) async {
+    await prefs.setString(
+      AppConstants.keyCalendarEventLedger,
+      json.encode(ledger),
+    );
   }
 
   /// 记录上报状态与时间

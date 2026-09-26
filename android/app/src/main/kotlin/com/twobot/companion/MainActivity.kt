@@ -92,6 +92,9 @@ class MainActivity : FlutterActivity(), SensorEventListener {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // WO-69: 日历通道挂主引擎；并注册任务引擎生命周期监听（后台 isolate 引擎创建时挂同一通道）
+        CalendarSyncChannel.attach(this, flutterEngine)
+        CalendarSyncChannel.ensureTaskEngineListener(applicationContext)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getNativeSensors" -> {
