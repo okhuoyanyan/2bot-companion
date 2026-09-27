@@ -79,6 +79,11 @@ class TelemetryThrottleScheduler {
   @visibleForTesting
   DateTime Function() nowProvider = DateTime.now;
 
+  /// WO-70 §7 硬性规则②：SMTP 发送与 OS 锁等待只允许发生在【后台 isolate】。
+  /// 主 isolate（UI）默认 false → dispatch 不发送，只置「待发标记」由后台
+  /// 30s tick 接力；后台任务 isolate 在 startCallback 里置 true。
+  bool isBackgroundOwner = false;
+
   DateTime? _lastSendTime;
   bool _isDirty = false;
   TelemetryTrigger? _lastDirtyTrigger;
@@ -305,6 +310,18 @@ class TelemetryThrottleScheduler {
   }) async {
     if (_isSending) return null;
     final now = nowProvider();
+
+    // ── WO-70 §7 规则②：主 isolate 只置「待发」标记，绝不触碰 SMTP/OS 锁 ──
+    if (!isBackgroundOwner) {
+      _recordGate('deferred', trigger,
+          detail: '前台 isolate 不发送，交后台 30s tick 接力');
+      try {
+        await StorageService.setTelemetryPendingKick(true);
+      } catch (_) {}
+      _isDirty = true;
+      _lastDirtyTrigger = trigger;
+      return null;
+    }
 
     // ── 闸2：失败有界冷却 ── 连续失败期间只标脏 + 延后到冷却结束（单发延后，
     // 非周期重试），杜绝「535 → 不推进水位 → 每次事件都立即发」的自锁环。

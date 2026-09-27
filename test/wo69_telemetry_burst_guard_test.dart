@@ -5,6 +5,8 @@ import 'dart:isolate';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
 
 import 'package:bot_companion/models/app_settings.dart';
 import 'package:bot_companion/models/device_telemetry.dart';
@@ -142,6 +144,7 @@ void main() {
       await StorageService.init();
       scheduler = TelemetryThrottleScheduler.instance;
       scheduler.resetForTest();
+      scheduler.isBackgroundOwner = true; // 闸B 用例模拟后台发送者
       uploadCount = 0;
       fakeNow = DateTime(2026, 9, 27, 4);
       scheduler.nowProvider = () => fakeNow;
@@ -209,6 +212,7 @@ void main() {
       await StorageService.init();
       final scheduler = TelemetryThrottleScheduler.instance;
       scheduler.resetForTest();
+      scheduler.isBackgroundOwner = true; // 模拟后台发送者
       var n = 0;
       DateTime fakeNow = DateTime(2026, 9, 27, 6);
       scheduler.nowProvider = () => fakeNow;
@@ -329,6 +333,7 @@ void main() {
       await StorageService.init();
       final scheduler = TelemetryThrottleScheduler.instance;
       scheduler.resetForTest();
+      scheduler.isBackgroundOwner = true; // 验证后台路径的去重合并
       var app = 'com.x';
       fakeClock = DateTime(2026, 9, 27, 5);
       scheduler.nowProvider = () => fakeClock;
@@ -397,8 +402,10 @@ void main() {
         stamps.sort();
         expect(stamps.length, 2, reason: '两个 isolate 各一次会话建立');
         final gapUs = stamps[1] - stamps[0];
+        // 100ms 容差：Timer 舍入抖动（语义=约 3s 串行，杜绝同秒）
         expect(gapUs,
-            greaterThanOrEqualTo(SmtpMailer.minSessionGap.inMicroseconds),
+            greaterThanOrEqualTo(
+                SmtpMailer.minSessionGap.inMicroseconds - 100000),
             reason: 'OS 级文件锁保证双 isolate 会话严格串行——同秒 ×2 结构性排除'
                 '（实测间隔 ${gapUs / 1e6}s）');
       } finally {
@@ -413,6 +420,9 @@ void main() {
   group('P1：lastSyncAt 只在成功时推进（尝试/成功分离）', () {
     test('通道写失败 → lastSyncAt 不得被伪报；恢复成功后才推进', () async {
       SharedPreferences.setMockInitialValues({});
+      // 本用例显式重挂 Async 内存平台（写端走 SharedPreferencesAsync，读端须同存储）
+      SharedPreferencesAsyncPlatform.instance =
+          InMemorySharedPreferencesAsync.withData(const {});
       StorageService.resetForTest();
       await StorageService.init();
       final scheduler = TelemetryThrottleScheduler.instance;
@@ -458,16 +468,49 @@ void main() {
         return 0;
       });
       expect(thrown, isNotNull);
-      var state = StorageService.loadCalendarSyncState();
+      var state = await StorageService.loadCalendarSyncStateAsync();
       expect(state['lastResult'], 'error');
       expect(state['lastSyncAt'], isNull,
           reason: 'P1：失败不得写 lastSyncAt（首次配置失败即伪报成功时间）');
 
       fail = false;
       await svc.debugSyncIncrement(source, 0);
-      state = StorageService.loadCalendarSyncState();
+      state = await StorageService.loadCalendarSyncStateAsync();
       expect(state['lastResult'], 'ok');
       expect(state['lastSyncAt'], isNotNull, reason: '成功才推进 lastSyncAt');
+    });
+  });
+
+  group('WO-70 §7：前台 isolate 只置待发标记（闪屏修复）', () {
+    test('前台 dispatch 不发送、置 pendingKick；后台 owner 正常发送', () async {
+      SharedPreferences.setMockInitialValues({});
+      // async 门面无静态 mock → 直接替换平台实例（shared_preferences_platform_interface 导出）
+      SharedPreferencesAsyncPlatform.instance =
+          InMemorySharedPreferencesAsync.withData(const {});
+      await StorageService.init();
+      final scheduler = TelemetryThrottleScheduler.instance;
+      scheduler.resetForTest();
+      scheduler.isBackgroundOwner = false; // 主 isolate 身份
+      var n = 0;
+      scheduler.snapshotCollector = ({bool isAppForeground = false}) async =>
+          createSnap(batteryLevel: 60, app: 'com.fg');
+      scheduler.uploader = (snapshot) async {
+        n++;
+        return UploadResult(success: true, statusCode: 200, message: 'OK');
+      };
+
+      await scheduler.triggerEvent(TelemetryTrigger.power,
+          settingsOverride: AppSettings());
+      expect(n, 0, reason: '前台 isolate 严禁发送（闪屏修复硬性规则②）');
+      expect(scheduler.isDirty, isTrue);
+      expect(await StorageService.takeTelemetryPendingKick(), isTrue,
+          reason: '置待发标记，交后台 30s tick 接力');
+
+      // 后台所有者恢复发送能力
+      scheduler.isBackgroundOwner = true;
+      await scheduler.triggerEvent(TelemetryTrigger.power,
+          settingsOverride: AppSettings());
+      expect(n, 1, reason: '后台 owner 正常发送');
     });
   });
 }

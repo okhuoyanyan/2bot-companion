@@ -318,10 +318,8 @@ class SmtpMailer {
     } catch (_) {}
   }
 
-  static File _smtpGateStampFile() {
-    final dir = lockDirOverride ?? Directory.systemTemp.path;
-    return File('$dir/wo69_smtp-gate.stamp');
-  }
+  static File _smtpGateStampFile() =>
+      File('${resolveLockDir()}/wo69_smtp-gate.stamp');
 
   static Future<void> _sendOnce({
     required MailAccountConfig config,

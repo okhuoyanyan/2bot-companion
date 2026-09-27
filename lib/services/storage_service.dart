@@ -261,11 +261,28 @@ class StorageService {
     }
   }
 
+  /// 任务 isolate 内部读最新状态（Async 直读，与写端同一存储）
+  static Future<Map<String, dynamic>> loadCalendarSyncStateAsync() async {
+    try {
+      final raw = await SharedPreferencesAsync()
+          .getString(AppConstants.keyCalendarSyncState);
+      if (raw == null || raw.isEmpty) return {};
+      final decoded = json.decode(raw);
+      return decoded is Map<String, dynamic> ? decoded : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
   static Future<void> saveCalendarSyncState(Map<String, dynamic> state) async {
-    await prefs.setString(
-      AppConstants.keyCalendarSyncState,
-      json.encode(state),
-    );
+    // WO-70：与 UI 读端对称——统一走 SharedPreferencesAsync（legacy prefs 与
+    // Async 门面在 Android 上是两套存储，跨 isolate 读不到彼此）
+    try {
+      await SharedPreferencesAsync().setString(
+        AppConstants.keyCalendarSyncState,
+        json.encode(state),
+      );
+    } catch (_) {}
   }
 
   /// 读取幂等版本台账 {uid: {sequence, lastModifiedMs, cancelled}}
@@ -295,6 +312,34 @@ class StorageService {
   // 跨 isolate 一致——旧版页面读到昨天旧状态正是缓存隔离所致）
   // ============================================================
   static const String keyTelemetryAttempts = 'pref_telemetry_attempts';
+  static const String keyTelemetryPendingKick = 'pref_telemetry_pending_kick';
+
+  /// WO-70：刷新本 isolate 的 prefs 缓存（跨 isolate 写入可见性——
+  /// 主 isolate 保存的开关值，任务 isolate 缓存里是旧的，必须 reload 后再读）
+  static Future<void> reloadPrefs() async {
+    try {
+      await _prefs?.reload();
+    } catch (_) {}
+  }
+
+  /// WO-70 §7：前台 isolate 置「待发」标记（后台 30s tick 读取并接力发送）
+  static Future<void> setTelemetryPendingKick(bool v) async {
+    try {
+      await SharedPreferencesAsync()
+          .setBool(keyTelemetryPendingKick, v);
+    } catch (_) {}
+  }
+
+  static Future<bool> takeTelemetryPendingKick() async {
+    try {
+      final asyncPrefs = SharedPreferencesAsync();
+      final v = await asyncPrefs.getBool(keyTelemetryPendingKick) ?? false;
+      if (v) await asyncPrefs.setBool(keyTelemetryPendingKick, false);
+      return v;
+    } catch (_) {
+      return false;
+    }
+  }
 
   static Future<void> recordTelemetryAttempt({
     required String trigger,

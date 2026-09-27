@@ -49,6 +49,8 @@ void main() {
 
     scheduler = TelemetryThrottleScheduler.instance;
     scheduler.resetForTest();
+    // WO-70 §7：这些用例模拟的是【后台任务 isolate】（唯一发送者）行为
+    scheduler.isBackgroundOwner = true;
     uploadCount = 0;
     uploadedSnapshots = [];
     uploadReturnValue = UploadResult(
