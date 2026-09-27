@@ -2,8 +2,12 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
 
 import 'package:bot_companion/models/app_settings.dart';
+import 'package:bot_companion/services/calendar_event_store.dart';
+import 'package:bot_companion/services/calendar_local_service.dart';
 import 'package:bot_companion/services/calendar_sync_service.dart';
 import 'package:bot_companion/services/ics_min_parser.dart';
 import 'package:bot_companion/services/imap_idle_client.dart';
@@ -20,6 +24,9 @@ void main() {
     // 静态缓存必须随每个用例重置（_prefs ??= 会跨用例泄漏上一用例的台账/水位线）
     StorageService.resetForTest();
     SharedPreferences.setMockInitialValues({});
+    // 状态写端走 SharedPreferencesAsync（与 UI 读端同存储），测试须挂内存平台实现
+    SharedPreferencesAsyncPlatform.instance =
+        InMemorySharedPreferencesAsync.withData(const {});
     await StorageService.init();
   });
 
@@ -160,7 +167,7 @@ void main() {
       await svc.debugSyncIncrement(source, 0);
       expect(gatewayBatches, hasLength(1), reason: '取消通告不得因 SEQUENCE=0 判过时丢弃');
       expect(gatewayBatches.single.single['cancelled'], isTrue);
-      final state = StorageService.loadCalendarSyncState();
+      final state = await StorageService.loadCalendarSyncStateAsync();
       expect(state['lastResult'], 'ok');
     });
 
@@ -181,7 +188,7 @@ void main() {
       expect(gatewayBatches, hasLength(1), reason: '坏件越过，好件照常应用');
       expect(gatewayBatches.single.single['uid'], 'cal_2');
       expect(StorageService.loadCalendarWatermark().lastProcessedUid, 870);
-      final state = StorageService.loadCalendarSyncState();
+      final state = await StorageService.loadCalendarSyncStateAsync();
       expect(state['lastBad'], 1);
       expect(state['lastResult'], 'partial');
     });
@@ -205,7 +212,8 @@ void main() {
       );
       final wm = StorageService.loadCalendarWatermark();
       expect(wm.lastProcessedUid, 0, reason: '第一封就失败 → 水位线不得越过任何未应用邮件');
-      expect(StorageService.loadCalendarSyncState()['lastResult'], 'error',
+      final errState = await StorageService.loadCalendarSyncStateAsync();
+      expect(errState['lastResult'], 'error',
           reason: '失败须落状态供设置页展示');
     });
 
@@ -215,6 +223,62 @@ void main() {
       final next = await svc.debugSyncIncrement(source, 800);
       expect(next, 900);
       expect(gatewayBatches, isEmpty);
+    });
+  });
+
+  group('WO-70 整改①：gateway 断路回归守门', () {
+    test('默认构造的 CalendarSyncService 必须注入 EventStoreCalendarGateway', () {
+      final svc = CalendarSyncService();
+      expect(svc.gateway, isA<EventStoreCalendarGateway>(),
+          reason: '断路回归守门：默认 MethodChannelGateway 从未被后台 isolate 激活，'
+              'store 恒空（检测员第二轮指认）');
+    });
+
+    test('写入后库内回读：store 事件数与 gateway.storedCount 一致且可渲染', () async {
+      SharedPreferences.setMockInitialValues({});
+      await StorageService.init();
+      // 重置单例库（防跨用例污染）
+      CalendarLocalService.instance.store = CalendarEventStore();
+      const crlf = '\r\n';
+      final ics = 'BEGIN:VCALENDAR$crlf'
+          'BEGIN:VEVENT$crlf'
+          'UID:cal_gate$crlf'
+          'DTSTART:20260928T090000Z$crlf'
+          'DURATION:PT1H$crlf'
+          'SUMMARY:断路守门事件$crlf'
+          'END:VEVENT$crlf'
+          'END:VCALENDAR$crlf';
+      final encoded = base64.encode(utf8.encode(ics));
+      final raw = 'Subject: X-2BOT-CAL-20260928-0100$crlf'
+          'Content-Type: multipart/mixed; boundary=B$crlf$crlf'
+          '--B$crlf'
+          'Content-Type: text/calendar; name=calendar.ics$crlf'
+          'Content-Transfer-Encoding: base64$crlf$crlf'
+          '$encoded$crlf--B--$crlf';
+      final source = FakeSource(
+        uidValidity: 1,
+        result: (
+          mails: [CalendarMail(uid: 950, subject: 'cal', raw: raw)],
+          maxSeenUid: 950,
+        ),
+      );
+      final svc = CalendarSyncService.test(
+        settingsProvider: () => AppSettings(
+          calendarSyncEnabled: true,
+          mailAccount: 'fixture@example.invalid',
+          mailAuthCode: 'FIXTURE',
+        ),
+        sourceFactory: (_) => source,
+        gateway: EventStoreCalendarGateway(),
+      );
+      await svc.debugSyncIncrement(source, 0);
+
+      // 写后回读：库内恰 1 条 + storedCount 一致 + 可渲染出该事件
+      expect(CalendarLocalService.instance.store.events.length, 1);
+      expect(await svc.gateway.storedCount(), 1);
+      final rendered = CalendarLocalService.instance.store.renderFullIcs();
+      expect(rendered, contains('UID:cal_gate'));
+      expect(rendered, contains('SUMMARY:断路守门事件'));
     });
   });
 
@@ -284,6 +348,9 @@ class FakeGateway implements CalendarGateway {
   @override
   Future<void> upsertEvents(List<Map<String, dynamic>> events) async =>
       onUpsert(events);
+
+  @override
+  Future<int> storedCount() async => -1;
 
   @override
   Future<void> ping() async {}

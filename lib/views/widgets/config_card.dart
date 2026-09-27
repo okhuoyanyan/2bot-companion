@@ -157,7 +157,8 @@ class _ConfigCardState extends State<ConfigCard> {
         return;
       }
       if (mailKey.isNotEmpty && !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(mailKey)) {
-        _toast('⚠️ 加密密钥必须是 64 个十六进制字符（32 字节）');
+        // WO-70 自验改进：失败提示带实际长度（用户可自查少输/多输）
+        _toast('⚠️ 加密密钥必须是 64 个十六进制字符（32 字节），当前 ${mailKey.length} 个字符');
         return;
       }
     } else {
@@ -255,9 +256,47 @@ class _ConfigCardState extends State<ConfigCard> {
                       fontSize: 10, color: AppTheme.warningAmber),
                 ),
               );
+        // WO-70：本机只读服务自证区（在跑/端口/URL/用户/口令/库内条数/跳过原因）
+        final serverRunning = state['serverRunning'] as bool? ?? false;
+        final serverPort = (state['serverPort'] as num?)?.toInt() ?? 0;
+        final serverUser = '${state['serverUser'] ?? ''}';
+        final serverPass = '${state['serverPass'] ?? ''}';
+        final storeCount = (state['storeCount'] as num?)?.toInt() ?? 0;
+        final bgError = '${state['bgError'] ?? ''}';
+
+        final serverBlock = Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SizedBox(height: 4),
+            Text(
+              serverRunning
+                  ? '本机服务：运行中 · 端口 $serverPort · 库内 $storeCount 条'
+                  : '本机服务：未运行${bgError.isEmpty ? "" : " · $bgError"}',
+              style: TextStyle(
+                fontSize: 10,
+                color: serverRunning
+                    ? AppTheme.accentEmerald
+                    : AppTheme.textMuted,
+              ),
+            ),
+            if (serverRunning) ...[
+              Text(
+                '订阅 URL：http://127.0.0.1:$serverPort/calendar.ics',
+                style: const TextStyle(
+                    fontSize: 10, color: AppTheme.textMuted),
+              ),
+              Text(
+                'CalDAV：http://127.0.0.1:$serverPort/ · 用户 $serverUser · 口令 $serverPass',
+                style: const TextStyle(
+                    fontSize: 10, color: AppTheme.textMuted),
+              ),
+            ],
+          ],
+        );
+
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: [statusLine, errorLine],
+          children: [statusLine, errorLine, serverBlock],
         );
       },
     );

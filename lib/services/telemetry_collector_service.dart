@@ -226,3 +226,34 @@ class TelemetryCollectorService {
     }
   }
 }
+
+/// WO-70 优先级2：读取真实构建版本（versionName/versionCode，PackageManager 直读）
+class AppVersionInfo {
+  final String versionName;
+  final int versionCode;
+  const AppVersionInfo({required this.versionName, required this.versionCode});
+}
+
+/// 独立通道调用（主 isolate 使用；失败返回 null 由 UI 回退占位）
+class AppVersionService {
+  static const MethodChannel _channel =
+      MethodChannel('com.twobot.companion/native_sensors');
+  static AppVersionInfo? _cache;
+
+  static Future<AppVersionInfo?> load() async {
+    if (_cache != null) return _cache;
+    try {
+      final data = await _channel
+          .invokeMapMethod<String, dynamic>('getAppVersion')
+          .timeout(const Duration(seconds: 3));
+      if (data == null) return null;
+      _cache = AppVersionInfo(
+        versionName: (data['versionName'] as String?) ?? '',
+        versionCode: (data['versionCode'] as num?)?.toInt() ?? 0,
+      );
+      return _cache;
+    } catch (_) {
+      return null;
+    }
+  }
+}

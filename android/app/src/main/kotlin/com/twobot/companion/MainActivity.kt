@@ -104,6 +104,21 @@ class MainActivity : FlutterActivity(), SensorEventListener {
                         result.error("NATIVE_SENSOR_ERROR", e.localizedMessage, null)
                     }
                 }
+                "getAppVersion" -> {
+                    // WO-70 优先级2：版本标签读真实构建版本（严禁硬编码）
+                    try {
+                        val pi = packageManager.getPackageInfo(packageName, 0)
+                        result.success(
+                            mapOf(
+                                "versionName" to (pi.versionName ?: ""),
+                                "versionCode" to
+                                    (if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode.toInt() else pi.versionCode)
+                            )
+                        )
+                    } catch (e: Exception) {
+                        result.error("APP_VERSION_ERROR", e.localizedMessage, null)
+                    }
+                }
                 "requestIgnoreBatteryOptimizations" -> {
                     try {
                         requestIgnoreBatteryOptimizations()

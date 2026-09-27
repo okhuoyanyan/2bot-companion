@@ -37,6 +37,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _hasUsagePermission = true;
   bool _hasNotificationPermission = true;
 
+  String _versionLabel = '…';
   StreamSubscription<BatteryState>? _batterySubscription;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
 
@@ -46,6 +47,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _loadInitialData();
     _setupEventDrivenListeners();
+    // WO-70 优先级2：版本标签读真实构建版本
+    AppVersionService.load().then((v) {
+      if (mounted && v != null) {
+        setState(() => _versionLabel = 'v${v.versionName} (${v.versionCode})');
+      }
+    });
   }
 
   @override
@@ -384,9 +391,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 color: AppTheme.cardBorder,
                 borderRadius: BorderRadius.circular(6),
               ),
-              child: const Text(
-                'v1.5.0',
-                style: TextStyle(
+              child: Text(
+                _versionLabel,
+                style: const TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
                   color: AppTheme.textSecondary,

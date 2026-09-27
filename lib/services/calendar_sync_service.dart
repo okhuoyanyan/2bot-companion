@@ -6,6 +6,7 @@ import 'package:meta/meta.dart';
 
 import '../models/app_settings.dart';
 import '../utils/constants.dart';
+import 'calendar_local_service.dart';
 import 'calendar_mail_extract.dart';
 import 'ics_min_parser.dart';
 import 'imap_idle_client.dart';
@@ -57,12 +58,30 @@ class CalendarEventLedger {
   }
 }
 
-/// 原生日历写入通道抽象（生产 = MethodChannel；测试 = 假实现）
+/// 原生日历写入通道抽象（生产 = 本机事件库；MethodChannel 为降级回滚面）
 abstract class CalendarGateway {
   /// 批量 upsert；CANCELLED 事件由原生侧按 UID 删除。失败抛异常。
   Future<void> upsertEvents(List<Map<String, dynamic>> events);
 
+  /// 库内事件总数（WO-70 整改①同步后自检用；未知 = -1）
+  Future<int> storedCount();
+
   /// 通道健康探测（可选实现；默认成功）
+  Future<void> ping() async {}
+}
+
+/// WO-70：默认日历写入通道 = 本机事件库（CalendarProvider 路径降级为回滚面）
+class EventStoreCalendarGateway implements CalendarGateway {
+  @override
+  Future<void> upsertEvents(List<Map<String, dynamic>> events) async {
+    await CalendarLocalService.instance.applyAndPersist(events);
+  }
+
+  @override
+  Future<int> storedCount() async =>
+      CalendarLocalService.instance.store.events.length;
+
+  @override
   Future<void> ping() async {}
 }
 
@@ -93,6 +112,9 @@ class MethodChannelCalendarGateway implements CalendarGateway {
 
   /// 最近一次通道往返耗时（状态页展示：驳回硬性条件①）
   static int? lastRoundTripMs;
+
+  @override
+  Future<int> storedCount() async => -1; // 降级面无法回读库内条数
 
   @override
   Future<void> ping() async {
@@ -193,7 +215,10 @@ class CalendarSyncService {
     CalendarMailSource Function(AppSettings)? sourceFactory,
     AppSettings Function()? settingsProvider,
     this.onStatus,
-  })  : gateway = gateway ?? MethodChannelCalendarGateway(),
+  // WO-70 整改①（检测员指认断路）：默认写入通道 = 本机事件库。
+  // 此前默认仍是 MethodChannelCalendarGateway（从未被后台 isolate 激活），
+  // 导致 CalendarLocalService.store 恒空、/calendar.ics 恒 0 条。
+  })  : gateway = gateway ?? EventStoreCalendarGateway(),
         sourceFactory = sourceFactory ??
             ((s) => QqImapSource(ImapConfig(
                   account: s.mailAccount,
@@ -231,10 +256,35 @@ class CalendarSyncService {
 
   /// 30s tick 入口：按开关状态起/停（天然自愈：isolate 重启后下一 tick 即恢复）
   Future<void> tick() async {
+    // WO-70：跨 isolate 写入可见性——先刷新 prefs 缓存再读开关
+    //（否则任务 isolate 永远看到启动时的旧值）
+    await StorageService.reloadPrefs();
     final settings = settingsProvider();
+    // WO-70 自验观测：开关值与分支走向（不含任何凭据）
+    // ignore: avoid_print
+    print('[WO70] tick: calEnabled=${settings.calendarSyncEnabled} '
+        'accountSet=${settings.mailAccount.trim().isNotEmpty} '
+        'authSet=${settings.mailAuthCode.trim().isNotEmpty} '
+        'running=$_running server=${CalendarLocalService.instance.isRunning}');
     final shouldRun = settings.calendarSyncEnabled &&
         settings.mailAccount.trim().isNotEmpty &&
         settings.mailAuthCode.trim().isNotEmpty;
+    // 本机只读服务与 IMAP 解耦：开关开即服务（IMAP 凭据缺失只影响拉取，
+    // 不影响对外提供已同步内容；服务常驻由 tick 自愈维持）
+    try {
+      if (settings.calendarSyncEnabled) {
+        await CalendarLocalService.instance.ensureStarted();
+        // ignore: avoid_print
+        print('[WO70] local service ensured: '
+            'running=${CalendarLocalService.instance.isRunning} '
+            'port=${CalendarLocalService.instance.port}');
+      } else {
+        await CalendarLocalService.instance.ensureStopped();
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('[WO70] ensureStarted failed: $e');
+    }
     if (shouldRun && !_running) {
       start();
     } else if (!shouldRun && _running) {
@@ -273,6 +323,7 @@ class CalendarSyncService {
   // ------------------------------------------------------------------
 
   Future<void> _runLoop() async {
+    _lastKnownState = await StorageService.loadCalendarSyncStateAsync();
     while (!_stopRequested) {
       try {
         final settings = settingsProvider();
@@ -296,10 +347,10 @@ class CalendarSyncService {
             ? sessionBackoff[_consecutiveFailures - 1]
             : fallbackPollInterval;
         _mode = 'backoff';
-        _setStatus(
+        await _setStatus(
           mode: 'backoff',
           result: 'error',
-          error: 'IMAP 会话失败（第 $_consecutiveFailures 次，$_formatWait(wait)后重试）：${_safeMessage(e)}',
+          error: 'IMAP 会话失败（第 $_consecutiveFailures 次，${_formatWait(wait)}后重试）：${_safeMessage(e)}',
         );
         if (await _sleep(wait)) return;
       }
@@ -321,6 +372,7 @@ class CalendarSyncService {
     try {
       final uidValidity = await source.connect();
       debugPrint('[WO69] IMAP 连接成功 (uidValidity=$uidValidity)');
+      _lastKnownState = await StorageService.loadCalendarSyncStateAsync();
       var wm = StorageService.loadCalendarWatermark();
       var lastUid = wm.lastProcessedUid;
       if (wm.uidValidity != null &&
@@ -338,18 +390,18 @@ class CalendarSyncService {
       lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
       _consecutiveFailures = 0;
       _mode = 'idle';
-      _setStatus(mode: 'idle', result: 'ok');
+      await _setStatus(mode: 'idle', result: 'ok');
 
       // IDLE 长连接循环
       while (!_stopRequested) {
         final accepted = await source.startIdle();
         if (!accepted) {
           _mode = 'poll';
-          _setStatus(mode: 'poll', error: '服务器不接受 IDLE，退化为兜底轮询');
+          await _setStatus(mode: 'poll', error: '服务器不接受 IDLE，退化为兜底轮询');
           // 兜底轮询：每 15 分钟整连重拉（服务循环外层 sleep 实现同节奏）
           if (await _sleep(fallbackPollInterval)) return;
           lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
-          _setStatus(mode: 'poll', result: 'ok');
+          await _setStatus(mode: 'poll', result: 'ok');
           continue;
         }
         final event = await source.waitForEvent(beat: idleBeat);
@@ -364,7 +416,7 @@ class CalendarSyncService {
         debugPrint('[WO69] IDLE 推送 EXISTS=$event，开始秒级增量');
         await source.stopIdle();
         lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
-        _setStatus(mode: 'idle', result: 'ok');
+        await _setStatus(mode: 'idle', result: 'ok');
       }
     } finally {
       try {
@@ -395,7 +447,7 @@ class CalendarSyncService {
         await StorageService.saveCalendarWatermark(
             uidValidity: uidValidity, lastProcessedUid: next);
       }
-      _touchState(result: 'ok');
+      await _touchState(result: 'ok');
       return next;
     }
 
@@ -403,6 +455,7 @@ class CalendarSyncService {
     var handledUid = lastUid;
     var appliedCount = 0;
     var badCount = 0;
+    int? stateInStore; // 库内条数自检结果（null = 通道不可回读）
     final errors = <String>[];
 
     for (final mail in mails) {
@@ -440,7 +493,7 @@ class CalendarSyncService {
           // 下次重拉时已写条目按台账跳过 → 幂等续传
           errors.add('UID ${mail.uid}: 日历写入失败（通道）(${_safeMessage(e)}；'
               '本批 ${chunkMaps.length} 条，已累计应用 $appliedCount 条)');
-          _touchState(result: 'error', error: errors.last);
+          await _touchState(result: 'error', error: errors.last);
           await StorageService.saveCalendarWatermark(
               uidValidity: uidValidity, lastProcessedUid: handledUid);
           rethrow;
@@ -462,11 +515,25 @@ class CalendarSyncService {
       await StorageService.saveCalendarWatermark(
           uidValidity: uidValidity, lastProcessedUid: next);
     }
-    _touchState(
-      result: errors.isEmpty ? 'ok' : 'partial',
+    // WO-70 整改①：同步后库内自检——本次解析应应用 N 条，库内总数不得少于
+    // 已应用累计；不符（写通道断路/静默丢弃）→ 记 failed 而非 ok。
+    var finalResult = errors.isEmpty ? 'ok' : 'partial';
+    try {
+      final inStore = await gateway.storedCount();
+      if (inStore >= 0 && inStore < appliedCount) {
+        finalResult = 'failed';
+        errors.add('库内自检不符：本次应用 $appliedCount 条但库内仅 $inStore 条');
+      }
+      if (inStore >= 0) stateInStore = inStore;
+    } catch (_) {
+      stateInStore = null; // 自检不可用（降级面）不阻断
+    }
+    await _touchState(
+      result: finalResult,
       error: errors.isEmpty ? null : errors.join('；'),
       applied: appliedCount,
       bad: badCount,
+      inStore: stateInStore,
     );
     debugPrint('[WO69] 同步完成：水位线推进至 $next（应用 $appliedCount 条，'
         '坏件 $badCount 封）');
@@ -517,8 +584,10 @@ class CalendarSyncService {
     return _stopRequested;
   }
 
-  void _touchState({String? result, String? error, int? applied, int? bad}) {
-    final state = StorageService.loadCalendarSyncState();
+  Future<void> _touchState({String? result, String? error, int? applied, int? bad, int? inStore}) async {
+    // 同步读在 tick 异步链上不可用——用最近一次快照 + 本函数写入后由 Async 落盘。
+    // 为保持 attemptLog 追加语义，这里读 Async 的最新副本（fire-and-forget 缓存）。
+    final state = _lastKnownState;
     // 驳回硬性条件①：记录「上次尝试时间」（与成功时间区分）
     state['lastAttemptAt'] = DateTime.now().toIso8601String();
     state['lastChannelMs'] = MethodChannelCalendarGateway.lastRoundTripMs;
@@ -549,13 +618,25 @@ class CalendarSyncService {
     }
     if (applied != null) state['lastApplied'] = applied;
     if (bad != null) state['lastBad'] = bad;
+    if (inStore != null && inStore >= 0) state['storeCount'] = inStore;
     state['mode'] = _mode;
-    StorageService.saveCalendarSyncState(state);
+    // WO-70：本机服务自证数据（设置页显示）
+    final local = CalendarLocalService.instance;
+    state['serverRunning'] = local.isRunning;
+    state['serverPort'] = local.port;
+    state['serverUser'] = local.username;
+    state['serverPass'] = local.password;
+    state['storeCount'] = local.store.events.length;
+    _lastKnownState = Map<String, dynamic>.of(state);
+    await StorageService.saveCalendarSyncState(state);
   }
 
-  void _setStatus({String? mode, String? result, String? error}) {
+  /// _touchState 的追加语义所需：最近一次状态副本（任务 isolate 内存）
+  Map<String, dynamic> _lastKnownState = <String, dynamic>{};
+
+  Future<void> _setStatus({String? mode, String? result, String? error}) async {
     if (mode != null) _mode = mode;
-    _touchState(result: result, error: error);
+    await _touchState(result: result, error: error);
     onStatus?.call(CalendarSyncStatus(
       lastSyncAt: DateTime.now(),
       lastResult: result ?? '',

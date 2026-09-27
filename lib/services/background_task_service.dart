@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:isolate';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import '../utils/constants.dart';
 import 'calendar_sync_service.dart';
@@ -9,6 +12,20 @@ import 'telemetry_throttle_scheduler.dart';
 /// 必须在顶级作用域声明的后台任务回调入口
 @pragma('vm:entry-point')
 void startCallback() {
+  // WO-70 §7：本 isolate 是【唯一的发送者】（SMTP/OS 锁等待只在这里异步发生）
+  TelemetryThrottleScheduler.instance.isBackgroundOwner = true;
+  // WO-70 §7 闪屏验证：后台 isolate 未捕获异常 → 显式打印（logcat 可见）+ 落状态。
+  // 架构师怀疑 +13 闪屏 = 后台 isolate 崩溃重启循环，此监听用于真机/模拟器实锤。
+  Isolate.current.addErrorListener(RawReceivePort((pair) async {
+    final List<Object> err = pair as List<Object>;
+    final msg = '后台 isolate 异常: ${err[0]} | ${err[1]}';
+    debugPrint('[WO70] $msg');
+    try {
+      final st = StorageService.loadCalendarSyncState();
+      st['bgError'] = msg;
+      await StorageService.saveCalendarSyncState(st);
+    } catch (_) {}
+  }).sendPort);
   FlutterForegroundTask.setTaskHandler(CompanionTaskHandler());
 }
 
@@ -36,6 +53,20 @@ class CompanionTaskHandler extends TaskHandler {
       );
     } catch (_) {}
 
+    // WO-70：启动即跑一次日历 tick（服务/同步随开关即刻生效，不等首个 30s）
+    try {
+      if (await StorageService.takeTelemetryPendingKick()) {
+        final kickSnap = await TelemetryCollectorService.collectSnapshot(
+          isAppForeground: false,
+        );
+        await TelemetryThrottleScheduler.instance
+            .evaluateStateChange(kickSnap);
+      }
+    } catch (_) {}
+    try {
+      await CalendarSyncService.instance.tick();
+    } catch (_) {}
+
     // 启动 30 秒周期状态差分扫描（检测解锁/锁屏、前台应用、WiFi、电量、蓝牙等事件）
     _statePollTimer?.cancel();
     _statePollTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
@@ -44,6 +75,17 @@ class CompanionTaskHandler extends TaskHandler {
           isAppForeground: false,
         );
         await TelemetryThrottleScheduler.instance.evaluateStateChange(snapshot);
+      } catch (_) {}
+
+      // WO-70：前台置「待发」标记 → 本 tick 立即评估一次（前台事件 ≤30s 接力）
+      try {
+        if (await StorageService.takeTelemetryPendingKick()) {
+          final snap0 = await TelemetryCollectorService.collectSnapshot(
+            isAppForeground: false,
+          );
+          await TelemetryThrottleScheduler.instance
+              .evaluateStateChange(snap0);
+        }
       } catch (_) {}
 
       // WO-69 日历自动同步 tick（独立 try/catch：任何异常绝不影响遥测主线）

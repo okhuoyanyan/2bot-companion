@@ -19,34 +19,54 @@ import 'package:meta/meta.dart';
 @visibleForTesting
 String? lockDirOverride;
 
-/// 在名为 [lockName] 的 OS 级文件锁内执行 [body]（同进程跨 isolate 真互斥）。
-/// 锁获取失败（如目录不可写）→ 降级为直接执行（调用方须容忍弱化语义）。
+/// 锁/戳文件目录解析（生产语义：override 优先，否则系统临时目录）。
+/// 公开给同包服务（smtp 盖章文件与锁同目录），避免生产代码触测测试钩子告警。
+String resolveLockDir() => lockDirOverride ?? Directory.systemTemp.path;
+
+/// WO-70 §7 闪屏修复：锁获取【严禁阻塞等待】——`blockingExclusive` 在主
+/// isolate 上会把调用链卡住最长 minSessionGap（闪屏回归根因）。改为
+/// 【非阻塞尝试 + 异步让出重试】：拿不到锁 → 异步 sleep 后重试（事件循环
+/// 始终空闲，任何 isolate 的 UI/遥测链路都不被卡死），有界重试后降级放行。
 Future<T> crossIsolateSynchronized<T>(
   String lockName,
-  Future<T> Function() body,
-) async {
+  Future<T> Function() body, {
+  Future<void> Function(Duration)? sleep,
+  Duration retryInterval = const Duration(milliseconds: 200),
+  int maxRetries = 20,
+}) async {
+  final doSleep = sleep ?? Future<void>.delayed;
   final dir = lockDirOverride ?? Directory.systemTemp.path;
   final lockFile = File('$dir/wo69_$lockName.lock');
   RandomAccessFile? raf;
-  try {
-    raf = await lockFile.open(mode: FileMode.append);
-    // 必须 blockingExclusive（阻塞等待）：exclusive 在 Windows 上是非阻塞语义，
-    // 第二个锁会立即抛 PathAccessException——被降级 catch 吞掉后即退化为无锁并发
-    //（第三轮实测：0.0s 间隔同秒双会话的根因）。
-    await raf.lock(FileLock.blockingExclusive);
-  } catch (_) {
-    // 锁不可用（目录不可写/平台不支持）：降级为无锁执行，绝不阻断上报主链
-    raf?.close();
+  var locked = false;
+  for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      raf ??= await lockFile.open(mode: FileMode.append);
+      // 非阻塞尝试：exclusive 在 busy 时立即抛 PathAccessException（Windows 实测）
+      await raf.lock(FileLock.exclusive);
+      locked = true;
+      break;
+    } catch (_) {
+      try {
+        await raf?.close();
+      } catch (_) {}
+      raf = null;
+      if (attempt < maxRetries) await doSleep(retryInterval);
+    }
+  }
+  if (!locked) {
+    // 有界重试耗尽（锁被长占）：降级为无锁执行——观测/发送是可容忍弱语义的路径，
+    // 绝不允许为锁阻塞任何 isolate（WO-70 §7 硬性规则①）
     return body();
   }
   try {
     return await body();
   } finally {
     try {
-      await raf.unlock();
+      await raf?.unlock();
     } catch (_) {}
     try {
-      await raf.close();
+      await raf?.close();
     } catch (_) {}
   }
 }
