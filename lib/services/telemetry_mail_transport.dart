@@ -3,8 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:meta/meta.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-
+import 'cross_isolate_lock.dart';
 import 'telemetry_mail_protocol.dart';
 
 /// ============================================================================
@@ -189,7 +188,6 @@ class SmtpMailer {
       socketFactoryForTest;
 
   static DateTime? _lastAttemptAt;
-  static const String _kLastSmtpAttemptMs = 'pref_last_smtp_attempt_ms';
 
   /// 测试辅助：清空发送节流状态（仅测试使用）
   @visibleForTesting
@@ -226,25 +224,32 @@ class SmtpMailer {
         await delayProvider(minSessionGap - since);
       }
     }
-    // 跨 isolate 同秒闸（WO-69 驳回缺陷一：同秒 ×2 = 主/任务 isolate 各开一条
-    // SMTP 会话；本 isolate 静态闸管不到对方 → 经 SharedPreferencesAsync 持久化
-    // 最近会话时刻，发起前【等待】而非丢弃——事件不丢，会话串行化）
-    try {
-      final asyncPrefs = SharedPreferencesAsync();
-      final lastMs = await asyncPrefs.getInt(_kLastSmtpAttemptMs);
-      if (lastMs != null) {
-        final since = nowProvider()
-            .difference(DateTime.fromMillisecondsSinceEpoch(lastMs));
-        if (!since.isNegative && since < minSessionGap) {
-          await delayProvider(minSessionGap - since);
+    // 跨 isolate 同秒闸（第三轮 P2，架构师裁定）：原 SharedPreferencesAsync
+    // 「读-判断-写」非原子（TOCTOU）——双 isolate 同读旧值 → 同秒双会话。
+    // 现改 OS 级文件锁：持锁者完成「读戳-等待-盖新戳」全程，后到者在锁上
+    // 排队 → 会话严格串行，事件不丢。时间戳存锁旁的 .stamp 文件
+    // （纯文件 IO，任何 isolate 可用，不依赖平台通道）。
+    await crossIsolateSynchronized('smtp-gate', () async {
+      try {
+        final stamp = _smtpGateStampFile();
+        int? lastMs;
+        try {
+          lastMs = int.tryParse(await stamp.readAsString());
+        } catch (_) {}
+        if (lastMs != null) {
+          final since = nowProvider()
+              .difference(DateTime.fromMillisecondsSinceEpoch(lastMs));
+          if (!since.isNegative && since < minSessionGap) {
+            // 持锁等待：其它 isolate 在锁上排队，串行语义由此保证
+            await delayProvider(minSessionGap - since);
+          }
         }
+        await stamp.writeAsString(
+            '${nowProvider().millisecondsSinceEpoch}', flush: true);
+      } catch (_) {
+        // 锁/文件不可用 → 退化为本 isolate 静态闸
       }
-      await asyncPrefs.setInt(
-          _kLastSmtpAttemptMs, nowProvider().millisecondsSinceEpoch);
-    } catch (_) {
-      // 持久层不可用 → 退化为本 isolate 静态闸
-    }
-    await _touchLastSmtpAttempt();
+    });
 
     final totalAttempts = backoff.length + 1;
     String lastError = '未知错误';
@@ -304,13 +309,18 @@ class SmtpMailer {
     return null;
   }
 
-  /// 统一刷新两级「最近 SMTP 会话时刻」（本 isolate 静态 + 跨 isolate 持久层）
+  /// 统一刷新「最近 SMTP 会话时刻」（本 isolate 静态 + 跨 isolate 盖章文件）
   static Future<void> _touchLastSmtpAttempt() async {
     _lastAttemptAt = nowProvider();
     try {
-      await SharedPreferencesAsync()
-          .setInt(_kLastSmtpAttemptMs, _lastAttemptAt!.millisecondsSinceEpoch);
+      await _smtpGateStampFile()
+          .writeAsString('${_lastAttemptAt!.millisecondsSinceEpoch}', flush: true);
     } catch (_) {}
+  }
+
+  static File _smtpGateStampFile() {
+    final dir = lockDirOverride ?? Directory.systemTemp.path;
+    return File('$dir/wo69_smtp-gate.stamp');
   }
 
   static Future<void> _sendOnce({

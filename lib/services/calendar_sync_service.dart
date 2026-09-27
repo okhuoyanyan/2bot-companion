@@ -535,7 +535,12 @@ class CalendarSyncService {
         {'at': state['lastAttemptAt'], 'result': result ?? state['lastResult'], 'error': error}
       ];
     }
-    state['lastSyncAt'] = DateTime.now().toIso8601String();
+    // P1（检测员手术）：lastSyncAt 语义 = 上次【成功】同步时间——
+    // 仅 ok/partial 时推进；失败也写会让「上次尝试 / 上次成功」分离落空，
+    // 且首次配置失败即伪报成功时间。
+    if (result == 'ok' || result == 'partial') {
+      state['lastSyncAt'] = DateTime.now().toIso8601String();
+    }
     if (result != null) state['lastResult'] = result;
     if (error != null) {
       state['lastError'] = error;

@@ -4,6 +4,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:meta/meta.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'cross_isolate_lock.dart';
+
 import '../models/app_settings.dart';
 import '../utils/constants.dart';
 
@@ -300,22 +302,30 @@ class StorageService {
     String? detail,
     required DateTime at,
   }) async {
-    final p = prefs;
-    List<dynamic> list = [];
-    final raw = p.getString(keyTelemetryAttempts);
-    if (raw != null && raw.isNotEmpty) {
-      try {
-        list = json.decode(raw) as List<dynamic>;
-      } catch (_) {}
-    }
-    list.insert(0, {
-      'at': at.toIso8601String(),
-      'trigger': trigger,
-      'gate': gate,
-      if (detail != null) 'detail': detail,
-    });
-    if (list.length > 8) list = list.sublist(0, 8);
-    await p.setString(keyTelemetryAttempts, json.encode(list));
+    // P3（第三轮整改）：写端原走本 isolate 缓存单例 → 双 isolate 并发丢更新；
+    // 现统一 SharedPreferencesAsync + 与 SMTP 会话闸【共用同一把 OS 级锁】
+    //（读-改-写全程持锁，跨 isolate 真互斥）
+    // 闸门记录是可丢弃观测数据：任何失败（平台未初始化/锁不可用）不得影响上报主链
+    try {
+      await crossIsolateSynchronized('smtp-gate', () async {
+      final asyncPrefs = SharedPreferencesAsync();
+      List<dynamic> list = [];
+      final raw = await asyncPrefs.getString(keyTelemetryAttempts);
+      if (raw != null && raw.isNotEmpty) {
+        try {
+          list = json.decode(raw) as List<dynamic>;
+        } catch (_) {}
+      }
+      list.insert(0, {
+        'at': at.toIso8601String(),
+        'trigger': trigger,
+        'gate': gate,
+        if (detail != null) 'detail': detail,
+      });
+      if (list.length > 8) list = list.sublist(0, 8);
+      await asyncPrefs.setString(keyTelemetryAttempts, json.encode(list));
+      });
+    } catch (_) {}
   }
 
   /// UI 读取：直读平台层（SharedPreferencesAsync），绕过本 isolate 缓存

@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -7,22 +9,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:bot_companion/models/app_settings.dart';
 import 'package:bot_companion/models/device_telemetry.dart';
 import 'package:bot_companion/services/calendar_sync_service.dart';
-
-import 'calendar_sync_service_test.dart';
+import 'package:bot_companion/services/cross_isolate_lock.dart';
 import 'package:bot_companion/services/imap_idle_client.dart';
 import 'package:bot_companion/services/storage_service.dart';
 import 'package:bot_companion/services/telemetry_mail_transport.dart';
 import 'package:bot_companion/services/telemetry_throttle_scheduler.dart';
 import 'package:bot_companion/services/telemetry_uploader_service.dart';
 
+import 'calendar_sync_service_test.dart' show FakeGateway, FakeSource;
+
 /// ============================================================================
-/// WO-69 追补整改 · 突发旁路修复单测（架构师急件 2026-09-27 ②）
+/// WO-69 · 突发旁路防御单测（追补整改 + 驳回整改 + 第三轮整改 P1/P2）
 /// ============================================================================
-/// 钉死三道闸：
-///   闸A SMTP 正文出网后【禁止重试】（同 payload 重复投递 = 535 直接来源）；
-///   闸B 调度层载荷去重（非白名单路径，剔除 timestamp 后同状态不重投）；
-///   闸C 失败有界冷却 + 最小会话间隔（同秒连发被结构性排除）。
-/// 全部零真连：transport 用脚本化假 socket，scheduler 用注入假 uploader。
+/// 三道闸：闸A SMTP 正文出网后禁止重试；闸B 调度层载荷去重；闸C 失败冷却 +
+/// 白名单同类限频 + SMTP 跨 isolate 串行（OS 级文件锁）。全部零真连。
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -43,7 +43,6 @@ void main() {
         message: 'H\r\n\r\nB',
       );
       expect(s.messageTransmitted, isFalse, reason: '正文未出网前不得标记');
-      // 220 → EHLO → AUTH×3 → MAIL → RCPT → DATA → 正文
       s.onResponseLine('220 ready');
       s.onResponseLine('250 ok');
       s.onResponseLine('334 u');
@@ -73,8 +72,8 @@ void main() {
       s.onResponseLine('250 ok');
       s.onResponseLine('354 end data'); // 正文出网，250 永不到达（被限流时恰恰如此）
 
-      final resolved = SmtpMailer.resolveSendFailure(
-          s, 'TimeoutException after 5s', 1, false);
+      final resolved =
+          SmtpMailer.resolveSendFailure(s, 'TimeoutException after 5s', 1, false);
       expect(resolved, isNotNull, reason: '不得返回 null（返回 null = 允许重试 = 重复投递）');
       expect(resolved!.success, isTrue,
           reason: '按已投递返回：调度层据此推进水位，杜绝 535 自锁');
@@ -111,15 +110,15 @@ void main() {
       };
       try {
         await SmtpMailer.send(
-          config: const MailAccountConfig(
-              account: 'a@example.invalid', authCode: 'X'),
+          config:
+              const MailAccountConfig(account: 'a@example.invalid', authCode: 'X'),
           subject: 'S1',
           body: 'B',
           connectTimeout: const Duration(milliseconds: 50),
         );
         await SmtpMailer.send(
-          config: const MailAccountConfig(
-              account: 'a@example.invalid', authCode: 'X'),
+          config:
+              const MailAccountConfig(account: 'a@example.invalid', authCode: 'X'),
           subject: 'S2',
           body: 'B',
           connectTimeout: const Duration(milliseconds: 50),
@@ -160,7 +159,6 @@ void main() {
           settingsOverride: settings);
       expect(uploadCount, 1);
 
-      // 快进 2 秒：节流窗口（1s）已过 → dispatch 真正执行 → 命中去重
       fakeNow = fakeNow.add(const Duration(seconds: 2));
       await scheduler.triggerEvent(TelemetryTrigger.power,
           settingsOverride: settings);
@@ -174,7 +172,6 @@ void main() {
           settingsOverride: settings);
       expect(uploadCount, 1);
 
-      // 状态变化：前台应用切换（内容不同 → 必须送达）
       scheduler.snapshotCollector = ({bool isAppForeground = false}) async =>
           createSnap(batteryLevel: 85, app: 'com.b');
       fakeNow = fakeNow.add(const Duration(seconds: 2));
@@ -235,17 +232,13 @@ void main() {
       expect(n, 1, reason: '60s 内同类白名单事件不得立即连发（驳回缺陷一实测 5-30s 一封的来源）');
       expect(scheduler.isDirty, isTrue, reason: '事件标脏，窗口期满合并发出');
 
-      // 快进 61s → 恢复立即发
       fakeNow = fakeNow.add(const Duration(seconds: 61));
       await scheduler.triggerEvent(TelemetryTrigger.location,
           settingsOverride: settings);
       expect(n, 2);
     });
 
-    test('SMTP 跨 isolate 串行：持久化最近会话时刻，第二条会话等待 ≥3s', () async {
-      SharedPreferences.setMockInitialValues({});
-      await StorageService.init();
-      SmtpMailer.resetForTest();
+    test('SMTP 会话间隔闸：第二次 send 的首个等待 = minSessionGap', () async {
       final delays = <Duration>[];
       var now = DateTime(2026, 9, 27, 7);
       SmtpMailer.nowProvider = () => now;
@@ -255,29 +248,26 @@ void main() {
       };
       try {
         await SmtpMailer.send(
-          config: const MailAccountConfig(
-              account: 'a@example.invalid', authCode: 'X'),
+          config:
+              const MailAccountConfig(account: 'a@example.invalid', authCode: 'X'),
           subject: 'S1',
           body: 'B',
           connectTimeout: const Duration(milliseconds: 50),
         );
         await SmtpMailer.send(
-          config: const MailAccountConfig(
-              account: 'a@example.invalid', authCode: 'X'),
+          config:
+              const MailAccountConfig(account: 'a@example.invalid', authCode: 'X'),
           subject: 'S2',
           body: 'B',
           connectTimeout: const Duration(milliseconds: 50),
         );
-        // 第一次 send 的等待序列 = 会话内重试退避 1s/3s；
-        // 第二次 send 的首个等待 = 会话间隔闸强制 3s（本 isolate 静态闸先命中；
-        // 跨 isolate 持久闸与之测量同一窗口，任一命中即保证 ≥3s 间隔）
+        // 第一次 send 的等待 = 会话内重试退避 1s/3s；第二次 send 的首个等待 = 会话间隔闸 3s
         expect(delays.length, greaterThanOrEqualTo(3));
         expect(delays[2], SmtpMailer.minSessionGap,
             reason: '同秒 ×2 被结构性排除（会话间隔闸强制 3s），事件不丢');
       } finally {
         SmtpMailer.nowProvider = DateTime.now;
         SmtpMailer.delayProvider = Future<void>.delayed;
-        SmtpMailer.resetForTest();
       }
     });
   });
@@ -288,7 +278,7 @@ void main() {
       await StorageService.init();
       final scheduler = TelemetryThrottleScheduler.instance;
       scheduler.resetForTest();
-      final crlf = String.fromCharCodes([13, 10]);
+      const crlf = '\r\n';
       final ics = StringBuffer('BEGIN:VCALENDAR$crlf');
       for (var i = 0; i < 120; i++) {
         ics.write('BEGIN:VEVENT$crlf'
@@ -350,7 +340,6 @@ void main() {
         return UploadResult(success: true, statusCode: 200, message: 'OK');
       };
 
-      // 充电插拔时电量流秒级连跳三次（同状态）→ 旧实现发 3 封（同秒簇来源之一）
       await scheduler.triggerTelemetryRefresh();
       expect(n, 1);
       fakeClock = fakeClock.add(const Duration(seconds: 2));
@@ -360,11 +349,125 @@ void main() {
       await scheduler.triggerTelemetryRefresh();
       expect(n, 1);
 
-      // 真实状态变化 → 送达（快进越过 90s 节流窗口）
       app = 'com.y';
       fakeClock = fakeClock.add(const Duration(seconds: 91));
       await scheduler.triggerTelemetryRefresh();
       expect(n, 2);
+    });
+  });
+
+  group('P2 强制项：跨 isolate 真并发（OS 级锁竞争，架构师指定）', () {
+    test('双 isolate 同时 send → 会话建立时刻间隔 ≥ minSessionGap（零同秒）', () async {
+      final tmp = await Directory.systemTemp.createTemp('wo69_gate_test');
+      lockDirOverride = tmp.path;
+      final logBase = '${tmp.path}/sessions';
+      Future<void> isolateEntry(String id) async {
+        lockDirOverride = tmp.path;
+        SmtpMailer.resetForTest();
+        final ownLog = '$logBase-$id';
+        SmtpMailer.socketFactoryForTest = (host, port, timeout) async {
+          // 会话建立即记录真实墙钟（每 isolate 独立日志，规避并发 append 竞争）
+          await File(ownLog).writeAsString(
+              '${DateTime.now().microsecondsSinceEpoch}',
+              mode: FileMode.write,
+              flush: true);
+          throw StateError('connection refused (test stub)');
+        };
+        await SmtpMailer.send(
+          config:
+              const MailAccountConfig(account: 'a@example.invalid', authCode: 'X'),
+          subject: 'S',
+          body: 'B',
+          backoff: const [],
+          connectTimeout: const Duration(milliseconds: 50),
+        );
+      }
+
+      try {
+        // 两个【真实 isolate】同时发起（静态门闸按 isolate 隔离，正是被测竞争面）
+        final reports = await Future.wait([
+          Isolate.run(() => isolateEntry('A').then((_) => '$logBase-A')),
+          Isolate.run(() => isolateEntry('B').then((_) => '$logBase-B')),
+        ]);
+        final stamps = <int>[];
+        for (final f in reports) {
+          final line = await File(f).readAsString();
+          stamps.add(int.parse(line.trim()));
+        }
+        stamps.sort();
+        expect(stamps.length, 2, reason: '两个 isolate 各一次会话建立');
+        final gapUs = stamps[1] - stamps[0];
+        expect(gapUs,
+            greaterThanOrEqualTo(SmtpMailer.minSessionGap.inMicroseconds),
+            reason: 'OS 级文件锁保证双 isolate 会话严格串行——同秒 ×2 结构性排除'
+                '（实测间隔 ${gapUs / 1e6}s）');
+      } finally {
+        lockDirOverride = null;
+        try {
+          await tmp.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+  });
+
+  group('P1：lastSyncAt 只在成功时推进（尝试/成功分离）', () {
+    test('通道写失败 → lastSyncAt 不得被伪报；恢复成功后才推进', () async {
+      SharedPreferences.setMockInitialValues({});
+      StorageService.resetForTest();
+      await StorageService.init();
+      final scheduler = TelemetryThrottleScheduler.instance;
+      scheduler.resetForTest();
+      Object? thrown;
+      var fail = true;
+      const crlf = '\r\n';
+      final p1Ics = 'BEGIN:VCALENDAR$crlf'
+          'BEGIN:VEVENT$crlf'
+          'UID:cal_p1$crlf'
+          'SEQUENCE:0$crlf'
+          'DTSTART:20260928T090000Z$crlf'
+          'DURATION:PT1H$crlf'
+          'END:VEVENT$crlf'
+          'END:VCALENDAR$crlf';
+      final p1MailRaw = 'Subject: X-2BOT-CAL-20260927-1100$crlf'
+          'Content-Type: multipart/mixed; boundary=B$crlf$crlf'
+          '--B$crlf'
+          'Content-Type: text/calendar; name=calendar.ics$crlf'
+          'Content-Transfer-Encoding: base64$crlf$crlf'
+          '${base64.encode(utf8.encode(p1Ics))}$crlf'
+          '--B--$crlf';
+      final source = FakeSource(
+        uidValidity: 1,
+        result: (
+          mails: [CalendarMail(uid: 910, subject: 'cal', raw: p1MailRaw)],
+          maxSeenUid: 910,
+        ),
+      );
+      final svc = CalendarSyncService.test(
+        settingsProvider: () => AppSettings(
+          calendarSyncEnabled: true,
+          mailAccount: 'fixture@example.invalid',
+          mailAuthCode: 'FIXTURE',
+        ),
+        sourceFactory: (_) => source,
+        gateway: FakeGateway(onUpsert: (batch) {
+          if (fail) throw StateError('通道未激活(模拟)');
+        }),
+      );
+      await svc.debugSyncIncrement(source, 0).catchError((e) {
+        thrown = e;
+        return 0;
+      });
+      expect(thrown, isNotNull);
+      var state = StorageService.loadCalendarSyncState();
+      expect(state['lastResult'], 'error');
+      expect(state['lastSyncAt'], isNull,
+          reason: 'P1：失败不得写 lastSyncAt（首次配置失败即伪报成功时间）');
+
+      fail = false;
+      await svc.debugSyncIncrement(source, 0);
+      state = StorageService.loadCalendarSyncState();
+      expect(state['lastResult'], 'ok');
+      expect(state['lastSyncAt'], isNotNull, reason: '成功才推进 lastSyncAt');
     });
   });
 }

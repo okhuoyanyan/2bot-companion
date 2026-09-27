@@ -110,15 +110,18 @@ class TelemetryThrottleScheduler {
   final Map<String, DateTime> _lastWhitelistAt = <String, DateTime>{};
 
   /// 闸门判定记录（驳回硬性条件①：设置页可见 本次尝试时间/发送原因/闸门判定）
-  void _recordGate(String gate, TelemetryTrigger trigger, {String? detail}) {
+  Future<void> _recordGate(String gate, TelemetryTrigger trigger,
+      {String? detail}) async {
     try {
-      StorageService.recordTelemetryAttempt(
+      await StorageService.recordTelemetryAttempt(
         trigger: trigger.label,
         gate: gate,
         detail: detail,
         at: nowProvider(),
       );
-    } catch (_) {}
+    } catch (_) {
+      // 观测记录是可丢弃数据：失败静默，绝不影响上报主链
+    }
   }
 
   /// 有界冷却时长：连续失败 1/2/3+ 次 → 30s/60s/120s（封顶 300s，防 535 期间猛打）
