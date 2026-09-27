@@ -1,5 +1,8 @@
 import 'dart:convert';
 
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
@@ -282,6 +285,45 @@ void main() {
     });
   });
 
+  group('WO-71 ③：首次同步顺序（水位线空 → 先扫描再 IDLE）', () {
+    test('连接后第一个动作必须是扫描（fetchNewSince），绝不先 IDLE', () async {
+      StorageService.resetForTest();
+      SharedPreferences.setMockInitialValues({});
+      await StorageService.init();
+      final source = FakeSource(
+        uidValidity: 1,
+        result: (mails: [], maxSeenUid: 900),
+      );
+      final svc = CalendarSyncService.test(
+        settingsProvider: () => AppSettings(
+          calendarSyncEnabled: true,
+          mailAccount: 'fixture@example.invalid',
+          mailAuthCode: 'FIXTURE',
+        ),
+        sourceFactory: (_) => source,
+        gateway: FakeGateway(onUpsert: (_) {}),
+      );
+      // 直接驱动一个短会话：start → 等 1 秒 → stop
+      void dbg(String m) {
+        File('C:/Users/NAS/AppData/Local/Temp/wo71_dbg.log').writeAsStringSync(
+            '$m\r\n', mode: FileMode.append);
+      }
+      dbg('start begin, calls=${source.calls}');
+      svc.start();
+      dbg('start returned');
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      dbg('waited, calls=${source.calls}');
+      await svc.stop();
+      dbg('stopped, calls=${source.calls}');
+      expect(source.calls.first, 'scan',
+          reason: '水位线为空时必须先扫描再 IDLE——'
+              '先 IDLE 则无历史推送、永不扫描、库内恒 0（WO-71 §1.2）');
+      final idleIdx = source.calls.indexOf('idle');
+      final scanIdx = source.calls.indexOf('scan');
+      expect(idleIdx, greaterThan(scanIdx), reason: 'IDLE 必须在首轮扫描之后');
+    });
+  });
+
   group('时效契约常量（工单 ④ 硬指标的守门断言）', () {
     test('IDLE 节拍必须 < 30 分钟（实测服务端 30.0 分钟强断）', () {
       expect(CalendarSyncService.idleBeat, lessThan(const Duration(minutes: 30)));
@@ -360,6 +402,13 @@ class FakeSource implements CalendarMailSource {
   final int? uidValidity;
   final ({List<CalendarMail> mails, int maxSeenUid}) result;
 
+  /// WO-71 ③：调用序列记录（断言「水位线空 → 先扫描再 IDLE」）
+  final List<String> calls = <String>[];
+
+  /// 真实 IDLE 语义：waitForEvent 阻塞直到 close()（模拟服务器长等待），
+  /// 避免「立即 null」造成的紧密空转（那会饿死测试 Timer）
+  final Completer<void> _idleWake = Completer<void>();
+
   FakeSource({required this.uidValidity, required this.result});
 
   @override
@@ -367,18 +416,30 @@ class FakeSource implements CalendarMailSource {
 
   @override
   Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
-          int lastProcessedUid) async =>
-      result;
+          int lastProcessedUid) async {
+    calls.add('scan');
+    return result;
+  }
 
   @override
-  Future<bool> startIdle() async => true;
+  Future<bool> startIdle() async {
+    calls.add('idle');
+    return true;
+  }
 
   @override
-  Future<int?> waitForEvent({required Duration beat}) async => null;
+  Future<int?> waitForEvent({required Duration beat}) async {
+    // 真实 IDLE 语义：长阻塞至 close() 唤醒（否则立即 null 会让会话循环
+    // 微任务级紧密空转、饿死测试 Timer——此前用例挂死的根因）
+    await _idleWake.future;
+    return null;
+  }
 
   @override
   Future<void> stopIdle() async {}
 
   @override
-  Future<void> close() async {}
+  Future<void> close() async {
+    if (!_idleWake.isCompleted) _idleWake.complete();
+  }
 }

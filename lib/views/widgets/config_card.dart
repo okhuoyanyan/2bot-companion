@@ -74,7 +74,10 @@ class _ConfigCardState extends State<ConfigCard> {
   bool _obscureAuthCode = true;
   bool _obscureKey = true;
   Timer? _statusRefreshTimer;
-  int _statusTick = 0;
+
+  /// WO-71 任务 B（整改⑥③）：状态刷新【局部化】——ValueNotifier 只重绘
+  /// 状态文本，不再全卡 setState（全树重建会让对话框/输入框反复重建抢焦点）
+  final ValueNotifier<int> _statusTick = ValueNotifier<int>(0);
 
   bool get _isMailMode => _transportMode == AppConstants.transportMail;
 
@@ -84,7 +87,7 @@ class _ConfigCardState extends State<ConfigCard> {
     // WO-69 驳回缺陷三：状态页必须【页面显示时刷新】——5s 周期轻刷新
     // （读取走 SharedPreferencesAsync 直读平台层，不受本 isolate 缓存欺骗）
     _statusRefreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted) setState(() => _statusTick++);
+      _statusTick.value++; // 不触发 setState：只有 ValueListenableBuilder 子树重绘
     });
     final s = widget.initialSettings;
     _urlController = TextEditingController(text: s.relayUrl);
@@ -105,6 +108,7 @@ class _ConfigCardState extends State<ConfigCard> {
   @override
   void dispose() {
     _statusRefreshTimer?.cancel();
+    _statusTick.dispose();
     _urlController.dispose();
     _tokenController.dispose();
     _mailAccountController.dispose();
@@ -195,8 +199,10 @@ class _ConfigCardState extends State<ConfigCard> {
   /// WO-69：日历同步状态（FutureBuilder 每次构建直读平台层最新值；
   /// 驳回缺陷三：不再读本 isolate 缓存——那会显示昨天的旧状态）
   Widget _buildCalendarSyncStatus() {
-    return FutureBuilder<Map<String, dynamic>>(
-      key: ValueKey(_statusTick),
+    return ValueListenableBuilder<int>(
+      valueListenable: _statusTick,
+      builder: (context, tick, _) => FutureBuilder<Map<String, dynamic>>(
+      key: ValueKey(tick),
       future: StorageService.loadCalendarSyncStateFresh(),
       builder: (context, snap) {
         final state = snap.data ?? const <String, dynamic>{};
@@ -294,18 +300,53 @@ class _ConfigCardState extends State<ConfigCard> {
           ],
         );
 
+        // WO-71 A.4：IMAP 命令级可观测（命令名/规模/耗时/结果，最近 6 条）
+        final imapLog = (state['imapLog'] as List?) ?? const <dynamic>[];
+        final imapBlock = imapLog.isEmpty
+            ? const SizedBox.shrink()
+            : Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'IMAP 命令（最近 6 条）',
+                      style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          color: AppTheme.textSecondary),
+                    ),
+                    ...imapLog.map((l) => Text(
+                          '$l',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 9, color: AppTheme.textMuted),
+                        )),
+                  ],
+                ),
+              );
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [statusLine, errorLine, serverBlock, imapBlock],
+        );
+
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [statusLine, errorLine, serverBlock],
         );
       },
+      ),
     );
   }
 
   /// 遥测上报闸门记录（驳回硬性条件①：本次尝试时间/发送原因/闸门判定，最近 8 次）
   Widget _buildTelemetryAttempts() {
-    return FutureBuilder<List<Map<String, dynamic>>>(
-      key: ValueKey('tel$_statusTick'),
+    return ValueListenableBuilder<int>(
+      valueListenable: _statusTick,
+      builder: (context, tick, _) => FutureBuilder<List<Map<String, dynamic>>>(
+      key: ValueKey('tel$tick'),
       future: StorageService.loadTelemetryAttempts(),
       builder: (context, snap) {
         final attempts = snap.data ?? const <Map<String, dynamic>>[];
@@ -345,6 +386,7 @@ class _ConfigCardState extends State<ConfigCard> {
           ),
         );
       },
+      ),
     );
   }
 
