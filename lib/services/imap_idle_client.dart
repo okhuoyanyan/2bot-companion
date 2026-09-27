@@ -319,8 +319,14 @@ class ImapIdleClient {
       if (remain <= Duration.zero) {
         throw TimeoutException('IMAP 等待响应超时', timeout);
       }
-      await _waitForData(
-          remain < const Duration(seconds: 1) ? remain : const Duration(seconds: 1));
+      try {
+        // 1s 轮询切片的 TimeoutException 必须就地消化（WO-69 驳回缺陷二）：
+        // QQ 响应出现 >1s 数据间隙属常态，不致命；总体 deadline 才是判据。
+        await _waitForData(
+            remain < const Duration(seconds: 1) ? remain : const Duration(seconds: 1));
+      } on TimeoutException {
+        continue;
+      }
     }
   }
 

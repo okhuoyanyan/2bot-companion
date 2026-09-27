@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:meta/meta.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'telemetry_mail_protocol.dart';
 
@@ -188,6 +189,7 @@ class SmtpMailer {
       socketFactoryForTest;
 
   static DateTime? _lastAttemptAt;
+  static const String _kLastSmtpAttemptMs = 'pref_last_smtp_attempt_ms';
 
   /// 测试辅助：清空发送节流状态（仅测试使用）
   @visibleForTesting
@@ -224,7 +226,25 @@ class SmtpMailer {
         await delayProvider(minSessionGap - since);
       }
     }
-    _lastAttemptAt = nowProvider();
+    // 跨 isolate 同秒闸（WO-69 驳回缺陷一：同秒 ×2 = 主/任务 isolate 各开一条
+    // SMTP 会话；本 isolate 静态闸管不到对方 → 经 SharedPreferencesAsync 持久化
+    // 最近会话时刻，发起前【等待】而非丢弃——事件不丢，会话串行化）
+    try {
+      final asyncPrefs = SharedPreferencesAsync();
+      final lastMs = await asyncPrefs.getInt(_kLastSmtpAttemptMs);
+      if (lastMs != null) {
+        final since = nowProvider()
+            .difference(DateTime.fromMillisecondsSinceEpoch(lastMs));
+        if (!since.isNegative && since < minSessionGap) {
+          await delayProvider(minSessionGap - since);
+        }
+      }
+      await asyncPrefs.setInt(
+          _kLastSmtpAttemptMs, nowProvider().millisecondsSinceEpoch);
+    } catch (_) {
+      // 持久层不可用 → 退化为本 isolate 静态闸
+    }
+    await _touchLastSmtpAttempt();
 
     final totalAttempts = backoff.length + 1;
     String lastError = '未知错误';
@@ -255,7 +275,7 @@ class SmtpMailer {
         if (resolved != null) return resolved;
         if (attempt <= backoff.length) {
           await delayProvider(backoff[attempt - 1]);
-          _lastAttemptAt = nowProvider();
+          await _touchLastSmtpAttempt();
         }
       }
     }
@@ -282,6 +302,15 @@ class SmtpMailer {
       );
     }
     return null;
+  }
+
+  /// 统一刷新两级「最近 SMTP 会话时刻」（本 isolate 静态 + 跨 isolate 持久层）
+  static Future<void> _touchLastSmtpAttempt() async {
+    _lastAttemptAt = nowProvider();
+    try {
+      await SharedPreferencesAsync()
+          .setInt(_kLastSmtpAttemptMs, _lastAttemptAt!.millisecondsSinceEpoch);
+    } catch (_) {}
   }
 
   static Future<void> _sendOnce({

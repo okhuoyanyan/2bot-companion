@@ -103,6 +103,24 @@ class TelemetryThrottleScheduler {
   int dedupSkippedCount = 0;
   int cooldownSkippedCount = 0;
 
+  /// WO-69 驳回缺陷一：白名单事件（location/batteryThreshold）在 WiFi/电量抖动下
+  /// 内容各不相同（去重天然拦不住）且不受 90s 窗口约束 → 5-30 秒一封。
+  /// 有界限频：同类白名单事件 60s 内只立即发一次，其余并入合并路径。
+  static const Duration whitelistMinGap = Duration(seconds: 60);
+  final Map<String, DateTime> _lastWhitelistAt = <String, DateTime>{};
+
+  /// 闸门判定记录（驳回硬性条件①：设置页可见 本次尝试时间/发送原因/闸门判定）
+  void _recordGate(String gate, TelemetryTrigger trigger, {String? detail}) {
+    try {
+      StorageService.recordTelemetryAttempt(
+        trigger: trigger.label,
+        gate: gate,
+        detail: detail,
+        at: nowProvider(),
+      );
+    } catch (_) {}
+  }
+
   /// 有界冷却时长：连续失败 1/2/3+ 次 → 30s/60s/120s（封顶 300s，防 535 期间猛打）
   Duration cooldownFor(int consecutiveFailures) {
     if (consecutiveFailures <= 0) return Duration.zero;
@@ -154,6 +172,7 @@ class TelemetryThrottleScheduler {
     _isSending = false;
     _recentPayloadFingerprints.clear();
     _persistedDeliveredFingerprint = null;
+    _lastWhitelistAt.clear();
     _lastAttemptTime = null;
     dedupSkippedCount = 0;
     cooldownSkippedCount = 0;
@@ -216,14 +235,27 @@ class TelemetryThrottleScheduler {
     // 时钟统一走 nowProvider（WO-69 追补：窗口/去重/冷却同一注入时钟，测试可快进）
     final now = nowProvider();
 
-    // 2. 白名单事件：立即发送
+    // 2. 白名单事件：立即发送——但同类事件受 60s 有界限频（驳回缺陷一：
+    //    WiFi SSID / 电量阈值抖动时内容各不相同，去重拦不住，必须限频）
     if (whitelisted) {
-      _coalesceTimer?.cancel();
-      _coalesceTimer = null;
-      _isDirty = false;
-      await _dispatchReport(
-          trigger: trigger, settings: settings, whitelisted: whitelisted);
-      return;
+      final lastWl = _lastWhitelistAt[trigger.key];
+      final flapProne = trigger == TelemetryTrigger.location ||
+          trigger == TelemetryTrigger.batteryThreshold;
+      if (flapProne &&
+          lastWl != null &&
+          now.difference(lastWl) < whitelistMinGap) {
+        _recordGate('whitelist-gap', trigger,
+            detail: '同类白名单事件 ${now.difference(lastWl).inSeconds}s 前已发，并入合并路径');
+        // 落入下方非白名单合并路径（标脏 + 窗口合并），不立即发
+      } else {
+        if (flapProne) _lastWhitelistAt[trigger.key] = now;
+        _coalesceTimer?.cancel();
+        _coalesceTimer = null;
+        _isDirty = false;
+        await _dispatchReport(
+            trigger: trigger, settings: settings, whitelisted: true);
+        return;
+      }
     }
 
     // 3. 非白名单事件：检查节流窗口
@@ -275,6 +307,8 @@ class TelemetryThrottleScheduler {
     // 非周期重试），杜绝「535 → 不推进水位 → 每次事件都立即发」的自锁环。
     if (_inFailureCooldown(now)) {
       cooldownSkippedCount++;
+      _recordGate('cooldown', trigger,
+          detail: '连续失败 $_consecutiveFailures 次，冷却期内延后');
       _isDirty = true;
       _lastDirtyTrigger = trigger;
       final last = _lastAttemptTime!;
@@ -311,6 +345,7 @@ class TelemetryThrottleScheduler {
       if (_dedupApplies(trigger, whitelisted) &&
           _isDuplicatePayload(fingerprint, now)) {
         dedupSkippedCount++;
+        _recordGate('dedup', trigger, detail: '同载荷指纹 ${fingerprint.substring(0, 8)} 窗口内已投递');
         _lastSendTime = now; // 内容已在信箱：视同已上报，推进窗口基线
         _updateLastState(snapshot);
         notificationUpdater?.call('载荷未变化，去重跳过发送');
@@ -322,9 +357,11 @@ class TelemetryThrottleScheduler {
       }
 
       final uploaderFunc = uploader ?? TelemetryUploaderService.upload;
+      _recordGate('sending', trigger, detail: '载荷 ${fingerprint.substring(0, 8)}');
       final result = await uploaderFunc(snapshot);
 
       if (result.success) {
+        _recordGate('sent', trigger, detail: result.message);
         _lastSendTime = nowProvider();
         _consecutiveFailures = 0;
         _updateLastState(snapshot);
@@ -339,11 +376,13 @@ class TelemetryThrottleScheduler {
         );
       } else {
         _consecutiveFailures++;
+        _recordGate('send-failed', trigger, detail: result.message);
         // 失败仅记录 + 闸2 冷却，等下次事件再试 —— 严禁引入定时重试
       }
       return result;
-    } catch (_) {
+    } catch (e) {
       _consecutiveFailures++;
+      _recordGate('dispatch-error', trigger, detail: e.toString());
       return null;
     } finally {
       _isSending = false;

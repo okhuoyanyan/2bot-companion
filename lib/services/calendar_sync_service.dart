@@ -70,14 +70,36 @@ class MethodChannelCalendarGateway implements CalendarGateway {
   static const MethodChannel _channel =
       MethodChannel(AppConstants.calendarChannelName);
 
+  /// 通道往返超时（驳回缺陷二：MissingPluginException 是【立即抛】，
+  /// 通道挂起是【永不完成】；10s 显式超时把「写入过慢/无应答」变成可判读错误）
+  static const Duration channelTimeout = Duration(seconds: 10);
+
   @override
   Future<void> upsertEvents(List<Map<String, dynamic>> events) async {
-    await _channel.invokeMethod('upsertEvents', {'events': events});
+    final sw = Stopwatch()..start();
+    debugPrint('[WO69] 通道请求 upsertEvents(${events.length} 条)…');
+    try {
+      await _channel
+          .invokeMethod('upsertEvents', {'events': events})
+          .timeout(channelTimeout);
+      lastRoundTripMs = sw.elapsedMilliseconds;
+      debugPrint('[WO69] 通道响应 ${sw.elapsedMilliseconds}ms (${events.length} 条)');
+    } on TimeoutException {
+      debugPrint('[WO69] 通道往返超时 ${channelTimeout.inSeconds}s '
+          '(${events.length} 条)——无应答或原生写入过慢');
+      rethrow;
+    }
   }
+
+  /// 最近一次通道往返耗时（状态页展示：驳回硬性条件①）
+  static int? lastRoundTripMs;
 
   @override
   Future<void> ping() async {
-    await _channel.invokeMethod('ping');
+    final sw = Stopwatch()..start();
+    await _channel.invokeMethod('ping').timeout(channelTimeout);
+    lastRoundTripMs = sw.elapsedMilliseconds;
+    debugPrint('[WO69] ping 往返 ${sw.elapsedMilliseconds}ms');
   }
 }
 
@@ -277,7 +299,7 @@ class CalendarSyncService {
         _setStatus(
           mode: 'backoff',
           result: 'error',
-          error: '连接/同步失败（第 $_consecutiveFailures 次，$_formatWait(wait)后重试）：${_safeMessage(e)}',
+          error: 'IMAP 会话失败（第 $_consecutiveFailures 次，$_formatWait(wait)后重试）：${_safeMessage(e)}',
         );
         if (await _sleep(wait)) return;
       }
@@ -399,31 +421,35 @@ class CalendarSyncService {
         continue;
       }
 
-      // 台账判新旧 → 只下发需应用的批次
-      final batch = <Map<String, dynamic>>[];
+      // 台账判新旧 → 分批下发（驳回缺陷二(b)：首次全量 411 条单发调用过重）
       final decided = <IcsEvent>[];
       for (final e in parsed.events) {
         if (ledger.decideFor(e) == LedgerDecision.apply) {
-          batch.add(_eventToNativeMap(e));
           decided.add(e);
         }
       }
-      if (batch.isNotEmpty) {
+      const batchSize = 50;
+      for (var i = 0; i < decided.length; i += batchSize) {
+        final chunk = decided.sublist(
+            i, (i + batchSize) < decided.length ? i + batchSize : decided.length);
+        final chunkMaps = chunk.map(_eventToNativeMap).toList();
         try {
-          await gateway.upsertEvents(batch);
+          await gateway.upsertEvents(chunkMaps);
         } catch (e) {
-          // **通道写失败不越过**：水位线停在已处理边界，下次重拉重放（幂等无害）
-          errors.add('UID ${mail.uid}: 日历写入失败（${_safeMessage(e)}）');
+          // **通道写失败不越过**：水位线停在已处理边界；已成功的批次台账已记，
+          // 下次重拉时已写条目按台账跳过 → 幂等续传
+          errors.add('UID ${mail.uid}: 日历写入失败（通道）(${_safeMessage(e)}；'
+              '本批 ${chunkMaps.length} 条，已累计应用 $appliedCount 条)');
           _touchState(result: 'error', error: errors.last);
           await StorageService.saveCalendarWatermark(
               uidValidity: uidValidity, lastProcessedUid: handledUid);
           rethrow;
         }
-        for (final e in decided) {
+        for (final e in chunk) {
           ledger.recordApplied(e);
         }
         await StorageService.saveCalendarEventLedger(ledger.entries);
-        appliedCount += decided.length;
+        appliedCount += chunk.length;
       }
       handledUid = mail.uid;
     }
@@ -493,6 +519,22 @@ class CalendarSyncService {
 
   void _touchState({String? result, String? error, int? applied, int? bad}) {
     final state = StorageService.loadCalendarSyncState();
+    // 驳回硬性条件①：记录「上次尝试时间」（与成功时间区分）
+    state['lastAttemptAt'] = DateTime.now().toIso8601String();
+    state['lastChannelMs'] = MethodChannelCalendarGateway.lastRoundTripMs;
+    if (state['attemptLog'] is List) {
+      final log = state['attemptLog'] as List;
+      log.insert(0, {
+        'at': state['lastAttemptAt'],
+        'result': result ?? state['lastResult'],
+        'error': error,
+      });
+      state['attemptLog'] = log.take(5).toList();
+    } else {
+      state['attemptLog'] = [
+        {'at': state['lastAttemptAt'], 'result': result ?? state['lastResult'], 'error': error}
+      ];
+    }
     state['lastSyncAt'] = DateTime.now().toIso8601String();
     if (result != null) state['lastResult'] = result;
     if (error != null) {

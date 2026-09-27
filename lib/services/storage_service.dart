@@ -287,6 +287,63 @@ class StorageService {
     );
   }
 
+  // ============================================================
+  // WO-69 驳回整改：遥测闸门判定记录（设置页可见：尝试时间/原因/闸门）
+  // 写入走各 isolate 缓存；读取一律走 SharedPreferencesAsync（直读平台层，
+  // 跨 isolate 一致——旧版页面读到昨天旧状态正是缓存隔离所致）
+  // ============================================================
+  static const String keyTelemetryAttempts = 'pref_telemetry_attempts';
+
+  static Future<void> recordTelemetryAttempt({
+    required String trigger,
+    required String gate,
+    String? detail,
+    required DateTime at,
+  }) async {
+    final p = prefs;
+    List<dynamic> list = [];
+    final raw = p.getString(keyTelemetryAttempts);
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        list = json.decode(raw) as List<dynamic>;
+      } catch (_) {}
+    }
+    list.insert(0, {
+      'at': at.toIso8601String(),
+      'trigger': trigger,
+      'gate': gate,
+      if (detail != null) 'detail': detail,
+    });
+    if (list.length > 8) list = list.sublist(0, 8);
+    await p.setString(keyTelemetryAttempts, json.encode(list));
+  }
+
+  /// UI 读取：直读平台层（SharedPreferencesAsync），绕过本 isolate 缓存
+  static Future<List<Map<String, dynamic>>> loadTelemetryAttempts() async {
+    try {
+      final asyncPrefs = SharedPreferencesAsync();
+      final raw = await asyncPrefs.getString(keyTelemetryAttempts);
+      if (raw == null || raw.isEmpty) return [];
+      final decoded = json.decode(raw);
+      if (decoded is List) {
+        return decoded.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  /// 日历同步状态 UI 读取：同上直读平台层（驳回缺陷三：旧缓存导致页面显示昨日状态）
+  static Future<Map<String, dynamic>> loadCalendarSyncStateFresh() async {
+    try {
+      final asyncPrefs = SharedPreferencesAsync();
+      final raw = await asyncPrefs.getString(AppConstants.keyCalendarSyncState);
+      if (raw == null || raw.isEmpty) return {};
+      final decoded = json.decode(raw);
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {}
+    return {};
+  }
+
   /// 记录上报状态与时间
   static Future<void> recordReportResult({
     required bool success,
