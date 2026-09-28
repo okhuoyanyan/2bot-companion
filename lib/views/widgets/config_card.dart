@@ -1,10 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../models/app_settings.dart';
+import '../../services/local_caldav_server.dart';
 import '../../services/storage_service.dart';
 import '../../utils/constants.dart';
 import '../../utils/theme.dart';
@@ -214,6 +216,135 @@ class _ConfigCardState extends State<ConfigCard> {
         },
       ),
     );
+  }
+
+  /// WO-73：ICS 订阅 URL（含独立令牌）展示 + 一键重置。
+  /// 运行态/端口直读平台层状态（与状态面板同源，5s tick 局部重绘）；
+  /// 令牌经 ensureIcsToken 读取——SharedPreferencesAsync 与后台 isolate 的
+  /// 服务同存储，跨 isolate 一致。重置写入后旧 URL 立即失效（服务端每请求
+  /// 直读），无需重启服务。URL 行固定高度（闪屏纪律：任何刷新不改卡片高度）。
+  Widget _buildIcsSubscription() {
+    return ValueListenableBuilder<int>(
+      valueListenable: _statusTick,
+      builder: (context, tick, _) => FutureBuilder<Map<String, dynamic>>(
+        key: ValueKey('icsPort$tick'),
+        future: StorageService.loadCalendarSyncStateFresh(),
+        builder: (context, snap) {
+          final state = snap.data ?? const <String, dynamic>{};
+          final running = state['serverRunning'] as bool? ?? false;
+          final port = (state['serverPort'] as num?)?.toInt() ?? 0;
+          return FutureBuilder<String>(
+            key: ValueKey('icsTok$tick'),
+            future: LocalCalDavServer.ensureIcsToken(),
+            builder: (context, tokSnap) {
+              final tok = tokSnap.data;
+              final url = (running && port > 0 && tok != null && tok.isNotEmpty)
+                  ? 'http://127.0.0.1:$port/calendar.ics?token=$tok'
+                  : '';
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      const Icon(Icons.link_rounded,
+                          size: 16, color: AppTheme.textSecondary),
+                      const SizedBox(width: 6),
+                      const Text(
+                        '日历订阅 URL（含独立令牌）',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: AppTheme.textPrimary,
+                        ),
+                      ),
+                      const Spacer(),
+                      TextButton.icon(
+                        onPressed:
+                            url.isEmpty ? null : () => _copyIcsUrl(url),
+                        icon: const Icon(Icons.copy_rounded, size: 14),
+                        label:
+                            const Text('复制', style: TextStyle(fontSize: 11)),
+                        style: TextButton.styleFrom(
+                          foregroundColor: AppTheme.primaryCyan,
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: (tok == null || tok.isEmpty)
+                            ? null
+                            : _confirmRotateIcsToken,
+                        icon: const Icon(Icons.refresh_rounded, size: 14),
+                        label: const Text('重置令牌',
+                            style: TextStyle(fontSize: 11)),
+                        style: TextButton.styleFrom(
+                          foregroundColor: AppTheme.textMuted,
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  SizedBox(
+                    height: 30,
+                    child: url.isEmpty
+                        ? const Text(
+                            '本机服务未运行（开启日历自动同步后显示订阅 URL）',
+                            style: TextStyle(
+                                fontSize: 10, color: AppTheme.textMuted),
+                          )
+                        : SelectableText(
+                            url,
+                            maxLines: 2,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontFamily: 'monospace',
+                              color: AppTheme.textSecondary,
+                            ),
+                          ),
+                  ),
+                  const Text(
+                    '粘贴到系统日历「URL 订阅」即可（无需输密码）；重置后旧链接立即失效。'
+                    'CalDAV 账户仍用 2bot + 口令（见状态面板）。',
+                    style: TextStyle(fontSize: 9, color: AppTheme.textMuted),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  void _copyIcsUrl(String url) {
+    Clipboard.setData(ClipboardData(text: url));
+    _toast('✅ 订阅 URL 已复制（含令牌，勿外传）');
+  }
+
+  Future<void> _confirmRotateIcsToken() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('重置订阅令牌？'),
+        content: const Text('旧订阅 URL 将立即失效，已订阅的客户端需要更新为新链接。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('重置'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await LocalCalDavServer.rotateIcsToken();
+    if (!mounted) return;
+    setState(() {}); // 重建 → FutureBuilder 换新 future → 读到新令牌
+    _toast('✅ 令牌已重置：旧订阅 URL 立即失效');
   }
 
   /// 遥测上报闸门记录（固定高度面板：恒定 8 槽，0..8 条高度不变）
@@ -580,6 +711,7 @@ class _ConfigCardState extends State<ConfigCard> {
                 setState(() => _calendarSyncEnabled = val);
               },
             ),
+            _buildIcsSubscription(),
             _buildTelemetryAttempts(),
             const SizedBox(height: 20),
 
