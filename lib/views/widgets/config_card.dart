@@ -331,11 +331,6 @@ class _ConfigCardState extends State<ConfigCard> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [statusLine, errorLine, serverBlock, imapBlock],
         );
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [statusLine, errorLine, serverBlock],
-        );
       },
       ),
     );

@@ -282,10 +282,6 @@ class ImapIdleClient {
 
   /// 从队列/assembler 取下一个单元（内部消费统一入口）
   ImapUnit? _nextUnit() {
-    // WO71-DBG2
-    try {
-      File('C:/Users/NAS/AppData/Local/Temp/wo71_dbg.log').writeAsStringSync('_nextUnit q=${_unitQueue.length} asm=${_assembler.hasUnits}\r\n', mode: FileMode.append);
-    } catch (_) {}
     if (_unitQueue.isNotEmpty) return _unitQueue.removeAt(0);
     if (_assembler.hasUnits) {
       _unitQueue.addAll(_assembler.takeUnits());
