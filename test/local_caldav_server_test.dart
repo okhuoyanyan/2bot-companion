@@ -10,6 +10,8 @@ import 'package:bot_companion/services/calendar_event_store.dart';
 import 'package:bot_companion/services/cross_isolate_lock.dart';
 import 'package:bot_companion/services/local_caldav_server.dart';
 
+import 'wo74r2_baseline.dart';
+
 /// ============================================================================
 /// WO-70 · 本机只读服务单测（事件模型 + HTTP 路由矩阵 + 只读契约）
 /// ============================================================================
@@ -101,7 +103,7 @@ void main() {
     const user = '2bot';
     const pass = 'test-pass-12';
 
-    Future<({int status, Map<String, String> headers, String body})> req(
+    Future<({int status, Map<String, String> headers, String body, List<int> bodyBytes})> req(
       String method,
       String path, {
       String? body,
@@ -181,7 +183,7 @@ void main() {
               line.substring(idx + 1).trim();
         }
       }
-      return (status: status, headers: hs, body: respBody);
+      return (status: status, headers: hs, body: respBody, bodyBytes: bodyBytes);
     }
 
     setUp(() async {
@@ -562,6 +564,137 @@ void main() {
       expect(r.body, contains('<c:calendar/>'));
       expect(r.body, contains('getctag'));
       expect(r.body, contains('<d:href>/calendars/2bot/default/</d:href>'));
+    });
+
+    // ==================================================================
+    // WO-74-R2 Phase 1 · 快照护栏（护栏③）
+    // 断言现状对照：基线 k* 常量由临时抓取脚本在【未改代码 5e57e31】上抓取后
+    // 程序化生成（test/wo74r2_baseline.dart，非手抄）；本组证明加日志前后
+    // PROPFIND 各层级与 REPORT 的 XML 正文 100% 逐字节一致。
+    // 豁免（规格）：GET /calendar.ics 的 Last-Modified 是响应头且随时间变化，
+    // 不在正文快照内（本组比对的是 body 字节，天然豁免）。
+    // ==================================================================
+    test('快照：PROPFIND 根 D1 逐字节吻合', () async {
+      final r = await req('PROPFIND', '/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineRootD1));
+    });
+    test('快照：PROPFIND principal 逐字节吻合', () async {
+      final r = await req('PROPFIND', '/principals/2bot/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselinePrincipal));
+    });
+    test('快照：PROPFIND home D1 逐字节吻合', () async {
+      final r = await req('PROPFIND', '/calendars/2bot/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineHomeD1));
+    });
+    test('快照：PROPFIND default（Depth 缺省=D1，与基线抓取口径一致）逐字节吻合',
+        () async {
+      final r = await req('PROPFIND', '/calendars/2bot/default/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineDefaultD0));
+    });
+    test('快照：REPORT sync-collection 逐字节吻合', () async {
+      final r = await req('REPORT', '/calendars/2bot/default/',
+          body: '<B:sync-collection xmlns:B="urn:ietf:params:xml:ns:caldav"/>');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineReportSync));
+    });
+    test('快照：REPORT calendar-multiget 逐字节吻合', () async {
+      final r = await req('REPORT', '/calendars/2bot/default/',
+          body: '<C:calendar-multiget xmlns:C="urn:ietf:params:xml:ns:caldav">'
+              '<D:href xmlns:D="DAV:">/calendars/2bot/default/cal_2.ics</D:href>'
+              '<D:href xmlns:D="DAV:">/calendars/2bot/default/none.ics</D:href>'
+              '</C:calendar-multiget>');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineReportMultiget));
+    });
+    test('快照：REPORT calendar-query 逐字节吻合', () async {
+      final r = await req('REPORT', '/calendars/2bot/default/',
+          body: '<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" '
+              'xmlns:D="DAV:" xmlns:g="urn:ietf:params:xml:ns:caldav:time-range">'
+              '<D:prop><D:getetag/><C:calendar-data/></D:prop>'
+              '<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter '
+              'name="VEVENT">'
+              '<g:time-range start="20240923T000000Z" '
+              'end="20240923T235959Z"/>'
+              '</C:comp-filter></C:filter></C:comp-filter>'
+              '</C:calendar-query>');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineReportQuery));
+    });
+    test('快照：GET /calendar.ics 正文逐字节吻合（Last-Modified 头豁免）', () async {
+      final r = await req('GET', '/calendar.ics?token=${server.icsToken}',
+          noAuth: true);
+      expect(r.status, 200);
+      expect(r.bodyBytes, utf8.encode(baselineIcs));
+    });
+
+    // ==================================================================
+    // WO-74-R2 Phase 1 · 访问记录行为（只落文件；凭据三禁；环形上限）
+    // ==================================================================
+    test('访问记录：格式/状态/字节齐全，且 token 与 Authorization 绝不落盘', () async {
+      final tmp = await Directory.systemTemp.createTemp('wo74r2_access');
+      LocalCalDavServer.accessLogDirOverride = tmp.path;
+      final logFile = File('${tmp.path}/caldav_access.log');
+      if (logFile.existsSync()) logFile.deleteSync();
+      try {
+        await req('GET', '/calendar.ics', noAuth: true); // 401（无 token）
+        await req('GET', '/calendar.ics?token=${server.icsToken}',
+            noAuth: true); // 200
+        await req('GET', '/calendar.ics?token=WRONG', noAuth: true); // 401
+        await req('GET', '/.well-known/caldav', noAuth: true); // 301
+        await req('PUT', '/calendars/2bot/default/x.ics',
+            body: 'x'); // 403
+        await req('PROPFIND', '/calendars/2bot/default/', depth: '0'); // 207
+        await LocalCalDavServer.accessWritesIdleForTest;
+
+        expect(logFile.existsSync(), isTrue, reason: '日志必须落盘');
+        final lines = logFile.readAsLinesSync();
+        expect(lines.length, 6, reason: '六个请求六行');
+        final b64pass = base64.encode(utf8.encode('$user:$pass'));
+        for (final l in lines) {
+          expect(l, matches(RegExp(
+              r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+ '
+              r'(GET|PUT|PROPFIND) \S+ \d{3} \d+(\.\d+?)ms \d+$')),
+              reason: '格式：时间 方法 路径 状态 耗时ms 字节');
+          expect(l.contains('token='), isFalse,
+              reason: '凭据三禁①：query 绝不落盘');
+          expect(l.contains(b64pass), isFalse, reason: '凭据三禁②');
+          expect(l.toLowerCase().contains('authorization'), isFalse,
+              reason: '凭据三禁②');
+          expect(l.contains('体检'), isFalse, reason: '凭据三禁③：响应体不落盘');
+        }
+        expect(lines.any((l) => l.contains(' 401 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 200 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 301 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 403 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 207 ')), isTrue);
+        final propfindLine = lines.firstWhere((l) => l.contains(' 207 '));
+        final bytesField =
+            int.parse(propfindLine.split(' ').last);
+        expect(bytesField, greaterThan(500), reason: '207 载荷字节=XML 长度');
+      } finally {
+        LocalCalDavServer.accessLogDirOverride = null;
+        if (tmp.existsSync()) {
+          await tmp.delete(recursive: true);
+        }
+      }
+    });
+
+    test('环形缓冲上限：超过 _accessRingMax 后保持恒定', () {
+      final before = LocalCalDavServer.accessRingSnapshot().length;
+      for (var i = 0; i < 450; i++) {
+        LocalCalDavServer.accessRingAddForTest('LINE$i');
+      }
+      final after = LocalCalDavServer.accessRingSnapshot();
+      expect(after.length, 400, reason: '环形上限 400（200–500 规格带内）');
+      expect(after.length, greaterThanOrEqualTo(before));
+      expect(after.last, 'LINE449');
+      // 清场：避免污染同套件后续用例的内存态
+      LocalCalDavServer.accessRingClearForTest();
+      expect(LocalCalDavServer.accessRingSnapshot(), isEmpty);
     });
   });
 
