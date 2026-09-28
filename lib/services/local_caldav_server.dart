@@ -1,17 +1,21 @@
-/// ============================================================================
-/// WO-70 · 本机只读服务（唯一对外出口）
-/// ============================================================================
-/// 仅绑 127.0.0.1；零新依赖（dart:io HttpServer）。
-/// 双入口：
-///   GET /calendar.ics                    → 系统日历「URL 订阅」
-///   CalDAV: / → /principals/2bot/ → /calendars/2bot/（→ /calendars/2bot/default/）
-///                                        → KashCal「CalDAV 账户」
-/// 响应形状对齐 NAS 侧 src/core/caldav-server.js（已与 KashCal 实测互通）。
-/// 只读：PUT/DELETE/POST 一律 403。认证：Basic（用户名 2bot）。
+// ============================================================================
+// WO-70 · 本机只读服务（唯一对外出口）
+// ============================================================================
+// 仅绑 127.0.0.1；零新依赖（dart:io HttpServer）。
+// 入口（WO-73 起）：
+//   GET /calendar.ics?token=<独立令牌>    → 系统日历「URL 订阅」（不认 Basic）
+//   /.well-known/caldav（GET/HEAD/PROPFIND）→ 免认证 301（RFC 6764 发现入口）
+//   CalDAV: / → /principals/2bot/ → /calendars/2bot/（→ /calendars/2bot/default/）
+//                                        → KashCal「CalDAV 账户」（仍 Basic）
+// 响应形状对齐 NAS 侧 src/core/caldav-server.js（已与 KashCal 实测互通）。
+// 只读：PUT/DELETE/POST 一律 403。认证：Basic（用户名 2bot）+ ICS 独立令牌。
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../utils/constants.dart';
 import 'calendar_event_store.dart';
@@ -26,6 +30,55 @@ class LocalCalDavServer {
 
   bool get isRunning => _server != null;
   String get url => 'http://127.0.0.1:$port';
+
+  // ------------------------------------------------------------------
+  // WO-73 · ICS 订阅独立令牌（与 Basic 口令相互独立，仅用于 GET /calendar.ics?token=）
+  // ------------------------------------------------------------------
+  // 存储走 SharedPreferencesAsync 直读平台层（WO-70 实证：legacy prefs 与
+  // Async 门面在 Android 上是两套存储，跨 isolate 不可互见）。服务端【每个
+  // 请求直读】——设置页侧重置写入后，旧令牌在下一个请求即失效，无需通知
+  // 后台 isolate。令牌绝不进任何日志（logcat 零明文）。
+  static const String icsTokenKey = 'pref_calendar_ics_token';
+
+  /// 生成 16 字节随机令牌 → 32 个 hex 字符（≥24，规格 §2.1）
+  static String generateIcsToken() {
+    final rnd = Random.secure();
+    return List<int>.generate(16, (_) => rnd.nextInt(256))
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+  }
+
+  /// 常量时间比较（防时序侧信道）：长度差折叠进累积差，不提前返回
+  static bool constantTimeEquals(String a, String b) {
+    var diff = a.length ^ b.length;
+    final n = a.length > b.length ? a.length : b.length;
+    for (var i = 0; i < n; i++) {
+      final ca = i < a.length ? a.codeUnitAt(i) : 0;
+      final cb = i < b.length ? b.codeUnitAt(i) : 0;
+      diff |= ca ^ cb;
+    }
+    return diff == 0;
+  }
+
+  /// 载入既有令牌；缺失或过短则生成并持久化（幂等）
+  static Future<String> ensureIcsToken() async {
+    final prefs = SharedPreferencesAsync();
+    final cur = await prefs.getString(icsTokenKey);
+    if (cur != null && cur.length >= 24) return cur;
+    final t = generateIcsToken();
+    await prefs.setString(icsTokenKey, t);
+    return t;
+  }
+
+  /// 一键重置：写入新随机令牌（旧令牌下一请求即失效，无需重启服务）
+  static Future<String> rotateIcsToken() async {
+    final t = generateIcsToken();
+    await SharedPreferencesAsync().setString(icsTokenKey, t);
+    return t;
+  }
+
+  String? _icsToken; // 启动时副本：仅供本 isolate 内展示/测试；鉴权不走它
+  String get icsToken => _icsToken ?? '';
 
   /// 绑定回环 18080 起，占用自动顺延（最多尝试 20 个端口）。
   Future<void> start({int preferredPort = 18080}) async {
@@ -42,6 +95,11 @@ class LocalCalDavServer {
       throw StateError('18080-18099 全部占用，本机服务无法启动');
     }
     _server!.listen(_handle, onError: (Object _) {});
+    try {
+      _icsToken = await ensureIcsToken();
+    } catch (_) {
+      _icsToken = null; // 令牌读取失败 → 订阅入口 fail-closed（一律 401）
+    }
   }
 
   Future<void> stop() async {
@@ -56,14 +114,37 @@ class LocalCalDavServer {
 
   Future<void> _handle(HttpRequest req) async {
     try {
-      if (!_checkAuth(req)) {
-        req.response.statusCode = 401;
-        req.response.headers
-            .set('WWW-Authenticate', 'Basic realm="2bot", charset="UTF-8"');
+      final method = req.method.toUpperCase();
+      final path = req.uri.path;
+
+      // —— WO-73 §6 BUG 修复：RFC 6764 发现入口【免认证 301】——
+      // 原 301 分支在 Basic 认证之后：未认证先 401，严格的 CalDAV 客户端在
+      // 发现第一步即放弃（管理员实机「登录成功但 0 个日历」）。空体重定向，
+      // 不泄露任何数据。
+      if (path == '/.well-known/caldav' &&
+          (method == 'GET' || method == 'HEAD' || method == 'PROPFIND')) {
+        req.response.statusCode = 301;
+        req.response.headers.set('Location', '/principals/2bot/');
         await req.response.close();
         return;
       }
-      final method = req.method.toUpperCase();
+
+      // —— WO-73 §2：仅 /calendar.ics 认【独立令牌】；其余全部仍强制 Basic ——
+      if (path == '/calendar.ics') {
+        if (!await _checkIcsToken(req)) {
+          req.response.statusCode = 401;
+          req.response.headers.set(
+              'WWW-Authenticate', 'Basic realm="2bot", charset="UTF-8"');
+          await req.response.close();
+          return;
+        }
+      } else if (!_checkAuth(req)) {
+        req.response.statusCode = 401;
+        req.response.headers.set(
+            'WWW-Authenticate', 'Basic realm="2bot", charset="UTF-8"');
+        await req.response.close();
+        return;
+      }
       if (method != 'GET' &&
           method != 'HEAD' &&
           method != 'OPTIONS' &&
@@ -71,13 +152,6 @@ class LocalCalDavServer {
           method != 'REPORT') {
         // 只读服务：写操作一律 403（硬性要求 5）
         req.response.statusCode = 403;
-        await req.response.close();
-        return;
-      }
-      final path = req.uri.path;
-      if (path == '/.well-known/caldav') {
-        req.response.statusCode = 301;
-        req.response.headers.set('Location', '/');
         await req.response.close();
         return;
       }
@@ -124,6 +198,22 @@ class LocalCalDavServer {
     } catch (_) {
       return false;
     }
+  }
+
+  /// WO-73：订阅令牌校验。token 只从 query 读取（禁 ?user=&pass= 形态，
+  /// 口令绝不进 URL）；每请求直读平台层 → 设置页重置即时生效；
+  /// 读取失败按拒绝处理（fail-closed）。
+  Future<bool> _checkIcsToken(HttpRequest req) async {
+    final given = req.uri.queryParameters['token'];
+    if (given == null || given.isEmpty) return false;
+    String? expected;
+    try {
+      expected = await SharedPreferencesAsync().getString(icsTokenKey);
+    } catch (_) {
+      return false;
+    }
+    if (expected == null || expected.length < 24) return false;
+    return constantTimeEquals(given, expected);
   }
 
   Future<void> _propfind(HttpRequest req, String path, String depth) async {

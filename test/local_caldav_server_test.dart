@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences_platform_interface/in_memory_shared_preferences_async.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
 
 import 'package:bot_companion/services/calendar_event_store.dart';
 import 'package:bot_companion/services/cross_isolate_lock.dart';
@@ -104,12 +106,17 @@ void main() {
       String path, {
       String? body,
       String? authOverride,
+      bool noAuth = false,
     }) async {
       final sock = await Socket.connect('127.0.0.1', port);
       final sb = StringBuffer('$method $path HTTP/1.1$crlf'
-          'Host: 127.0.0.1$crlf'
-          'Authorization: Basic '
-          '${base64.encode(utf8.encode(authOverride ?? '$user:$pass'))}$crlf');
+          'Host: 127.0.0.1$crlf');
+      // WO-73：noAuth = 完全不带 Authorization 头（免认证路径与 401 态的
+      // 真实形态；原助手恒发 Basic 头，测不出「未认证」分支）
+      if (!noAuth) {
+        sb.write('Authorization: Basic '
+            '${base64.encode(utf8.encode(authOverride ?? '$user:$pass'))}$crlf');
+      }
       if (body != null) {
         sb.write('Content-Type: application/xml; charset=utf-8$crlf');
         sb.write('Content-Length: ${utf8.encode(body).length}$crlf');
@@ -174,6 +181,10 @@ void main() {
 
     setUp(() async {
       SharedPreferences.setMockInitialValues({});
+      // WO-73：令牌走 SharedPreferencesAsync 存储（与生产跨 isolate 读法一致），
+      // 测试须挂内存平台实现——与 calendar_sync_service_test.dart:31 同款
+      SharedPreferencesAsyncPlatform.instance =
+          InMemorySharedPreferencesAsync.withData(const {});
       server = LocalCalDavServer(store: buildStore(), password: pass);
       await server.start(preferredPort: 32100);
       port = server.port;
@@ -213,10 +224,58 @@ void main() {
       expect(home.body, contains('supported-calendar-component-set'));
     });
 
-    test('GET /.well-known/caldav → 301', () async {
+    // ==================================================================
+    // WO-73 §6 · /.well-known/caldav 免认证 301（BUG 修复）
+    // 断言现状对照：原断言（改前 line 216-220）=【带 Basic 头】GET → 301 且
+    // Location '/'；其未覆盖的 BUG 面是【不带认证 → 401】（301 被藏在认证之后）。
+    // 修复契约：GET/HEAD/PROPFIND 不带认证 → 301 + Location /principals/2bot/
+    // + 空体；其余一切仍强制 Basic。
+    // ==================================================================
+    test('不带认证 GET /.well-known/caldav → 301 + Location + 空体', () async {
+      final r = await req('GET', '/.well-known/caldav', noAuth: true);
+      expect(r.status, 301,
+          reason: 'RFC 6764 发现入口不承载数据，必须匿名可达（原缺陷：未认证先 401）');
+      expect(r.headers['location'], '/principals/2bot/');
+      expect(r.body.trim(), isEmpty, reason: '免认证重定向不得在体里泄露任何数据');
+    });
+
+    test('不带认证 PROPFIND /.well-known/caldav → 同样 301', () async {
+      final r = await req('PROPFIND', '/.well-known/caldav', noAuth: true);
+      expect(r.status, 301);
+      expect(r.headers['location'], '/principals/2bot/');
+    });
+
+    test('不带认证 HEAD /.well-known/caldav → 301', () async {
+      final r = await req('HEAD', '/.well-known/caldav', noAuth: true);
+      expect(r.status, 301);
+      expect(r.headers['location'], '/principals/2bot/');
+    });
+
+    test('带认证 GET /.well-known/caldav → 同样 301（行为一致）', () async {
       final r = await req('GET', '/.well-known/caldav');
       expect(r.status, 301);
-      expect(r.headers['location'], '/');
+      expect(r.headers['location'], '/principals/2bot/');
+    });
+
+    test('免认证不扩面：其余路径不带认证 → 仍 401', () async {
+      expect((await req('GET', '/', noAuth: true)).status, 401);
+      expect((await req('GET', '/nonexistent', noAuth: true)).status, 401);
+      expect((await req('PROPFIND', '/', noAuth: true)).status, 401);
+      expect((await req('OPTIONS', '/', noAuth: true)).status, 401);
+      expect((await req('GET', '/.well-known/other', noAuth: true)).status, 401);
+      expect((await req('GET', '/calendar.ics', noAuth: true)).status, 401,
+          reason: 'ICS 无 token = 未认证（免认证只属于 well-known 一条路）');
+    });
+
+    test('well-known 写方法不豁免：无认证 PUT → 401；带认证 PUT → 403', () async {
+      expect(
+        (await req('PUT', '/.well-known/caldav', noAuth: true, body: 'x')).status,
+        401,
+      );
+      expect(
+        (await req('PUT', '/.well-known/caldav', body: 'x')).status,
+        403,
+      );
     });
 
     test('REPORT sync-collection：全量 + 墓碑 404', () async {
@@ -272,14 +331,147 @@ void main() {
       expect(r404.status, 404);
     });
 
-    test('GET /calendar.ics：完整 VCALENDAR + ETag + Last-Modified', () async {
-      final r = await req('GET', '/calendar.ics');
+    test('GET /calendar.ics：完整 VCALENDAR + ETag + Last-Modified（带令牌）', () async {
+      // WO-73 断言现状对照：原断言（改前 line 275-283）凭【默认 Basic 头】
+      // 取 200——令牌化后 ICS 入口只认 token，此处改为无 Basic + 正确 token
+      final r = await req(
+          'GET', '/calendar.ics?token=${server.icsToken}',
+          noAuth: true);
       expect(r.status, 200);
       expect(r.headers['content-type'], contains('text/calendar'));
       expect(r.headers['etag'], isNotNull);
       expect(r.headers['last-modified'], isNotNull);
       expect(r.body, contains('X-WR-CALNAME:2BOT 日历'));
       expect(r.body, contains('BEGIN:VCALENDAR'));
+    });
+
+    // ==================================================================
+    // WO-73 §2/§3 · ICS 订阅独立令牌（四态 + 独立性 + 重置）
+    // 断言现状对照：改前 /calendar.ics 只认 Basic（_checkAuth 先行，改前
+    // line 59）；token 四态均为本单新契约，红灯在实现前实证。
+    // ==================================================================
+    test('令牌生成：≥24 字符、全 hex、两次生成不同', () {
+      final t1 = LocalCalDavServer.generateIcsToken();
+      final t2 = LocalCalDavServer.generateIcsToken();
+      expect(t1.length, greaterThanOrEqualTo(24), reason: '规格 §2.1 硬约束');
+      expect(RegExp(r'^[0-9a-f]+$').hasMatch(t1), isTrue);
+      expect(t1, isNot(t2), reason: '随机性');
+    });
+
+    test('启动即持久化令牌；服务持有可读副本', () {
+      expect(server.icsToken.length, greaterThanOrEqualTo(24));
+      expect(
+        SharedPreferencesAsync().getString(LocalCalDavServer.icsTokenKey),
+        completion(server.icsToken),
+      );
+    });
+
+    test('常量时间比较：语义正确（等/异/前缀/长度差）', () {
+      const f = LocalCalDavServer.constantTimeEquals;
+      expect(f('abcdef', 'abcdef'), isTrue);
+      expect(f('abcdef', 'abcdeX'), isFalse);
+      expect(f('abcdef', 'abcdefX'), isFalse, reason: '长度不同必须不等');
+      expect(f('abc', ''), isFalse, reason: '前缀 ≠ 相等');
+      expect(f('', ''), isTrue);
+    });
+
+    test('正确 token（无 Basic 头）→ 200 全量 VEVENT（2 条）', () async {
+      final r = await req('GET', '/calendar.ics?token=${server.icsToken}',
+          noAuth: true);
+      expect(r.status, 200);
+      expect(r.body, contains('BEGIN:VCALENDAR'));
+      expect(r.body, contains('UID:cal_1'));
+      expect(r.body, contains('UID:cal_2'),
+          reason: '200 必须含库内全部事件（N=2）');
+    });
+
+    test('token 缺失 → 401（Basic 正确也不放行——令牌与口令相互独立）', () async {
+      final rBasicOnly = await req('GET', '/calendar.ics');
+      expect(rBasicOnly.status, 401,
+          reason: '规格 §2.2：token 缺失仍 401；Basic 不是 ICS 入口的凭据');
+      final rNone = await req('GET', '/calendar.ics', noAuth: true);
+      expect(rNone.status, 401);
+      expect(rNone.headers['www-authenticate'], contains('Basic'));
+    });
+
+    test('token 错误 / 截断 / 空 → 401', () async {
+      final wrong =
+          await req('GET', '/calendar.ics?token=${'0' * 32}', noAuth: true);
+      expect(wrong.status, 401);
+      final truncated = await req(
+          'GET', '/calendar.ics?token=${server.icsToken.substring(0, 31)}',
+          noAuth: true);
+      expect(truncated.status, 401, reason: '前缀不得通过（常量时间比较的全等语义）');
+      final empty = await req('GET', '/calendar.ics?token=', noAuth: true);
+      expect(empty.status, 401);
+    });
+
+    test('带 token 的 PUT/DELETE/POST → 403（只读不变）', () async {
+      final t = server.icsToken;
+      expect(
+        (await req('PUT', '/calendar.ics?token=$t', noAuth: true, body: 'x'))
+            .status,
+        403,
+      );
+      expect(
+        (await req('DELETE', '/calendar.ics?token=$t', noAuth: true)).status,
+        403,
+      );
+      expect(
+        (await req('POST', '/calendar.ics?token=$t', noAuth: true, body: 'x'))
+            .status,
+        403,
+      );
+    });
+
+    test('正确 token 用于其余路径 → 仍 401（令牌仅限 calendar.ics）', () async {
+      final t = server.icsToken;
+      expect((await req('GET', '/?token=$t', noAuth: true)).status, 401);
+      expect((await req('PROPFIND', '/?token=$t', noAuth: true)).status, 401);
+      expect(
+        (await req('GET', '/calendars/2bot/default/cal_1.ics?token=$t',
+                noAuth: true))
+            .status,
+        401,
+      );
+      expect((await req('OPTIONS', '/?token=$t', noAuth: true)).status, 401);
+      expect((await req('GET', '/calendar.icss?token=$t', noAuth: true)).status,
+          401,
+          reason: '非精确路径匹配不豁免');
+    });
+
+    test('重置：旧 token 立即 401 / 新 token 立即 200（跨隔离写即时生效）', () async {
+      final old = server.icsToken;
+      final newTok = await LocalCalDavServer.rotateIcsToken();
+      expect(newTok.length, greaterThanOrEqualTo(24));
+      expect(newTok, isNot(old));
+      expect(
+        (await req('GET', '/calendar.ics?token=$old', noAuth: true)).status,
+        401,
+        reason: '旧令牌必须立即失效（服务端每请求直读平台层）',
+      );
+      expect(
+        (await req('GET', '/calendar.ics?token=$newTok', noAuth: true)).status,
+        200,
+      );
+    });
+
+    test('令牌绝不进日志：服务端源码零日志调用 + 401 响应不回显 token', () async {
+      // (a) 静态面：本服务文件不得出现任何日志调用——token 无进 logcat 的通道
+      //（可断言「日志格式化函数不接收 token」的最强形态：根本没有日志函数）
+      final src =
+          File('lib/services/local_caldav_server.dart').readAsStringSync();
+      expect(
+        RegExp(r'\b(print|debugPrint|log|info|warning|severe)\s*\(')
+            .hasMatch(src),
+        isFalse,
+        reason: 'logcat 无 token 明文的静态保证',
+      );
+      // (b) 响应面：401 的体与头不得回显令牌
+      final r401 = await req('GET', '/calendar.ics?token=WRONG', noAuth: true);
+      expect(r401.status, 401);
+      expect(r401.body, isNot(contains(server.icsToken)));
+      expect(r401.headers.values.join('|'), isNot(contains(server.icsToken)));
     });
 
     test('只读契约：PUT/DELETE/POST 一律 403', () async {

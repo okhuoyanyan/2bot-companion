@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.0+17  # WO-71 闪屏返工——固定高度状态面板（卡片高度恒定，整页位移根因修复）
+version: 1.6.1+18  # WO-73 ICS 订阅独立令牌 + /.well-known/caldav 免认证 301
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -41,6 +41,9 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  # WO-73：单测直接挂内存平台实现（InMemorySharedPreferencesAsync，与
+  # calendar_sync_service_test.dart 同款），此处声明以免 depend_on_referenced_packages
+  shared_preferences_platform_interface: ^2.4.1
 
 flutter:
   uses-material-design: true
