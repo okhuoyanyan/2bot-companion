@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
+
 import '../utils/constants.dart';
 
 /// ============================================================================
@@ -91,6 +93,14 @@ class ImapAssembler {
   /// 喂入任意长度的字节分片（片界可在 literal 中间/行中间）
   void add(List<int> chunk) {
     if (chunk.isEmpty) return;
+    try {
+      _drainAdd(chunk);
+    } catch (_) {
+      rethrow;
+    }
+  }
+
+  void _drainAdd(List<int> chunk) {
     final merged = Uint8List(_data.length - _pos + chunk.length);
     merged.setRange(0, _data.length - _pos, _data, _pos);
     merged.setRange(_data.length - _pos, merged.length, chunk);
@@ -200,6 +210,15 @@ int? parseUidValidity(List<ImapUnit> units) {
   return null;
 }
 
+/// WO-71 整改 B：EXISTS 推送解析（**必须有捕获组**——此前 `^\*\s+\d+\s+EXISTS`
+/// 无捕获组却调用 group(1)! ⇒ 收到推送即 RangeError 崩溃）
+int? parseExistsCount(String head) {
+  final m =
+      RegExp(r'^\*\s+(\d+)\s+EXISTS', caseSensitive: false).firstMatch(head);
+  if (m == null) return null;
+  return int.tryParse(m.group(1)!);
+}
+
 /// SEARCH 响应解析 → UID 列表
 List<int> parseSearchUids(List<ImapUnit> units) {
   for (final u in units) {
@@ -244,10 +263,9 @@ class ImapIdleClient {
   final ImapConfig config;
   final int tagSeed;
 
-  SecureSocket? _socket;
+  Socket? _socket;
   StreamSubscription<Uint8List>? _sub;
   final ImapAssembler _assembler = ImapAssembler();
-  final BytesBuilder _raw = BytesBuilder(copy: true);
   Completer<void>? _dataWaiter;
   bool _closedByServer = false;
   Object? _streamError;
@@ -255,6 +273,39 @@ class ImapIdleClient {
   bool _loggedIn = false;
   String? _idleTag;
   final List<ImapUnit> _scratch = <ImapUnit>[];
+
+  /// WO-71 修复「SELECT 成功后卡死」的核心：
+  /// `_readUnit` 一次 takeUnits 会取走整批单元，test 命中 return 时
+  /// **同批剩余单元必须保留**（此前直接丢弃 → LOGIN/SELECT 响应被丢 →
+  /// 之后所有命令永等超时，真机 15s 卡死）。所有消费者统一从本队列取。
+  final List<ImapUnit> _unitQueue = <ImapUnit>[];
+
+  /// 从队列/assembler 取下一个单元（内部消费统一入口）
+  ImapUnit? _nextUnit() {
+    if (_unitQueue.isNotEmpty) return _unitQueue.removeAt(0);
+    if (_assembler.hasUnits) {
+      _unitQueue.addAll(_assembler.takeUnits());
+      if (_unitQueue.isNotEmpty) return _unitQueue.removeAt(0);
+    }
+    return null;
+  }
+
+  /// WO-71 任务 A.4：命令级可观测——每条命令的 发送/首响应/完成/耗时。
+  /// 行格式：`IMAP <命令> <阶段> <详情>`；设置页与 logcat 共用。
+  void Function(String line)? onCommandLog;
+
+  DateTime? _cmdStart;
+  String _cmdName = '';
+  bool _firstResponseLogged = false;
+
+  void _log(String s) {
+    onCommandLog?.call(s);
+  }
+
+  /// WO-71 ④：socket 工厂注入（录制回放测试用；生产 = SecureSocket 直连）
+  @visibleForTesting
+  static Future<Socket> Function(String host, int port, Duration timeout)?
+      socketFactory;
 
   ImapIdleClient({required this.config, this.tagSeed = 100})
       : _tagCounter = tagSeed;
@@ -267,7 +318,13 @@ class ImapIdleClient {
   }
 
   void _onData(Uint8List chunk) {
-    _raw.add(chunk);
+    // WO-71：直接喂装配器（消除 _raw/takeBytes 中间层与唤醒时序竞态）
+    _assembler.add(chunk);
+    _wakeDataWaiter();
+  }
+
+  /// 唤醒等待数据的协程
+  void _wakeDataWaiter() {
     final w = _dataWaiter;
     if (w != null && !w.isCompleted) {
       _dataWaiter = null;
@@ -275,11 +332,19 @@ class ImapIdleClient {
     }
   }
 
-  /// 把 socket 缓冲喂进装配器；无可用数据则等待（最多 [timeout]）。
-  /// 抛 [ImapClosedException] = 服务端断开；抛 [TimeoutException] = 本次等待超时。
+  /// WO-71 ④：测试注入口——把字节同步喂进装配器数据路径（等价 socket onData）
+  @visibleForTesting
+  void debugFeedBytes(Uint8List chunk) => _onData(chunk);
+
+  /// WO-71 ④：命令写出回调（回放轨在此同步注入响应字节）
+  @visibleForTesting
+  void Function(String cmd)? debugHookOnCommand;
+  /// WO-71 ④：命令完成回调
+  @visibleForTesting
+  Future<void> Function()? debugHookOnAfterCommand;
+
+  /// 等待装配器出现新单元（WO-71：直喂版——数据路径只有 assembler 一份）
   Future<void> _waitForData(Duration timeout) async {
-    final b = _raw.takeBytes();
-    if (b.isNotEmpty) _assembler.add(b);
     while (!_assembler.hasUnits) {
       if (_closedByServer || _streamError != null) {
         throw ImapClosedException('${_streamError ?? '服务端关闭连接'}');
@@ -292,8 +357,6 @@ class ImapIdleClient {
         if (identical(_dataWaiter, w)) _dataWaiter = null;
         rethrow;
       }
-      final nb = _raw.takeBytes();
-      if (nb.isNotEmpty) _assembler.add(nb);
     }
   }
 
@@ -305,14 +368,22 @@ class ImapIdleClient {
   }) async {
     final deadline = DateTime.now().add(timeout);
     while (true) {
-      if (_assembler.hasUnits) {
-        for (final unit in _assembler.takeUnits()) {
-          if (test(unit)) return unit;
-          if (unit.head.toUpperCase().contains('* BYE')) {
-            throw ImapClosedException('服务端 BYE');
-          }
-          collect?.call(unit);
+      final unit = _nextUnit();
+      if (unit != null) {
+        if (!_firstResponseLogged) {
+          _firstResponseLogged = true;
+          _log('IMAP << $_cmdName 首响应 (${unit.head.length}B)');
         }
+        if (test(unit)) {
+          _log('IMAP == $_cmdName 完成 '
+              '${DateTime.now().difference(_cmdStart ?? DateTime.now()).inMilliseconds}ms '
+              'head=${unit.head.length > 60 ? unit.head.substring(0, 60) : unit.head}');
+          return unit;
+        }
+        if (unit.head.toUpperCase().contains('* BYE')) {
+          throw ImapClosedException('服务端 BYE');
+        }
+        collect?.call(unit);
         continue;
       }
       final remain = deadline.difference(DateTime.now());
@@ -320,8 +391,6 @@ class ImapIdleClient {
         throw TimeoutException('IMAP 等待响应超时', timeout);
       }
       try {
-        // 1s 轮询切片的 TimeoutException 必须就地消化（WO-69 驳回缺陷二）：
-        // QQ 响应出现 >1s 数据间隙属常态，不致命；总体 deadline 才是判据。
         await _waitForData(
             remain < const Duration(seconds: 1) ? remain : const Duration(seconds: 1));
       } on TimeoutException {
@@ -331,15 +400,24 @@ class ImapIdleClient {
   }
 
   void _send(String line) {
+    final parts = line.split(' ');
+    final name = parts.length > 1 ? parts[1] : parts.first;
+    _cmdName = name;
+    _cmdStart = DateTime.now();
+    _firstResponseLogged = false;
+    // WO-71 整改⑤：命令级可观测（发送阶段，带参数规模）
+    _log('IMAP >> $name [${line.length}B] 发送');
     _socket?.write('$line\r\n');
+    debugHookOnCommand?.call(line);
   }
 
   /// 连接 + LOGIN + SELECT INBOX。返回 SELECT 期间的 untagged 单元（含 UIDVALIDITY）。
   Future<List<ImapUnit>> connect({
     Duration timeout = const Duration(seconds: 10),
   }) async {
-    final socket = await SecureSocket.connect(config.host, config.port,
-        timeout: timeout);
+    final socket = await (socketFactory != null
+        ? socketFactory!(config.host, config.port, timeout)
+        : SecureSocket.connect(config.host, config.port, timeout: timeout));
     _socket = socket;
     _sub = socket.listen(_onData, onError: (Object e) {
       _streamError = e;
@@ -413,6 +491,9 @@ class ImapIdleClient {
     return false; // 服务器拒绝 IDLE（tagged NO/BAD）
   }
 
+  /// WO-71 整改 A：UID FETCH 分批上限（单行命令 ≤~2KB，远低于 QQ 丢弃阈值）
+  static const int fetchBatchSize = 50;
+
   /// IDLE 等待。返回 EXISTS 通知里的消息数；节拍到点（应 DONE+重发）返回 null；
   /// 服务端断开/BYE 抛 [ImapClosedException]。
   Future<int?> waitForEvent({required Duration beat}) async {
@@ -423,8 +504,8 @@ class ImapIdleClient {
       try {
         if (_assembler.hasUnits) {
           for (final u in _assembler.takeUnits()) {
-            final m = RegExp(r'^\*\s+\d+\s+EXISTS').firstMatch(u.head);
-            if (m != null) return int.parse(m.group(1)!);
+            final n = parseExistsCount(u.head);
+            if (n != null) return n;
             if (u.isContinuation) continue;
             if (u.head.toUpperCase().contains('* BYE')) {
               throw ImapClosedException('IDLE 期间服务端 BYE');
@@ -476,7 +557,6 @@ class ImapIdleClient {
       throw ImapCommandException('UID SEARCH', searchResp.status ?? 'NO');
     }
     final candidates = parseSearchUids(_scratch);
-    _scratch.clear();
     final fresh = candidates.where((u) => u > lastProcessedUid).toList()..sort();
     final maxSeenUid =
         candidates.isEmpty ? 0 : candidates.reduce((a, b) => a > b ? a : b);
@@ -484,50 +564,75 @@ class ImapIdleClient {
       return (mails: const <CalendarMail>[], maxSeenUid: maxSeenUid);
     }
 
-    // 客户端精筛：拉 SUBJECT 头（QQ 文本搜索键不可用的替代）
-    final headerTag = _nextTag();
-    _send('$headerTag UID FETCH ${fresh.join(',')} '
-        '(UID BODY.PEEK[HEADER.FIELDS (SUBJECT)])');
-    await _readUnit(
-      timeout: timeout,
-      test: (u) => u.tag == headerTag,
-      collect: _scratch.add,
-    );
-    final matched = <int>[];
+    // 客户端精筛：拉 SUBJECT 头（QQ 文本搜索键不可用的替代）。
+    // WO-71 整改 A（致命）：`UID FETCH uid1,uid2,…` 单行超长（1129 个 UID ≈ 6KB，
+    // RFC 3501 建议命令行 ≤1000 字节）→ QQ【静默丢弃】→ 15s 超时（真机实测复现）。
+    // 修复：分批（每批 ≤[fetchBatchSize] 个 UID），批间让出事件循环；批次可观测。
+    final matchedHeader = <int>[];
     final subjects = <int, String>{};
-    for (final u in _scratch) {
-      final parsed = parseHeaderFetchUnit(u);
-      if (parsed == null) continue;
-      if (subjectMatchesPrefix(parsed.header, AppConstants.calSubjectPrefix)) {
-        matched.add(parsed.uid);
-        subjects[parsed.uid] = parsed.header;
+    final headerBatches = (fresh.length / fetchBatchSize).ceil();
+    for (var b = 0; b < headerBatches; b++) {
+      final batch = fresh.sublist(b * fetchBatchSize,
+          (b + 1) * fetchBatchSize < fresh.length
+              ? (b + 1) * fetchBatchSize
+              : fresh.length);
+      final headerTag = _nextTag();
+      _send('$headerTag UID FETCH ${batch.join(',')} '
+          '(UID BODY.PEEK[HEADER.FIELDS (SUBJECT)])');
+      _log('IMAP .. FETCH HDR [批次 ${b + 1}/$headerBatches, '
+          '${batch.length}条] 等待响应…');
+      await _readUnit(
+        timeout: timeout,
+        test: (u) => u.tag == headerTag,
+        collect: _scratch.add,
+      );
+      for (final u in _scratch) {
+        final parsed = parseHeaderFetchUnit(u);
+        if (parsed == null) continue;
+        if (subjectMatchesPrefix(parsed.header, AppConstants.calSubjectPrefix)) {
+          matchedHeader.add(parsed.uid);
+          subjects[parsed.uid] = parsed.header;
+        }
       }
+      _scratch.clear();
+      // 批间让出事件循环（不阻塞 isolate 其它定时器）
+      await Future<void>.delayed(Duration.zero);
     }
-    _scratch.clear();
+    final matched = matchedHeader..sort();
+    _log('IMAP == FETCH HDR 完成：${fresh.length} 条中前缀命中 ${matched.length} 条');
     if (matched.isEmpty) {
       return (mails: const <CalendarMail>[], maxSeenUid: maxSeenUid);
     }
-    matched.sort();
 
-    // 全文拉取（仅前缀命中集合）
-    final fullTag = _nextTag();
-    _send('$fullTag UID FETCH ${matched.join(',')} (UID BODY.PEEK[])');
-    await _readUnit(
-      timeout: timeout,
-      test: (u) => u.tag == fullTag,
-      collect: _scratch.add,
-    );
+    // 全文拉取（仅前缀命中集合）——同样分批
     final mails = <CalendarMail>[];
-    for (final u in _scratch) {
-      final parsed = parseFullFetchUnit(u);
-      if (parsed == null) continue;
-      mails.add(CalendarMail(
-        uid: parsed.uid,
-        subject: subjects[parsed.uid] ?? '',
-        raw: parsed.raw,
-      ));
+    final fullBatches = (matched.length / fetchBatchSize).ceil();
+    for (var b = 0; b < fullBatches; b++) {
+      final batch = matched.sublist(b * fetchBatchSize,
+          (b + 1) * fetchBatchSize < matched.length
+              ? (b + 1) * fetchBatchSize
+              : matched.length);
+      final fullTag = _nextTag();
+      _send('$fullTag UID FETCH ${batch.join(',')} (UID BODY.PEEK[])');
+      _log('IMAP .. FETCH FULL [批次 ${b + 1}/$fullBatches, '
+          '${batch.length}条] 等待响应…');
+      await _readUnit(
+        timeout: timeout,
+        test: (u) => u.tag == fullTag,
+        collect: _scratch.add,
+      );
+      for (final u in _scratch) {
+        final parsed = parseFullFetchUnit(u);
+        if (parsed == null) continue;
+        mails.add(CalendarMail(
+          uid: parsed.uid,
+          subject: subjects[parsed.uid] ?? '',
+          raw: parsed.raw,
+        ));
+      }
+      _scratch.clear();
+      await Future<void>.delayed(Duration.zero);
     }
-    _scratch.clear();
     mails.sort((a, b) => a.uid.compareTo(b.uid));
     return (mails: mails, maxSeenUid: maxSeenUid);
   }
@@ -556,3 +661,4 @@ class ImapIdleClient {
     _idleTag = null;
   }
 }
+

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -143,11 +144,15 @@ class QqImapSource implements CalendarMailSource {
   final ImapConfig config;
   ImapIdleClient? _client;
 
+  /// WO-71 任务 A.4：命令级日志出口（设置页可见）
+  void Function(String line)? onCommandLog;
+
   QqImapSource(this.config);
 
   @override
   Future<int?> connect() async {
     final client = ImapIdleClient(config: config);
+    client.onCommandLog = onCommandLog;
     _client = client;
     final units = await client.connect();
     return parseUidValidity(units);
@@ -360,6 +365,17 @@ class CalendarSyncService {
   /// 单次会话：连接 → 增量同步 → IDLE 长连接循环
   Future<void> _runSession(AppSettings settings) async {
     final source = sourceFactory(settings);
+    if (source is QqImapSource) {
+      source.onCommandLog = (line) {
+        // WO-71 A.4：命令级可观测——写入状态环（设置页渲染最近 6 条）
+        try {
+          final st = _lastKnownState;
+          final log = (st['imapLog'] as List?) ?? <dynamic>[];
+          log.insert(0, '$line');
+          st['imapLog'] = log.take(6).toList();
+        } catch (_) {}
+      };
+    }
     _currentSource = source;
     // 通道健康探测：未激活（如开机自启、App 尚未打开过）只记录不自断——
     // 打开 App 一次保存设置后服务热重启即挂载通道（自愈路径）
@@ -386,7 +402,6 @@ class CalendarSyncService {
             uidValidity: uidValidity, lastProcessedUid: lastUid);
       }
 
-      // 首轮增量同步（建立基线）
       lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
       _consecutiveFailures = 0;
       _mode = 'idle';

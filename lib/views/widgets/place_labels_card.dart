@@ -59,7 +59,8 @@ class _PlaceLabelsCardState extends State<PlaceLabelsCard> {
         title: Text('标注地点: $ssid', style: const TextStyle(fontSize: 15)),
         content: TextField(
           controller: controller,
-          autofocus: true,
+          // WO-71：移除 autofocus——自动抢焦点叠加设置页 5s 重建
+          // 导致键盘反复弹出/收起（闪屏根因，规格 §2）
           style: const TextStyle(fontSize: 13, color: AppTheme.textPrimary),
           decoration: const InputDecoration(
             labelText: '自定义地点名称',
@@ -100,7 +101,7 @@ class _PlaceLabelsCardState extends State<PlaceLabelsCard> {
           children: [
             TextField(
               controller: ssidController,
-              autofocus: true,
+              // WO-71：移除 autofocus（同上，闪屏根因修复）
               style: const TextStyle(fontSize: 13, color: AppTheme.textPrimary),
               decoration: const InputDecoration(
                 labelText: 'WiFi 名称 (SSID)',
