@@ -8,6 +8,7 @@ import '../../models/app_settings.dart';
 import '../../services/storage_service.dart';
 import '../../utils/constants.dart';
 import '../../utils/theme.dart';
+import 'calendar_sync_status_panel.dart';
 
 /// 配置表单提交值（WO-36：扩展传输模式与邮箱参数；WO-37：扩展节流档位、静默保活与事件开关）
 class ConfigFormValues {
@@ -198,189 +199,33 @@ class _ConfigCardState extends State<ConfigCard> {
 
   /// WO-69：日历同步状态（FutureBuilder 每次构建直读平台层最新值；
   /// 驳回缺陷三：不再读本 isolate 缓存——那会显示昨天的旧状态）
+  /// WO-71 闪屏返工：渲染改由固定高度面板 CalendarSyncStatusPanel 承担——
+  /// 任何内容更新都不得改变卡片高度（整页位移的直接根因）
   Widget _buildCalendarSyncStatus() {
     return ValueListenableBuilder<int>(
       valueListenable: _statusTick,
       builder: (context, tick, _) => FutureBuilder<Map<String, dynamic>>(
-      key: ValueKey(tick),
-      future: StorageService.loadCalendarSyncStateFresh(),
-      builder: (context, snap) {
-        final state = snap.data ?? const <String, dynamic>{};
-        final lastSyncAt = state['lastSyncAt'] as String?;
-        final lastAttemptAt = state['lastAttemptAt'] as String?;
-        final lastResult = state['lastResult'] as String?;
-        final lastError = state['lastError'] as String?;
-        final lastApplied = state['lastApplied'] as int?;
-        final mode = (state['mode'] as String?) ?? '';
-        final channelMs = state['lastChannelMs'] as int?;
-
-        const modeTexts = {
-          'idle': '推送在线 (IDLE)',
-          'poll': '兜底轮询 (15 分钟)',
-          'backoff': '故障退避中',
-          'off': '未运行',
-        };
-        final modeText = modeTexts[mode] ?? (mode.isEmpty ? '' : '模式:$mode');
-        final chText =
-            channelMs != null ? ' · 通道往返 ${channelMs}ms' : '';
-
-        final Widget statusLine;
-        if (lastAttemptAt == null || lastAttemptAt.isEmpty) {
-          statusLine = Text(
-            modeText.isEmpty ? '尚未尝试过' : '尚未尝试过 · $modeText',
-            style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
-          );
-        } else {
-          final attemptAt = _formatSyncTime(lastAttemptAt);
-          final syncText = (lastSyncAt == null || lastSyncAt.isEmpty)
-              ? '无成功'
-              : _formatSyncTime(lastSyncAt);
-          final applied = lastApplied != null ? '（应用 $lastApplied 条）' : '';
-          final resultText = (lastResult == 'ok' || lastResult == null)
-              ? '成功$applied'
-              : (lastResult == 'partial' ? '部分成功$applied' : '失败');
-          statusLine = Text(
-            '上次尝试：$attemptAt · $resultText · 上次成功：$syncText$chText'
-            '${modeText.isEmpty ? '' : ' · $modeText'}',
-            style: TextStyle(
-              fontSize: 10,
-              color: (lastResult == 'ok' || lastResult == null)
-                  ? AppTheme.textMuted
-                  : AppTheme.warningAmber,
-            ),
-          );
-        }
-        final errorLine = (lastError == null || lastError.isEmpty)
-            ? const SizedBox.shrink()
-            : Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text(
-                  '失败原因：$lastError',
-                  maxLines: 4,
-                  overflow: TextOverflow.fade,
-                  style: const TextStyle(
-                      fontSize: 10, color: AppTheme.warningAmber),
-                ),
-              );
-        // WO-70：本机只读服务自证区（在跑/端口/URL/用户/口令/库内条数/跳过原因）
-        final serverRunning = state['serverRunning'] as bool? ?? false;
-        final serverPort = (state['serverPort'] as num?)?.toInt() ?? 0;
-        final serverUser = '${state['serverUser'] ?? ''}';
-        final serverPass = '${state['serverPass'] ?? ''}';
-        final storeCount = (state['storeCount'] as num?)?.toInt() ?? 0;
-        final bgError = '${state['bgError'] ?? ''}';
-
-        final serverBlock = Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const SizedBox(height: 4),
-            Text(
-              serverRunning
-                  ? '本机服务：运行中 · 端口 $serverPort · 库内 $storeCount 条'
-                  : '本机服务：未运行${bgError.isEmpty ? "" : " · $bgError"}',
-              style: TextStyle(
-                fontSize: 10,
-                color: serverRunning
-                    ? AppTheme.accentEmerald
-                    : AppTheme.textMuted,
-              ),
-            ),
-            if (serverRunning) ...[
-              Text(
-                '订阅 URL：http://127.0.0.1:$serverPort/calendar.ics',
-                style: const TextStyle(
-                    fontSize: 10, color: AppTheme.textMuted),
-              ),
-              Text(
-                'CalDAV：http://127.0.0.1:$serverPort/ · 用户 $serverUser · 口令 $serverPass',
-                style: const TextStyle(
-                    fontSize: 10, color: AppTheme.textMuted),
-              ),
-            ],
-          ],
-        );
-
-        // WO-71 A.4：IMAP 命令级可观测（命令名/规模/耗时/结果，最近 6 条）
-        final imapLog = (state['imapLog'] as List?) ?? const <dynamic>[];
-        final imapBlock = imapLog.isEmpty
-            ? const SizedBox.shrink()
-            : Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'IMAP 命令（最近 6 条）',
-                      style: TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                          color: AppTheme.textSecondary),
-                    ),
-                    ...imapLog.map((l) => Text(
-                          '$l',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 9, color: AppTheme.textMuted),
-                        )),
-                  ],
-                ),
-              );
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [statusLine, errorLine, serverBlock, imapBlock],
-        );
-      },
+        key: ValueKey(tick),
+        future: StorageService.loadCalendarSyncStateFresh(),
+        builder: (context, snap) {
+          final state = snap.data ?? const <String, dynamic>{};
+          final imapLog = (state['imapLog'] as List?) ?? const <dynamic>[];
+          return CalendarSyncStatusPanel(state: state, imapLog: imapLog);
+        },
       ),
     );
   }
 
-  /// 遥测上报闸门记录（驳回硬性条件①：本次尝试时间/发送原因/闸门判定，最近 8 次）
+  /// 遥测上报闸门记录（固定高度面板：恒定 8 槽，0..8 条高度不变）
   Widget _buildTelemetryAttempts() {
     return ValueListenableBuilder<int>(
       valueListenable: _statusTick,
       builder: (context, tick, _) => FutureBuilder<List<Map<String, dynamic>>>(
-      key: ValueKey('tel$tick'),
-      future: StorageService.loadTelemetryAttempts(),
-      builder: (context, snap) {
-        final attempts = snap.data ?? const <Map<String, dynamic>>[];
-        if (attempts.isEmpty) {
-          return const SizedBox.shrink();
-        }
-        return Padding(
-          padding: const EdgeInsets.only(top: 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '遥测上报闸门记录（最近 ${8} 次）',
-                style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.textSecondary),
-              ),
-              const SizedBox(height: 4),
-              ...attempts.map((a) {
-                final at = _formatSyncTime('${a['at']}');
-                final gate = '${a['gate']}';
-                final trigger = '${a['trigger']}';
-                final detail = a['detail'] == null ? '' : ' · ${a['detail']}';
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 2),
-                  child: Text(
-                    '$at · [$gate] $trigger$detail',
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        fontSize: 9, color: AppTheme.textMuted),
-                  ),
-                );
-              }),
-            ],
-          ),
-        );
-      },
+        key: ValueKey('tel$tick'),
+        future: StorageService.loadTelemetryAttempts(),
+        builder: (context, snap) {
+          return TelemetryAttemptsPanel(attempts: snap.data ?? const []);
+        },
       ),
     );
   }

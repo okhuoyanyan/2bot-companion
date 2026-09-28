@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.0+16  # WO-71 IMAP 真实会话层修复 + 闪屏根因修复 + 命令级可观测
+version: 1.6.0+17  # WO-71 闪屏返工——固定高度状态面板（卡片高度恒定，整页位移根因修复）
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
