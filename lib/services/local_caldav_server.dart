@@ -216,143 +216,131 @@ class LocalCalDavServer {
     return constantTimeEquals(given, expected);
   }
 
-  Future<void> _propfind(HttpRequest req, String path, String depth) async {
-    final xml = StringBuffer()
-      ..writeln('<?xml version="1.0" encoding="utf-8"?>');
+  // ------------------------------------------------------------------
+  // WO-74 · PROPFIND 属性表化
+  // ------------------------------------------------------------------
+  // 属性以【局部名 → 完整 XML 元素】登记，响应恒为【全量属性块】——
+  // WO-74 v2 护栏 1：属性过滤【不做】（禁止引入 XML 解析/正则；主流客户端
+  // 解析 propstat 时忽略未识别属性，病根是「缺属性」而非「多属性」；
+  // NAS 侧 caldav-server.js 全量策略已与各大客户端互通多年）。
 
+  /// WO-74 §2.1：客户端判定「该集合可同步」所依赖的标准声明
+  static String _supportedReportSetXml() =>
+      '<d:supported-report-set>'
+      '<d:supported-report><d:report><c:calendar-query/></d:report></d:supported-report>'
+      '<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>'
+      '<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>'
+      '</d:supported-report-set>';
+
+  /// 单条 response：全量属性 200 propstat
+  String _responseXml(String href, Map<String, String> props) {
+    final sb = StringBuffer()
+      ..writeln('  <d:response>')
+      ..writeln('    <d:href>$href</d:href>')
+      ..writeln('    <d:propstat>')
+      ..writeln('      <d:prop>');
+    for (final line in props.values) {
+      sb.writeln('        $line');
+    }
+    sb
+      ..writeln('      </d:prop>')
+      ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
+      ..writeln('    </d:propstat>')
+      ..write('  </d:response>');
+    return sb.toString();
+  }
+
+  Future<void> _propfind(HttpRequest req, String path, String depth) async {
+    final cupXml =
+        '<d:current-user-principal><d:href>/principals/2bot/</d:href></d:current-user-principal>';
+    final reports = _supportedReportSetXml();
+    final ctag = store.ctag;
+
+    // 根（发现链第 1 步）
+    final rootProps = <String, String>{
+      'current-user-principal': cupXml,
+    };
+    // principal（发现链第 2 步；WO-74 §2.2 补 calendar-user-address-set）
+    final principalProps = <String, String>{
+      'current-user-principal': cupXml,
+      'principal-URL':
+          '<d:principal-URL><d:href>/principals/2bot/</d:href></d:principal-URL>',
+      'calendar-home-set':
+          '<c:calendar-home-set><d:href>/calendars/2bot/</d:href></c:calendar-home-set>',
+      // RFC 4791 §2.4.1（前置审细化：两个 href）
+      'calendar-user-address-set':
+          '<c:calendar-user-address-set><d:href>mailto:2bot@2bot.local</d:href>'
+              '<d:href>/principals/2bot/</d:href></c:calendar-user-address-set>',
+      'resourcetype': '<d:resourcetype><d:principal/></d:resourcetype>',
+      'displayname': '<d:displayname>2bot</d:displayname>',
+    };
+    // home 集合（发现链第 3 步；WO-74 §2.1 补 supported-report-set）
+    final homeProps = <String, String>{
+      'resourcetype': '<d:resourcetype><d:collection/></d:resourcetype>',
+      'displayname': '<d:displayname>Calendars</d:displayname>',
+      'supported-report-set': reports,
+    };
+    // 日历集合（对齐 NAS §6.3 + WO-74 §2.1）
+    final calProps = <String, String>{
+      'resourcetype':
+          '<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>',
+      'displayname':
+          '<d:displayname>${AppConstants.calendarDisplayName}</d:displayname>',
+      'getctag': '<cs:getctag>$ctag</cs:getctag><c:getctag>$ctag</c:getctag>',
+      'sync-token': '<d:sync-token>${store.syncToken}</d:sync-token>',
+      'supported-calendar-component-set':
+          '<c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>',
+      'current-user-privilege-set':
+          '<d:current-user-privilege-set><d:privilege><d:read/></d:privilege><d:privilege><d:read-free-busy/></d:privilege></d:current-user-privilege-set>',
+      'supported-report-set': reports,
+    };
+
+    final responses = <String>[];
     if (path == '/' || path == '') {
-      // 发现链第 1 步：current-user-principal
-      xml
-        ..writeln(
-            '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">')
-        ..writeln('  <d:response>')
-        ..writeln('    <d:href>/</d:href>')
-        ..writeln('    <d:propstat>')
-        ..writeln('      <d:prop>')
-        ..writeln(
-            '        <d:current-user-principal><d:href>/principals/2bot/</d:href></d:current-user-principal>')
-        ..writeln('      </d:prop>')
-        ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
-        ..writeln('    </d:propstat>')
-        ..writeln('  </d:response>')
-        ..write('</d:multistatus>');
-      await _xml207(req, xml.toString());
-      return;
-    }
-    if (path == '/principals/2bot/' || path == '/principals/2bot') {
-      // 发现链第 2 步：principal + calendar-home-set（对齐 NAS §6.1 形状）
-      xml
-        ..writeln(
-            '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">')
-        ..writeln('  <d:response>')
-        ..writeln('    <d:href>/principals/2bot/</d:href>')
-        ..writeln('    <d:propstat>')
-        ..writeln('      <d:prop>')
-        ..writeln(
-            '        <d:current-user-principal><d:href>/principals/2bot/</d:href></d:current-user-principal>')
-        ..writeln('        <d:principal-URL><d:href>/principals/2bot/</d:href></d:principal-URL>')
-        ..writeln(
-            '        <c:calendar-home-set><d:href>/calendars/2bot/</d:href></c:calendar-home-set>')
-        ..writeln('        <d:resourcetype><d:principal/></d:resourcetype>')
-        ..writeln('        <d:displayname>2bot</d:displayname>')
-        ..writeln('      </d:prop>')
-        ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
-        ..writeln('    </d:propstat>')
-        ..writeln('  </d:response>')
-        ..write('</d:multistatus>');
-      await _xml207(req, xml.toString());
-      return;
-    }
-    if (path == '/calendars/2bot/' || path == '/calendars/2bot') {
-      // 发现链第 3 步：home 集合（depth 1 时附日历集合）
-      xml
-        ..writeln(
-            '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">')
-        ..writeln('  <d:response>')
-        ..writeln('    <d:href>/calendars/2bot/</d:href>')
-        ..writeln('    <d:propstat>')
-        ..writeln('      <d:prop>')
-        ..writeln('        <d:resourcetype><d:collection/></d:resourcetype>')
-        ..writeln('        <d:displayname>Calendars</d:displayname>')
-        ..writeln('      </d:prop>')
-        ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
-        ..writeln('    </d:propstat>')
-        ..writeln('  </d:response>');
+      responses.add(_responseXml('/', rootProps));
       if (depth != '0') {
-        final ctag = store.ctag;
-        xml
-          ..writeln('  <d:response>')
-          ..writeln('    <d:href>/calendars/2bot/default/</d:href>')
-          ..writeln('    <d:propstat>')
-          ..writeln('      <d:prop>')
-          ..writeln(
-              '        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>')
-          ..writeln(
-              '        <d:displayname>${AppConstants.calendarDisplayName}</d:displayname>')
-          ..writeln('        <cs:getctag>$ctag</cs:getctag>')
-          ..writeln('        <c:getctag>$ctag</c:getctag>')
-          ..writeln('        <d:sync-token>${store.syncToken}</d:sync-token>')
-          ..writeln('        <c:supported-calendar-component-set>')
-          ..writeln('          <c:comp name="VEVENT"/>')
-          ..writeln('        </c:supported-calendar-component-set>')
-          ..writeln(
-              '        <d:current-user-privilege-set><d:privilege><d:read/></d:privilege><d:privilege><d:read-free-busy/></d:privilege></d:current-user-privilege-set>')
-          ..writeln('      </d:prop>')
-          ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
-          ..writeln('    </d:propstat>')
-          ..writeln('  </d:response>');
+        // WO-74 §2.3：根 D1 列出 calendar-home——不跟随发现链的扫描型客户端
+        // 也能发现日历（两跳协议：根扫描见 home → home D1 见 calendar）
+        responses.add(_responseXml('/calendars/2bot/', homeProps));
       }
-      xml.write('</d:multistatus>');
-      await _xml207(req, xml.toString());
-      return;
-    }
-    if (path == '/calendars/2bot/default/' || path == '/calendars/2bot/default') {
-      // 日历集合：depth 1 → 集合属性 + 每事件 href/getetag（对齐 NAS §6.3）
-      final ctag = store.ctag;
-      xml
-        ..writeln(
-            '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">')
-        ..writeln('  <d:response>')
-        ..writeln('    <d:href>/calendars/2bot/default/</d:href>')
-        ..writeln('    <d:propstat>')
-        ..writeln('      <d:prop>')
-        ..writeln(
-            '        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>')
-        ..writeln(
-            '        <d:displayname>${AppConstants.calendarDisplayName}</d:displayname>')
-        ..writeln('        <cs:getctag>$ctag</cs:getctag>')
-        ..writeln('        <c:getctag>$ctag</c:getctag>')
-        ..writeln('        <d:sync-token>${store.syncToken}</d:sync-token>')
-        ..writeln('        <c:supported-calendar-component-set>')
-        ..writeln('          <c:comp name="VEVENT"/>')
-        ..writeln('        </c:supported-calendar-component-set>')
-        ..writeln(
-            '        <d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>')
-        ..writeln('      </d:prop>')
-        ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
-        ..writeln('    </d:propstat>')
-        ..writeln('  </d:response>');
+    } else if (path == '/principals/2bot/' || path == '/principals/2bot') {
+      responses.add(
+          _responseXml('/principals/2bot/', principalProps));
+    } else if (path == '/calendars/2bot/' || path == '/calendars/2bot') {
+      responses.add(_responseXml('/calendars/2bot/', homeProps));
+      if (depth != '0') {
+        responses.add(
+            _responseXml('/calendars/2bot/default/', calProps));
+      }
+    } else if (path == '/calendars/2bot/default/' ||
+        path == '/calendars/2bot/default') {
+      responses
+          .add(_responseXml('/calendars/2bot/default/', calProps));
       if (depth != '0') {
         for (final e in store.events.values) {
           final ics = e.toIcs();
-          xml
-            ..writeln('  <d:response>')
-            ..writeln('    <d:href>/calendars/2bot/default/${Uri.encodeComponent(e.uid)}.ics</d:href>')
-            ..writeln('    <d:propstat>')
-            ..writeln('      <d:prop>')
-            ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
-            ..writeln('      </d:prop>')
-            ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
-            ..writeln('    </d:propstat>')
-            ..writeln('  </d:response>');
+          responses.add(_responseXml(
+              '/calendars/2bot/default/${Uri.encodeComponent(e.uid)}.ics',
+              {
+                'getetag': '<d:getetag>${store.etagOf(ics)}</d:getetag>',
+              }));
         }
       }
-      xml.write('</d:multistatus>');
-      await _xml207(req, xml.toString());
+    } else {
+      req.response.statusCode = 404;
+      await req.response.close();
       return;
     }
-    req.response.statusCode = 404;
-    await req.response.close();
+
+    final xml = StringBuffer()
+      ..writeln('<?xml version="1.0" encoding="utf-8"?>')
+      ..writeln(
+          '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">');
+    for (final r in responses) {
+      xml.writeln(r);
+    }
+    xml.write('</d:multistatus>');
+    await _xml207(req, xml.toString());
   }
 
   Future<void> _report(HttpRequest req, String path, String body) async {

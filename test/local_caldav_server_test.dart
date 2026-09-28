@@ -107,6 +107,7 @@ void main() {
       String? body,
       String? authOverride,
       bool noAuth = false,
+      String? depth,
     }) async {
       final sock = await Socket.connect('127.0.0.1', port);
       final sb = StringBuffer('$method $path HTTP/1.1$crlf'
@@ -116,6 +117,10 @@ void main() {
       if (!noAuth) {
         sb.write('Authorization: Basic '
             '${base64.encode(utf8.encode(authOverride ?? '$user:$pass'))}$crlf');
+      }
+      // WO-74：PROPFIND Depth 头（不发给默认=服务端按 1 处理，与生产一致）
+      if (depth != null) {
+        sb.write('Depth: $depth$crlf');
       }
       if (body != null) {
         sb.write('Content-Type: application/xml; charset=utf-8$crlf');
@@ -487,6 +492,76 @@ void main() {
         (await req('POST', '/calendars/2bot/default/', body: 'x')).status,
         403,
       );
+    });
+
+    // ==================================================================
+    // WO-74 v2 · CalDAV 客户端兼容性（supported-report-set 两处同步携带 /
+    //         calendar-user-address-set 双 href / 根 D1 列 calendar-home）
+    // 断言现状对照（grep -n 复核于改前 main 352b5f8 的 lib/services/local_caldav_server.dart）：
+    //  - `supported-report-set`：全文 0 处；`calendar-user-address-set`：全文 0 处；
+    //  - `_propfind`（:219）四个分支属性集全部 writeln 硬编码；
+    //  - 根分支恒只回 1 条目（无子资源）——规格 §1 实测「D1 仅 1 条目」即此。
+    // v2 护栏 1：属性过滤【不做】，恒为全量属性块（无请求体/带请求体均同）。
+    // ==================================================================
+    test('home 集合声明 supported-report-set：三报告齐全（规格 §2.1①前置）', () async {
+      final r = await req('PROPFIND', '/calendars/2bot/', depth: '0');
+      expect(r.status, 207);
+      expect(r.body, contains('supported-report-set'));
+      expect(r.body, contains('<c:calendar-query/>'));
+      expect(r.body, contains('<c:calendar-multiget/>'));
+      expect(r.body, contains('<d:sync-collection/>'));
+      expect(r.body, contains('displayname'),
+          reason: 'v2 护栏1：全量属性块（多属性客户端自会忽略）');
+    });
+
+    test('日历集合（default）响应节点同样携带 supported-report-set + 三报告（§2.1②）', () async {
+      final r = await req('PROPFIND', '/calendars/2bot/default/', depth: '0');
+      expect(r.status, 207);
+      expect(r.body, contains('supported-report-set'));
+      expect(r.body, contains('<c:calendar-query/>'));
+      expect(r.body, contains('<c:calendar-multiget/>'));
+      expect(r.body, contains('<d:sync-collection/>'));
+    });
+
+    test('home Depth1 的【子响应节点】也携带 supported-report-set（§2.1①）', () async {
+      final r = await req('PROPFIND', '/calendars/2bot/'); // Depth 缺省=1
+      expect(r.status, 207);
+      expect('supported-report-set'.allMatches(r.body).length,
+          greaterThanOrEqualTo(2),
+          reason: 'home 自身节点与子节点（default）都声明');
+      expect('calendar-multiget'.allMatches(r.body).length,
+          greaterThanOrEqualTo(2), reason: '子节点三报告缺一不可');
+    });
+
+    test('principal 返回 calendar-user-address-set 双 href（规格 §2.2·前置审细化）', () async {
+      final r = await req('PROPFIND', '/principals/2bot/', depth: '0');
+      expect(r.status, 207);
+      expect(r.body, contains('calendar-user-address-set'));
+      expect(r.body, contains('mailto:2bot@2bot.local'));
+      expect(r.body, contains('<d:href>/principals/2bot/</d:href>'),
+          reason: '第二个 href：principal 路径本身');
+    });
+
+    test('根 Depth1 列出 calendar-home /calendars/2bot/（规格 §2.3）；Depth0 不列', () async {
+      final r1 = await req('PROPFIND', '/'); // 无体 = allprop 形态（既有形状）
+      expect(r1.status, 207);
+      expect(r1.body, contains('<d:href>/calendars/2bot/</d:href>'),
+          reason: '不跟随 current-user-principal 链的客户端靠根扫描发现日历 home'
+              '（两跳协议：根扫描见 home → home D1 见 c:calendar，后者由'
+              '「既有形状不破坏」断言覆盖）');
+
+      final r0 = await req('PROPFIND', '/', depth: '0');
+      expect(r0.body, contains('current-user-principal'));
+      expect(r0.body, isNot(contains('<d:href>/calendars/2bot/</d:href>')),
+          reason: 'Depth 0 只回自身');
+    });
+
+    test('既有形状不破坏：allprop home D1 双条目 + c:calendar + getctag', () async {
+      final r = await req('PROPFIND', '/calendars/2bot/');
+      expect(r.status, 207);
+      expect(r.body, contains('<c:calendar/>'));
+      expect(r.body, contains('getctag'));
+      expect(r.body, contains('<d:href>/calendars/2bot/default/</d:href>'));
     });
   });
 
