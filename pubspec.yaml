@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.2+21  # WO-74-R2 Phase 1：本机服务访问记录（caldav_access.log，零行为变更）
+version: 1.6.2+22  # WO-74-R2 Phase 2：per-event calendar-data 加 VCALENDAR 信封（ical4j 兼容）
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

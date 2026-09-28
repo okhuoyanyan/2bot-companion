@@ -119,6 +119,21 @@ class StoredEvent {
     return buf.toString();
   }
 
+  /// WO-74-R2 Phase 2 · 单事件 ICS 的 VCALENDAR 信封版（per-event 出口专用）。
+  /// 病灶：per-event calendar-data 发裸 BEGIN:VEVENT，ical4j 严格解析拒收
+  ///（RFC 4791 §5.1/5545 要求 text/calendar 必含 VCALENDAR 包裹）。
+  /// 聚合 renderFullIcs() 自带信封，两勿混用。行尾统一 CRLF（与服务端
+  /// _crlf 幂等）→ etag 按本字节计算，PROPFIND 列表/REPORT/GET 全链一致。
+  /// PRODID 对齐 NAS 侧 caldav-server.js。
+  String toIcsWithEnvelope() {
+    return 'BEGIN:VCALENDAR\r\n'
+        'VERSION:2.0\r\n'
+        'PRODID:-//QQ-2BOT-NEW//CalDAV Server//CN\r\n'
+        'CALSCALE:GREGORIAN\r\n'
+        '${toIcs().replaceAll('\n', '\r\n')}'
+        '\r\nEND:VCALENDAR';
+  }
+
   static String _escapeIcsText(String raw) => raw
       .replaceAll('\\', '\\\\')
       .replaceAll(';', '\\;')

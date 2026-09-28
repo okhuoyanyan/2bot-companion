@@ -125,7 +125,6 @@ class LocalCalDavServer {
   static const int _accessRingMax = 400;
   static final Queue<String> _accessRing = Queue<String>();
   static File? _accessFile;
-  static Future<void> _accessChain = Future.value();
 
   /// 测试注入口：日志目录（生产恒 null → App 外部专属目录，可被 adb 导出；
   /// App 私有文档目录无法被 adb 读取，外部 files 目录是唯一可导出面）。
@@ -139,34 +138,57 @@ class LocalCalDavServer {
     _accessFile = null;
   }
 
-  static Future<File> _resolveAccessFile() async {
+  static File _resolveAccessFileSync() {
     // 落点=公共 Download（规格原文「App 文档目录」在 Android 上是
-    // /data 私有目录，adb 无法导出；Android/data/<pkg> 需框架 API 建目录，
-    // dart:io 直接 mkdir 会被 FUSE 拒绝——实测）。本日志经【凭据三禁】+
-    // 单测断言零凭据，放 Download 是可导出性与私密性的折中，位置归 Phase 2 裁定。
-    const base = '/storage/emulated/0/Download';
+    // /data 私有目录，adb 无法导出（run-as 需 debuggable）；Android/data/<pkg>
+    // 需框架 API 建目录，dart:io 直接 mkdir 会被 FUSE 拒绝——实测）。
+    // 本日志经【凭据三禁】+ 单测断言零凭据，放 Download 是可导出性与
+    // 私密性的折中，位置归 Phase 2 裁定。
+    // 【Phase 1 回归修复申报】a142184 的 resolve 丢过 override 读取
+    // （retarget 时引入），本单恢复；测试目录注入口自此重新生效。
+    final base = accessLogDirOverride ?? '/storage/emulated/0/Download';
     final dir = Directory(base);
     if (!dir.existsSync()) {
-      await dir.create(recursive: true);
+      dir.createSync(recursive: true);
     }
     return File('$base/caldav_access.log');
   }
+
+  static final List<String> _accessPending = <String>[];
+  static Future<void>? _accessDrainer;
+  static bool _draining = false;
 
   static Future<void> _appendAccess(String line) {
     _accessRing.addLast(line);
     while (_accessRing.length > _accessRingMax) {
       _accessRing.removeFirst();
     }
-    final next = _accessChain.then((_) async {
+    // 单 drainer 顺序落盘（WO-74-R2 P2：替换 .then 链——链式 await 在
+    // flutter_test 环境存在恢复点停摆竞态；drainer 长驻循环无此形态）。
+    // 目录解析为同步（existsSync/createSync 仅首次发生），唯一异步点=
+    // writeAsString（真机 885 行实证可用）。
+    _accessPending.add(line);
+    if (!_draining) {
+      _draining = true;
+      _accessDrainer = _drainAccess();
+    }
+    return _accessDrainer!;
+  }
+
+  static Future<void> _drainAccess() async {
+    try {
+    while (_accessPending.isNotEmpty) {
+      final line = _accessPending.removeAt(0);
       try {
-        final f = _accessFile ??= await _resolveAccessFile();
+        final f = _accessFile ??= _resolveAccessFileSync();
         await f.writeAsString('$line\n', mode: FileMode.append);
       } catch (_) {
         _accessFile = null; // 目录缺失/IO 瞬断：下次请求重建，绝不影响服务
       }
-    });
-    _accessChain = next;
-    return next;
+    }
+    } finally {
+      _draining = false;
+    }
   }
 
   static void _recordAccess(
@@ -184,7 +206,8 @@ class LocalCalDavServer {
     }
   }
   static void accessRingClearForTest() => _accessRing.clear();
-  static Future<void> get accessWritesIdleForTest => _accessChain;
+  static Future<void> get accessWritesIdleForTest =>
+      _accessDrainer ?? Future.value();
 
   Future<void> _handle(HttpRequest req) async {
     final sw = Stopwatch()..start();
@@ -407,7 +430,8 @@ class LocalCalDavServer {
           .add(_responseXml('/calendars/2bot/default/', calProps));
       if (depth != '0') {
         for (final e in store.events.values) {
-          final ics = e.toIcs();
+          // WO-74-R2 P2：etag 按实际发送字节（信封版）计算，与 REPORT/GET 同源
+          final ics = _crlf(e.toIcsWithEnvelope());
           responses.add(_responseXml(
               '/calendars/2bot/default/${Uri.encodeComponent(e.uid)}.ics',
               {
@@ -445,7 +469,8 @@ class LocalCalDavServer {
             '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">')
         ..writeln('  <d:sync-token>$token</d:sync-token>');
       for (final e in store.events.values) {
-        final ics = e.toIcs();
+        // WO-74-R2 P2：信封版（裸 VEVENT 被 ical4j 拒收）；etag=实际发送字节
+        final ics = _crlf(e.toIcsWithEnvelope());
         xml
           ..writeln('  <d:response>')
           ..writeln('    <d:href>$base${Uri.encodeComponent(e.uid)}.ics</d:href>')
@@ -453,7 +478,7 @@ class LocalCalDavServer {
           ..writeln('      <d:prop>')
           ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
           ..writeln(
-              '        <c:calendar-data>${_escapeXml(_crlf(ics))}</c:calendar-data>')
+              '        <c:calendar-data>${_escapeXml(ics)}</c:calendar-data>')
           ..writeln('      </d:prop>')
           ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
           ..writeln('    </d:propstat>')
@@ -484,7 +509,8 @@ class LocalCalDavServer {
         final uid = Uri.decodeComponent(name);
         final found = store.events[uid];
         if (found != null) {
-          final ics = found.toIcs();
+          // WO-74-R2 P2：信封版
+          final ics = _crlf(found.toIcsWithEnvelope());
           xml
             ..writeln('  <d:response>')
             ..writeln('    <d:href>$href</d:href>')
@@ -492,7 +518,7 @@ class LocalCalDavServer {
             ..writeln('      <d:prop>')
             ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
             ..writeln(
-                '        <c:calendar-data>${_escapeXml(_crlf(ics))}</c:calendar-data>')
+                '        <c:calendar-data>${_escapeXml(ics)}</c:calendar-data>')
             ..writeln('      </d:prop>')
             ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
             ..writeln('    </d:propstat>')
@@ -546,7 +572,8 @@ class LocalCalDavServer {
           (e.endMs ?? e.dtstartMs) <= rangeStart.millisecondsSinceEpoch) {
         continue;
       }
-      final ics = e.toIcs();
+      // WO-74-R2 P2：信封版
+      final ics = _crlf(e.toIcsWithEnvelope());
       xml
         ..writeln('  <d:response>')
         ..writeln('    <d:href>$base${Uri.encodeComponent(e.uid)}.ics</d:href>')
@@ -554,7 +581,7 @@ class LocalCalDavServer {
         ..writeln('      <d:prop>')
         ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
         ..writeln(
-            '        <c:calendar-data>${_escapeXml(_crlf(ics))}</c:calendar-data>')
+            '        <c:calendar-data>${_escapeXml(ics)}</c:calendar-data>')
         ..writeln('      </d:prop>')
         ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
         ..writeln('    </d:propstat>')
@@ -587,9 +614,10 @@ class LocalCalDavServer {
         await req.response.close();
         return 0;
       }
-      final body = _crlf(found.toIcs());
+      // WO-74-R2 P2：单事件 GET 也发信封版（与 REPORT 同形）；etag=实际发送字节
+      final body = _crlf(found.toIcsWithEnvelope());
       req.response.headers.set('Content-Type', 'text/calendar; charset=utf-8');
-      req.response.headers.set('ETag', store.etagOf(found.toIcs()));
+      req.response.headers.set('ETag', store.etagOf(body));
       if (found.lastModifiedMs != null) {
         req.response.headers.set('Last-Modified', HttpDate.format(
             DateTime.fromMillisecondsSinceEpoch(found.lastModifiedMs!,
