@@ -339,6 +339,21 @@ class ImapIdleClient {
   /// WO-71 ④：命令写出回调（回放轨在此同步注入响应字节）
   @visibleForTesting
   void Function(String cmd)? debugHookOnCommand;
+
+  /// WO-78-R3 ①：IDLE 生命周期日志出口（每跳一行：挂载/重挂/NOOP/推送/断开）。
+  /// print 必发 logcat（WO-70 先例）；onLifecycleLog 由上层接入设置页 imapLog 环。
+  void Function(String line)? onLifecycleLog;
+  DateTime? _idleMountedAt;
+
+  void _life(String msg) {
+    final line =
+        '[WO78-R3] ${DateTime.now().toIso8601String().substring(11, 19)} $msg';
+    // ignore: avoid_print
+    print(line);
+    try {
+      onLifecycleLog?.call(line);
+    } catch (_) {}
+  }
   /// WO-71 ④：命令完成回调
   @visibleForTesting
   Future<void> Function()? debugHookOnAfterCommand;
@@ -486,10 +501,17 @@ class ImapIdleClient {
     );
     if (cont.isContinuation) {
       _idleTag = tag;
+      _idleMountedAt = DateTime.now();
+      _life(_reAttach ? 'IDLE 重挂（NOOP 节拍循环）' : 'IDLE 挂载');
+      _reAttach = true;
       return true;
     }
+    _life('IDLE 被服务器拒绝（tagged NO/BAD）');
     return false; // 服务器拒绝 IDLE（tagged NO/BAD）
   }
+
+  /// WO-78-R3：是否为 NOOP 节拍循环中的重挂（仅用于生命周期日志措辞）
+  bool _reAttach = false;
 
   /// WO-71 整改 A：UID FETCH 分批上限（单行命令 ≤~2KB，远低于 QQ 丢弃阈值）
   static const int fetchBatchSize = 50;
@@ -509,11 +531,16 @@ class ImapIdleClient {
       final now = DateTime.now();
       if (now.isAfter(nextNoopAt)) {
         // —— NOOP 保活节拍 ——
+        _life('NOOP 节拍到点（${noopBeat.inSeconds}s）：DONE → NOOP 探测');
         await stopIdle();
         final pending = await noop();
-        if (pending != null) return pending;
+        if (pending != null) {
+          _life('NOOP 夹带 EXISTS=$pending（推送当时未达，兜底感知）→ 立即增量');
+          return pending;
+        }
         final accepted = await startIdle();
         if (!accepted) {
+          _life('重发 IDLE 被拒 → 重建会话');
           throw ImapCommandException('IDLE', 'NO（NOOP 节拍后重发被拒）');
         }
         nextNoopAt = DateTime.now().add(noopBeat);
@@ -526,7 +553,16 @@ class ImapIdleClient {
         if (_assembler.hasUnits) {
           for (final u in _assembler.takeUnits()) {
             final n = parseExistsCount(u.head);
-            if (n != null) return n;
+            if (n != null) {
+              final since = _idleMountedAt == null
+                  ? '?'
+                  : DateTime.now()
+                      .difference(_idleMountedAt!)
+                      .inSeconds
+                      .toString();
+              _life('IDLE 推送 EXISTS=$n（挂载后 ${since}s）→ 立即增量');
+              return n;
+            }
             if (u.isContinuation) continue;
             if (u.head.toUpperCase().contains('* BYE')) {
               throw ImapClosedException('IDLE 期间服务端 BYE');
@@ -569,6 +605,7 @@ class ImapIdleClient {
     final tag = _nextTag();
     _cmdStart ??= DateTime.now();
     _cmdName = 'NOOP';
+    _life('NOOP 探针发出（兜底感知）');
     _send('$tag NOOP');
     int? exists;
     final resp = await _readUnit(

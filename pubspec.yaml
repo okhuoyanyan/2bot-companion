@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.2+25  # WO-78-R2：ctag/sync-token 聚合 per-event etag（渲染变化自动传导→客户端自愈）
+version: 1.6.2+26  # WO-78-R3：IDLE 生命周期每跳可观测+NOOP 兜底 30s+断连即时重建（修 60s 白等）
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

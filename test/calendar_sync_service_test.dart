@@ -422,12 +422,14 @@ class FakeSource implements CalendarMailSource {
   }
 
   @override
+  void Function(String line)? onLifecycleLog;
+
+  @override
   Future<bool> startIdle() async {
     calls.add('idle');
     return true;
   }
 
-  @override
   @override
   Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)}) async {
     // 真实 IDLE 语义：长阻塞至 close() 唤醒（否则立即 null 会让会话循环
