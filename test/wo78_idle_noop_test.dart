@@ -96,6 +96,8 @@ void main() {
               host: '127.0.0.1',
               port: server.socket.port),
         );
+        final hops = <String>[];
+        client.onLifecycleLog = hops.add;
         await client.connect();
         expect(await client.startIdle(), isTrue);
 
@@ -106,11 +108,53 @@ void main() {
             noopBeat: const Duration(milliseconds: 300));
         sw.stop();
 
+        // WO-78-R3 ①：每跳一行生命周期可观测（挂载/NOOP/夹带/重挂）
+        expect(hops.join('|'), contains('IDLE 挂载'), reason: '①建立可观测');
+        expect(hops.join('|'), contains('NOOP 节拍到点'), reason: '①NOOP 跳可观测');
+        expect(hops.join('|'), contains('NOOP 夹带 EXISTS=7'), reason: '①兜底感知可观测');
+        expect(hops.join('|'), contains('NOOP 夹带 EXISTS=7（推送当时未达，兜底感知）'),
+            reason: '①兜底感知与「推送未达」因果必须可观测');
         expect(n, 7, reason: 'NOOP 响应夹带的积压 EXISTS 必须立即返回（不漏推送）');
         expect(sw.elapsed.inSeconds, lessThan(8), reason: '不应等到 25 分钟/beat 节拍');
         expect(server.received.toString(), contains('NOOP'));
         expect(server.received.toString(), contains('DONE'));
         await client.close();
+      } finally {
+        ImapIdleClient.socketFactory = null;
+        await server.close();
+      }
+    });
+
+    test('NOOP 无积压 → 重挂 hop 可观测（NOOP 往返证明存活，beat 窗口重置为有意行为）',
+        () async {
+      final server = await _ScriptedImapServer.bind(); // 不注入 EXISTS
+      ImapIdleClient.socketFactory =
+          (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
+      try {
+        final client = ImapIdleClient(
+          config: ImapConfig(
+              account: 'acct',
+              authCode: 'code',
+              host: '127.0.0.1',
+              port: server.socket.port),
+        );
+        final hops = <String>[];
+        client.onLifecycleLog = hops.add;
+        await client.connect();
+        expect(await client.startIdle(), isTrue);
+        // beat(10s) > noopBeat(200ms)：每次 NOOP 往返成功即证明连接存活，
+        // beat 窗口随之重置（保持挂载态）；close() 触发断开异常以收束
+        final fut = client.waitForEvent(
+            beat: const Duration(seconds: 10),
+            noopBeat: const Duration(milliseconds: 200));
+        await Future<void>.delayed(const Duration(milliseconds: 900));
+        expect(hops.join('|'), contains('IDLE 重挂（NOOP 节拍循环）'),
+            reason: '①重挂可观测（WO-78-R3 ②重挂修复面的观测出口）');
+        expect(hops.join('|'), contains('NOOP 探针发出'),
+            reason: '①NOOP 跳可观测');
+        await client.close();
+        await expectLater(fut, throwsA(isA<Exception>()),
+            reason: 'close() 后等待必须有界终止（Closed/超时皆可——不聋等）');
       } finally {
         ImapIdleClient.socketFactory = null;
         await server.close();

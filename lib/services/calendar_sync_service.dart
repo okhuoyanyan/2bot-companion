@@ -136,6 +136,10 @@ abstract class CalendarMailSource {
 
   Future<bool> startIdle();
   Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)});
+
+  /// WO-78-R3 ①：IDLE 生命周期日志出口（每跳一行）
+  void Function(String line)? get onLifecycleLog;
+  set onLifecycleLog(void Function(String line)? v);
   Future<void> stopIdle();
   Future<void> close();
 }
@@ -147,12 +151,17 @@ class QqImapSource implements CalendarMailSource {
   /// WO-71 任务 A.4：命令级日志出口（设置页可见）
   void Function(String line)? onCommandLog;
 
+  /// WO-78-R3 ①：IDLE 生命周期日志出口（挂载/重挂/NOOP/推送/断开 每跳一行）
+  @override
+  void Function(String line)? onLifecycleLog;
+
   QqImapSource(this.config);
 
   @override
   Future<int?> connect() async {
     final client = ImapIdleClient(config: config);
     client.onCommandLog = onCommandLog;
+    client.onLifecycleLog = onLifecycleLog;
     _client = client;
     final units = await client.connect();
     return parseUidValidity(units);
@@ -213,6 +222,7 @@ class CalendarSyncService {
   Future<void>? _loop;
   CalendarMailSource? _currentSource;
   int _consecutiveFailures = 0;
+  int _rebuildCount = 0; // WO-78-R3：连续会话重建计数（防打爆护栏）
   String _mode = 'off';
 
   /// 主 isolate / 测试用默认构造
@@ -242,8 +252,9 @@ class CalendarSyncService {
 
   /// 单次拉取节拍常量（暴露给测试与上层观测）
   static const Duration idleBeat = Duration(minutes: 25);
-  /// WO-78 缺陷②：NOOP 保活节拍——静默死连最坏聋 25 分钟 → 压到 ≤60s+10s 超时
-  static const Duration idleNoopBeat = Duration(seconds: 60);
+  /// WO-78-R3 ②：NOOP 兜底节拍 30s——诊断实证 NOOP 是唯一感知路径时，
+  /// 推送时效上限=本节拍+处理；IDLE 原生推送到达时本节拍仅作死连探针。
+  static const Duration idleNoopBeat = Duration(seconds: 30);
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
@@ -346,6 +357,21 @@ class CalendarSyncService {
         await _runSession(settings);
         // 会话正常退出（stop）即返回
         if (_stopRequested) return;
+      } on ImapClosedException catch (e) {
+        // WO-78-R3 ②：连接断开（BYE/FIN/NOOP 超时暴露的死连）≠ 持久性失败——
+        // 立即重建会话（连接即做一次增量同步），不吃 60s 退避（旧路径白等）。
+        // 防打爆护栏：连续重建 >3 次（flapping 网络）→ 30s 冷却；
+        // 成功同步会把 _consecutiveFailures 清零 → 顺带解除冷却。
+        if (_stopRequested) return;
+        _rebuildCount++;
+        // ignore: avoid_print
+        print('[WO78-R3] 连接断开 → 重建会话（第 $_rebuildCount 次）：${_safeMessage(e)}');
+        if (_rebuildCount > 3) {
+          // ignore: avoid_print
+          print('[WO78-R3] 连续重建超限，冷却 30s（网络 flapping 防打爆）');
+          if (await _sleep(const Duration(seconds: 30))) return;
+        }
+        continue;
       } catch (e) {
         if (_stopRequested) return;
         _consecutiveFailures++;
@@ -375,6 +401,15 @@ class CalendarSyncService {
           final st = _lastKnownState;
           final log = (st['imapLog'] as List?) ?? <dynamic>[];
           log.insert(0, '$line');
+          st['imapLog'] = log.take(6).toList();
+        } catch (_) {}
+      };
+      // WO-78-R3 ①：生命周期每跳一行——客户端已 print（logcat），此处仅入设置页环
+      source.onLifecycleLog = (line) {
+        try {
+          final st = _lastKnownState;
+          final log = (st['imapLog'] as List?) ?? <dynamic>[];
+          log.insert(0, line);
           st['imapLog'] = log.take(6).toList();
         } catch (_) {}
       };
@@ -408,6 +443,7 @@ class CalendarSyncService {
       lastUid = await _syncIncrement(source, lastUid,
           uidValidity: uidValidity, trigger: '启动');
       _consecutiveFailures = 0;
+      _rebuildCount = 0;
       _mode = 'idle';
       await _setStatus(mode: 'idle', result: 'ok');
 
@@ -460,7 +496,9 @@ class CalendarSyncService {
       {int? uidValidity, String trigger = '启动'}) async {
     final sw = Stopwatch()..start();
     final (:mails, maxSeenUid: maxSeen) = await source.fetchNewSince(lastUid);
-    debugPrint('[WO78] 拉取(触发=$trigger)：水位线=$lastUid，粗筛 maxSeen=$maxSeen，'
+    // WO-78-R3：观测行必须进 logcat（debugPrint 有节流丢弃；print 为 WO-70 同款先例）
+    // ignore: avoid_print
+    print('[WO78] 拉取(触发=$trigger)：水位线=$lastUid，粗筛 maxSeen=$maxSeen，'
         '日历新件=${mails.length} 封（粗筛 ${sw.elapsedMilliseconds}ms）');
     try {
       final st = _lastKnownState;
@@ -493,7 +531,8 @@ class CalendarSyncService {
       final mailDate = parseRfc5322Date(mail.raw);
       if (mailDate != null) {
         final sec = DateTime.now().difference(mailDate).inSeconds;
-        debugPrint('[WO78] 推送 $sec 秒到达（触发=$trigger，UID=${mail.uid}）');
+        // ignore: avoid_print
+        print('[WO78] 推送 $sec 秒到达（触发=$trigger，UID=${mail.uid}）');
       }
       final icsText = extractIcsFromMail(mail.raw);
       if (icsText == null) {
