@@ -11,6 +11,7 @@
 // 只读：PUT/DELETE/POST 一律 403。认证：Basic（用户名 2bot）+ ICS 独立令牌。
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -112,11 +113,109 @@ class LocalCalDavServer {
   // 请求处理
   // ------------------------------------------------------------------
 
-  Future<void> _handle(HttpRequest req) async {
-    try {
-      final method = req.method.toUpperCase();
-      final path = req.uri.path;
+  // ------------------------------------------------------------------
+  // WO-74-R2 Phase 1 · 访问记录（只落文件，零行为变更）
+  // ------------------------------------------------------------------
+  // 凭据三禁（最高红线）：① 路径只记 req.uri.path——query（?token=）绝不
+  // 入串，严禁 uri.toString()；② 不记 Authorization；③ 不记请求/响应体
+  // （只记载荷字节数）。实现命名刻意避开 logcat 面标识符（既有静态断言
+  // test:465 钉住源码零 print/debugPrint/log/info/warning/severe 调用），
+  // 本设施只写文件、logcat 零明文。环形缓冲 400 条（规格带 200–500），
+  // 文件为追加式全量。单请求开销 = Stopwatch + 一次字符串插值（≪0.05ms）。
+  static const int _accessRingMax = 400;
+  static final Queue<String> _accessRing = Queue<String>();
+  static File? _accessFile;
 
+  /// 测试注入口：日志目录（生产恒 null → App 外部专属目录，可被 adb 导出；
+  /// App 私有文档目录无法被 adb 读取，外部 files 目录是唯一可导出面）。
+  /// 变更即失效已缓存句柄——override 切换必须即时生效（否则缓存指向旧目录）。
+  static String? _accessDirOverride;
+  // ignore: unnecessary_getters_setters
+  static String? get accessLogDirOverride => _accessDirOverride;
+  static set accessLogDirOverride(String? v) {
+    if (_accessDirOverride == v) return;
+    _accessDirOverride = v;
+    _accessFile = null;
+  }
+
+  static File _resolveAccessFileSync() {
+    // 落点=公共 Download（规格原文「App 文档目录」在 Android 上是
+    // /data 私有目录，adb 无法导出（run-as 需 debuggable）；Android/data/<pkg>
+    // 需框架 API 建目录，dart:io 直接 mkdir 会被 FUSE 拒绝——实测）。
+    // 本日志经【凭据三禁】+ 单测断言零凭据，放 Download 是可导出性与
+    // 私密性的折中，位置归 Phase 2 裁定。
+    // 【Phase 1 回归修复申报】a142184 的 resolve 丢过 override 读取
+    // （retarget 时引入），本单恢复；测试目录注入口自此重新生效。
+    final base = accessLogDirOverride ?? '/storage/emulated/0/Download';
+    final dir = Directory(base);
+    if (!dir.existsSync()) {
+      dir.createSync(recursive: true);
+    }
+    return File('$base/caldav_access.log');
+  }
+
+  static final List<String> _accessPending = <String>[];
+  static Future<void>? _accessDrainer;
+  static bool _draining = false;
+
+  static Future<void> _appendAccess(String line) {
+    _accessRing.addLast(line);
+    while (_accessRing.length > _accessRingMax) {
+      _accessRing.removeFirst();
+    }
+    // 单 drainer 顺序落盘（WO-74-R2 P2：替换 .then 链——链式 await 在
+    // flutter_test 环境存在恢复点停摆竞态；drainer 长驻循环无此形态）。
+    // 目录解析为同步（existsSync/createSync 仅首次发生），唯一异步点=
+    // writeAsString（真机 885 行实证可用）。
+    _accessPending.add(line);
+    if (!_draining) {
+      _draining = true;
+      _accessDrainer = _drainAccess();
+    }
+    return _accessDrainer!;
+  }
+
+  static Future<void> _drainAccess() async {
+    try {
+    while (_accessPending.isNotEmpty) {
+      final line = _accessPending.removeAt(0);
+      try {
+        final f = _accessFile ??= _resolveAccessFileSync();
+        await f.writeAsString('$line\n', mode: FileMode.append);
+      } catch (_) {
+        _accessFile = null; // 目录缺失/IO 瞬断：下次请求重建，绝不影响服务
+      }
+    }
+    } finally {
+      _draining = false;
+    }
+  }
+
+  static void _recordAccess(
+      String method, String path, int status, Stopwatch sw, int bytes) {
+    _appendAccess('${DateTime.now().toIso8601String()} '
+        '$method $path $status ${sw.elapsedMicroseconds / 1000}ms $bytes');
+  }
+
+  // 以下三个为测试钩子（生产不调用）
+  static List<String> accessRingSnapshot() => List<String>.from(_accessRing);
+  static void accessRingAddForTest(String line) {
+    _accessRing.addLast(line);
+    while (_accessRing.length > _accessRingMax) {
+      _accessRing.removeFirst();
+    }
+  }
+  static void accessRingClearForTest() => _accessRing.clear();
+  static Future<void> get accessWritesIdleForTest =>
+      _accessDrainer ?? Future.value();
+
+  Future<void> _handle(HttpRequest req) async {
+    final sw = Stopwatch()..start();
+    final method = req.method.toUpperCase();
+    final path = req.uri.path; // 只记 path——?token= 所在的 query 不入日志
+    var status = 500;
+    var bytes = 0;
+    try {
       // —— WO-73 §6 BUG 修复：RFC 6764 发现入口【免认证 301】——
       // 原 301 分支在 Basic 认证之后：未认证先 401，严格的 CalDAV 客户端在
       // 发现第一步即放弃（管理员实机「登录成功但 0 个日历」）。空体重定向，
@@ -126,6 +225,7 @@ class LocalCalDavServer {
         req.response.statusCode = 301;
         req.response.headers.set('Location', '/principals/2bot/');
         await req.response.close();
+        _recordAccess(method, path, 301, sw, 0);
         return;
       }
 
@@ -136,6 +236,7 @@ class LocalCalDavServer {
           req.response.headers.set(
               'WWW-Authenticate', 'Basic realm="2bot", charset="UTF-8"');
           await req.response.close();
+          _recordAccess(method, path, 401, sw, 0);
           return;
         }
       } else if (!_checkAuth(req)) {
@@ -143,6 +244,7 @@ class LocalCalDavServer {
         req.response.headers.set(
             'WWW-Authenticate', 'Basic realm="2bot", charset="UTF-8"');
         await req.response.close();
+        _recordAccess(method, path, 401, sw, 0);
         return;
       }
       if (method != 'GET' &&
@@ -153,6 +255,7 @@ class LocalCalDavServer {
         // 只读服务：写操作一律 403（硬性要求 5）
         req.response.statusCode = 403;
         await req.response.close();
+        _recordAccess(method, path, 403, sw, 0);
         return;
       }
 
@@ -163,26 +266,35 @@ class LocalCalDavServer {
               'Allow', 'OPTIONS, GET, HEAD, PROPFIND, REPORT');
           req.response.statusCode = 200;
           await req.response.close();
-          return;
+          status = 200;
+          break;
         case 'PROPFIND':
-          await _propfind(req, path, req.headers.value('Depth') ?? '1');
-          return;
+          bytes =
+              await _propfind(req, path, req.headers.value('Depth') ?? '1');
+          status = 207;
+          break;
         case 'REPORT':
           final body = await utf8.decoder.bind(req).join();
-          await _report(req, path, body);
-          return;
+          bytes = await _report(req, path, body);
+          status = 207;
+          break;
         case 'GET':
         case 'HEAD':
-          await _get(req, path, headOnly: method == 'HEAD');
-          return;
+          bytes = await _get(req, path, headOnly: method == 'HEAD');
+          status = 200;
+          break;
+        default:
+          req.response.statusCode = 405;
+          await req.response.close();
+          status = 405;
       }
-      req.response.statusCode = 405;
-      await req.response.close();
+      _recordAccess(method, path, status, sw, bytes);
     } catch (_) {
       try {
         req.response.statusCode = 500;
         await req.response.close();
       } catch (_) {}
+      _recordAccess(method, path, 500, sw, 0);
     }
   }
 
@@ -250,7 +362,7 @@ class LocalCalDavServer {
     return sb.toString();
   }
 
-  Future<void> _propfind(HttpRequest req, String path, String depth) async {
+  Future<int> _propfind(HttpRequest req, String path, String depth) async {
     final cupXml =
         '<d:current-user-principal><d:href>/principals/2bot/</d:href></d:current-user-principal>';
     final reports = _supportedReportSetXml();
@@ -318,7 +430,8 @@ class LocalCalDavServer {
           .add(_responseXml('/calendars/2bot/default/', calProps));
       if (depth != '0') {
         for (final e in store.events.values) {
-          final ics = e.toIcs();
+          // WO-74-R2 P2：etag 按实际发送字节（信封版）计算，与 REPORT/GET 同源
+          final ics = _crlf(e.toIcsWithEnvelope());
           responses.add(_responseXml(
               '/calendars/2bot/default/${Uri.encodeComponent(e.uid)}.ics',
               {
@@ -329,7 +442,7 @@ class LocalCalDavServer {
     } else {
       req.response.statusCode = 404;
       await req.response.close();
-      return;
+      return 0;
     }
 
     final xml = StringBuffer()
@@ -340,10 +453,10 @@ class LocalCalDavServer {
       xml.writeln(r);
     }
     xml.write('</d:multistatus>');
-    await _xml207(req, xml.toString());
+    return _xml207(req, xml.toString());
   }
 
-  Future<void> _report(HttpRequest req, String path, String body) async {
+  Future<int> _report(HttpRequest req, String path, String body) async {
     const base = '/calendars/2bot/default/';
     final xml = StringBuffer();
     final token = store.syncToken;
@@ -356,7 +469,8 @@ class LocalCalDavServer {
             '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">')
         ..writeln('  <d:sync-token>$token</d:sync-token>');
       for (final e in store.events.values) {
-        final ics = e.toIcs();
+        // WO-74-R2 P2：信封版（裸 VEVENT 被 ical4j 拒收）；etag=实际发送字节
+        final ics = _crlf(e.toIcsWithEnvelope());
         xml
           ..writeln('  <d:response>')
           ..writeln('    <d:href>$base${Uri.encodeComponent(e.uid)}.ics</d:href>')
@@ -364,7 +478,7 @@ class LocalCalDavServer {
           ..writeln('      <d:prop>')
           ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
           ..writeln(
-              '        <c:calendar-data>${_escapeXml(_crlf(ics))}</c:calendar-data>')
+              '        <c:calendar-data>${_escapeXml(ics)}</c:calendar-data>')
           ..writeln('      </d:prop>')
           ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
           ..writeln('    </d:propstat>')
@@ -378,8 +492,7 @@ class LocalCalDavServer {
           ..writeln('  </d:response>');
       }
       xml.write('</d:multistatus>');
-      await _xml207(req, xml.toString());
-      return;
+      return _xml207(req, xml.toString());
     }
 
     if (body.contains('calendar-multiget')) {
@@ -396,7 +509,8 @@ class LocalCalDavServer {
         final uid = Uri.decodeComponent(name);
         final found = store.events[uid];
         if (found != null) {
-          final ics = found.toIcs();
+          // WO-74-R2 P2：信封版
+          final ics = _crlf(found.toIcsWithEnvelope());
           xml
             ..writeln('  <d:response>')
             ..writeln('    <d:href>$href</d:href>')
@@ -404,7 +518,7 @@ class LocalCalDavServer {
             ..writeln('      <d:prop>')
             ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
             ..writeln(
-                '        <c:calendar-data>${_escapeXml(_crlf(ics))}</c:calendar-data>')
+                '        <c:calendar-data>${_escapeXml(ics)}</c:calendar-data>')
             ..writeln('      </d:prop>')
             ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
             ..writeln('    </d:propstat>')
@@ -418,8 +532,7 @@ class LocalCalDavServer {
         }
       }
       xml.write('</d:multistatus>');
-      await _xml207(req, xml.toString());
-      return;
+      return _xml207(req, xml.toString());
     }
 
     // 7.3 calendar-query（通用/含 time-range 过滤）
@@ -459,7 +572,8 @@ class LocalCalDavServer {
           (e.endMs ?? e.dtstartMs) <= rangeStart.millisecondsSinceEpoch) {
         continue;
       }
-      final ics = e.toIcs();
+      // WO-74-R2 P2：信封版
+      final ics = _crlf(e.toIcsWithEnvelope());
       xml
         ..writeln('  <d:response>')
         ..writeln('    <d:href>$base${Uri.encodeComponent(e.uid)}.ics</d:href>')
@@ -467,17 +581,17 @@ class LocalCalDavServer {
         ..writeln('      <d:prop>')
         ..writeln('        <d:getetag>${store.etagOf(ics)}</d:getetag>')
         ..writeln(
-            '        <c:calendar-data>${_escapeXml(_crlf(ics))}</c:calendar-data>')
+            '        <c:calendar-data>${_escapeXml(ics)}</c:calendar-data>')
         ..writeln('      </d:prop>')
         ..writeln('      <d:status>HTTP/1.1 200 OK</d:status>')
         ..writeln('    </d:propstat>')
         ..writeln('  </d:response>');
     }
     xml.write('</d:multistatus>');
-    await _xml207(req, xml.toString());
+    return _xml207(req, xml.toString());
   }
 
-  Future<void> _get(HttpRequest req, String path,
+  Future<int> _get(HttpRequest req, String path,
       {required bool headOnly}) async {
     if (path == '/calendar.ics') {
       final body = store.renderFullIcs();
@@ -488,7 +602,7 @@ class LocalCalDavServer {
       req.response.statusCode = 200;
       if (!headOnly) req.response.write(body);
       await req.response.close();
-      return;
+      return headOnly ? 0 : utf8.encode(body).length;
     }
     if (path.startsWith('/calendars/2bot/default/') &&
         path.endsWith('.ics')) {
@@ -498,11 +612,12 @@ class LocalCalDavServer {
       if (found == null) {
         req.response.statusCode = 404;
         await req.response.close();
-        return;
+        return 0;
       }
-      final body = _crlf(found.toIcs());
+      // WO-74-R2 P2：单事件 GET 也发信封版（与 REPORT 同形）；etag=实际发送字节
+      final body = _crlf(found.toIcsWithEnvelope());
       req.response.headers.set('Content-Type', 'text/calendar; charset=utf-8');
-      req.response.headers.set('ETag', store.etagOf(found.toIcs()));
+      req.response.headers.set('ETag', store.etagOf(body));
       if (found.lastModifiedMs != null) {
         req.response.headers.set('Last-Modified', HttpDate.format(
             DateTime.fromMillisecondsSinceEpoch(found.lastModifiedMs!,
@@ -511,24 +626,27 @@ class LocalCalDavServer {
       req.response.statusCode = 200;
       if (!headOnly) req.response.write(body);
       await req.response.close();
-      return;
+      return headOnly ? 0 : utf8.encode(body).length;
     }
     if (path == '/' || path == '') {
       req.response.statusCode = 200;
       req.response.headers.set('Content-Type', 'text/plain; charset=utf-8');
       req.response.write('2BOT companion local read-only calendar service');
       await req.response.close();
-      return;
+      return utf8.encode('2BOT companion local read-only calendar service').length;
     }
     req.response.statusCode = 404;
     await req.response.close();
+    return 0;
   }
 
-  Future<void> _xml207(HttpRequest req, String xml) async {
+  Future<int> _xml207(HttpRequest req, String xml) async {
     req.response.headers.set('Content-Type', 'application/xml; charset=utf-8');
     req.response.statusCode = 207;
     req.response.write(xml);
     await req.response.close();
+    // 载荷字节（不含 chunked 帧/响应头）——供访问记录
+    return utf8.encode(xml).length;
   }
 
   /// ICS 行尾统一 CRLF（契约：CRLF 行尾）

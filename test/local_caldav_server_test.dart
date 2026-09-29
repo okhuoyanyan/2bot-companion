@@ -10,6 +10,8 @@ import 'package:bot_companion/services/calendar_event_store.dart';
 import 'package:bot_companion/services/cross_isolate_lock.dart';
 import 'package:bot_companion/services/local_caldav_server.dart';
 
+import 'wo74r2_baseline.dart';
+
 /// ============================================================================
 /// WO-70 · 本机只读服务单测（事件模型 + HTTP 路由矩阵 + 只读契约）
 /// ============================================================================
@@ -101,7 +103,7 @@ void main() {
     const user = '2bot';
     const pass = 'test-pass-12';
 
-    Future<({int status, Map<String, String> headers, String body})> req(
+    Future<({int status, Map<String, String> headers, String body, List<int> bodyBytes})> req(
       String method,
       String path, {
       String? body,
@@ -181,7 +183,7 @@ void main() {
               line.substring(idx + 1).trim();
         }
       }
-      return (status: status, headers: hs, body: respBody);
+      return (status: status, headers: hs, body: respBody, bodyBytes: bodyBytes);
     }
 
     setUp(() async {
@@ -325,12 +327,15 @@ void main() {
     });
 
     test('GET 单事件：200 + ETag；缺失 → 404', () async {
+      // WO-74-R2 P2 断言现状对照：原断言（a142184）钉裸尾 endsWith('END:VEVENT')
+      // ——信封化后单事件正文以 END:VCALENDAR 收尾（故意变更，规格②）
       final r = await req('GET', '/calendars/2bot/default/cal_1.ics');
       expect(r.status, 200);
       expect(r.headers['etag'], isNotNull);
       expect(r.headers['content-type'], contains('text/calendar'));
       expect(r.body, contains('UID:cal_1'));
-      expect(r.body.endsWith('END:VEVENT'), isTrue);
+      expect(r.body.startsWith('BEGIN:VCALENDAR'), isTrue);
+      expect(r.body.endsWith('END:VCALENDAR'), isTrue);
 
       final r404 = await req('GET', '/calendars/2bot/default/none.ics');
       expect(r404.status, 404);
@@ -375,7 +380,7 @@ void main() {
       const f = LocalCalDavServer.constantTimeEquals;
       expect(f('abcdef', 'abcdef'), isTrue);
       expect(f('abcdef', 'abcdeX'), isFalse);
-      expect(f('abcdef', 'abcdefX'), isFalse, reason: '长度不同必须不等');
+      expect(f('abcdef', 'abcdefX'), isFalse);
       expect(f('abc', ''), isFalse, reason: '前缀 ≠ 相等');
       expect(f('', ''), isTrue);
     });
@@ -562,6 +567,323 @@ void main() {
       expect(r.body, contains('<c:calendar/>'));
       expect(r.body, contains('getctag'));
       expect(r.body, contains('<d:href>/calendars/2bot/default/</d:href>'));
+    });
+
+    // ==================================================================
+    // WO-74-R2 Phase 1 · 快照护栏（护栏③）
+    // 断言现状对照：基线 k* 常量由临时抓取脚本在【未改代码 5e57e31】上抓取后
+    // 程序化生成（test/wo74r2_baseline.dart，非手抄）；本组证明加日志前后
+    // PROPFIND 各层级与 REPORT 的 XML 正文 100% 逐字节一致。
+    // 豁免（规格）：GET /calendar.ics 的 Last-Modified 是响应头且随时间变化，
+    // 不在正文快照内（本组比对的是 body 字节，天然豁免）。
+    // ==================================================================
+    test('快照：PROPFIND 根 D1 逐字节吻合', () async {
+      final r = await req('PROPFIND', '/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineRootD1));
+    });
+    test('快照：PROPFIND principal 逐字节吻合', () async {
+      final r = await req('PROPFIND', '/principals/2bot/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselinePrincipal));
+    });
+    test('快照：PROPFIND home D1 逐字节吻合', () async {
+      final r = await req('PROPFIND', '/calendars/2bot/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineHomeD1));
+    });
+    test('快照：PROPFIND default（Depth 缺省=D1，与基线抓取口径一致）逐字节吻合',
+        () async {
+      final r = await req('PROPFIND', '/calendars/2bot/default/');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineDefaultD0));
+    });
+    test('快照：REPORT sync-collection 逐字节吻合', () async {
+      final r = await req('REPORT', '/calendars/2bot/default/',
+          body: '<B:sync-collection xmlns:B="urn:ietf:params:xml:ns:caldav"/>');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineReportSync));
+    });
+    test('快照：REPORT calendar-multiget 逐字节吻合', () async {
+      final r = await req('REPORT', '/calendars/2bot/default/',
+          body: '<C:calendar-multiget xmlns:C="urn:ietf:params:xml:ns:caldav">'
+              '<D:href xmlns:D="DAV:">/calendars/2bot/default/cal_2.ics</D:href>'
+              '<D:href xmlns:D="DAV:">/calendars/2bot/default/none.ics</D:href>'
+              '</C:calendar-multiget>');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineReportMultiget));
+    });
+    test('快照：REPORT calendar-query 逐字节吻合', () async {
+      final r = await req('REPORT', '/calendars/2bot/default/',
+          body: '<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" '
+              'xmlns:D="DAV:" xmlns:g="urn:ietf:params:xml:ns:caldav:time-range">'
+              '<D:prop><D:getetag/><C:calendar-data/></D:prop>'
+              '<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter '
+              'name="VEVENT">'
+              '<g:time-range start="20240923T000000Z" '
+              'end="20240923T235959Z"/>'
+              '</C:comp-filter></C:filter></C:comp-filter>'
+              '</C:calendar-query>');
+      expect(r.status, 207);
+      expect(r.bodyBytes, utf8.encode(baselineReportQuery));
+    });
+    test('快照：GET /calendar.ics 正文逐字节吻合（Last-Modified 头豁免）', () async {
+      final r = await req('GET', '/calendar.ics?token=${server.icsToken}',
+          noAuth: true);
+      expect(r.status, 200);
+      expect(r.bodyBytes, utf8.encode(baselineIcs));
+    });
+
+    // ==================================================================
+    // WO-74-R2 Phase 1 · 访问记录行为（只落文件；凭据三禁；环形上限）
+    // ==================================================================
+    test('访问记录：格式/状态/字节齐全，且 token 与 Authorization 绝不落盘', () async {
+      final tmp = await Directory.systemTemp.createTemp('wo74r2_access');
+      LocalCalDavServer.accessLogDirOverride = tmp.path;
+      final logFile = File('${tmp.path}/caldav_access.log');
+      if (logFile.existsSync()) logFile.deleteSync();
+      try {
+        await req('GET', '/calendar.ics', noAuth: true); // 401（无 token）
+        await req('GET', '/calendar.ics?token=${server.icsToken}',
+            noAuth: true); // 200
+        await req('GET', '/calendar.ics?token=WRONG', noAuth: true); // 401
+        await req('GET', '/.well-known/caldav', noAuth: true); // 301
+        await req('PUT', '/calendars/2bot/default/x.ics',
+            body: 'x'); // 403
+        await req('PROPFIND', '/calendars/2bot/default/', depth: '0'); // 207
+        await LocalCalDavServer.accessWritesIdleForTest;
+
+        expect(logFile.existsSync(), isTrue, reason: '日志必须落盘');
+        final lines = logFile.readAsLinesSync();
+        expect(lines.length, 6, reason: '六个请求六行');
+        final b64pass = base64.encode(utf8.encode('$user:$pass'));
+        for (final l in lines) {
+          expect(l, matches(RegExp(
+              r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+ '
+              r'(GET|PUT|PROPFIND) \S+ \d{3} \d+(\.\d+?)ms \d+$')),
+              reason: '格式：时间 方法 路径 状态 耗时ms 字节');
+          expect(l.contains('token='), isFalse,
+              reason: '凭据三禁①：query 绝不落盘');
+          expect(l.contains(b64pass), isFalse, reason: '凭据三禁②');
+          expect(l.toLowerCase().contains('authorization'), isFalse,
+              reason: '凭据三禁②');
+          expect(l.contains('体检'), isFalse, reason: '凭据三禁③：响应体不落盘');
+        }
+        expect(lines.any((l) => l.contains(' 401 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 200 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 301 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 403 ')), isTrue);
+        expect(lines.any((l) => l.contains(' 207 ')), isTrue);
+        final propfindLine = lines.firstWhere((l) => l.contains(' 207 '));
+        final bytesField =
+            int.parse(propfindLine.split(' ').last);
+        expect(bytesField, greaterThan(500), reason: '207 载荷字节=XML 长度');
+      } finally {
+        LocalCalDavServer.accessLogDirOverride = null;
+        if (tmp.existsSync()) {
+          await tmp.delete(recursive: true);
+        }
+      }
+    });
+
+    test('环形缓冲上限：超过 _accessRingMax 后保持恒定', () {
+      final before = LocalCalDavServer.accessRingSnapshot().length;
+      for (var i = 0; i < 450; i++) {
+        LocalCalDavServer.accessRingAddForTest('LINE$i');
+      }
+      final after = LocalCalDavServer.accessRingSnapshot();
+      expect(after.length, 400, reason: '环形上限 400（200–500 规格带内）');
+      expect(after.length, greaterThanOrEqualTo(before));
+      expect(after.last, 'LINE449');
+      // 清场：避免污染同套件后续用例的内存态
+      LocalCalDavServer.accessRingClearForTest();
+      expect(LocalCalDavServer.accessRingSnapshot(), isEmpty);
+    });
+
+    // ==================================================================
+    // WO-74-R2 Phase 2 · calendar-data 信封
+    // 断言现状对照（grep -n 复核于改前 a142184）：sync-collection/multiget/
+    // calendar-query/单事件 GET 的 per-event calendar-data 均发【裸 BEGIN:VEVENT】
+    // （calendar_event_store.dart:81-120 toIcs 无信封；per-event 出口 0 处
+    // BEGIN:VCALENDAR）——ical4j 严格解析拒收 =「同步成功零显示」根因。
+    // 聚合 /calendar.ics 本就正确（renderFullIcs 有信封），零改动。
+    // ==================================================================
+    group('WO-74-R2 Phase 2 · 信封', () {
+      late LocalCalDavServer server;
+      late int port;
+      const pass2 = 'test-pass-12';
+
+      setUp(() async {
+        SharedPreferences.setMockInitialValues({});
+        SharedPreferencesAsyncPlatform.instance =
+            InMemorySharedPreferencesAsync.withData(const {});
+        server = LocalCalDavServer(store: buildStore(), password: pass2);
+        await server.start(preferredPort: 33100);
+        port = server.port;
+      });
+      tearDown(() async {
+        await server.stop();
+      });
+
+      Future<String> reqBody(String method, String path, {String? body}) async {
+        final sock = await Socket.connect('127.0.0.1', port);
+        final sb = StringBuffer('$method $path HTTP/1.1$crlf'
+            'Host: 127.0.0.1$crlf'
+            'Authorization: Basic '
+            '${base64.encode(utf8.encode('2bot:$pass2'))}$crlf');
+        if (body != null) {
+          sb.write('Content-Type: application/xml; charset=utf-8$crlf');
+          sb.write('Content-Length: ${utf8.encode(body).length}$crlf');
+        }
+        sb.write('Connection: close$crlf$crlf');
+        if (body != null) sb.write(body);
+        sock.write(sb.toString());
+        final rawBytes = <int>[];
+        await for (final chunk in sock) {
+          rawBytes.addAll(chunk);
+        }
+        sock.destroy();
+        var headEnd = -1;
+        for (var i = 0; i < rawBytes.length - 3; i++) {
+          if (rawBytes[i] == 13 &&
+              rawBytes[i + 1] == 10 &&
+              rawBytes[i + 2] == 13 &&
+              rawBytes[i + 3] == 10) {
+            headEnd = i;
+            break;
+          }
+        }
+        var bodyBytes = rawBytes.sublist(headEnd + 4);
+        final head = utf8.decode(rawBytes.sublist(0, headEnd));
+        if (head.toLowerCase().contains('transfer-encoding: chunked')) {
+          final decoded = <int>[];
+          var i = 0;
+          while (i < bodyBytes.length) {
+            var j = i;
+            while (j + 1 < bodyBytes.length &&
+                !(bodyBytes[j] == 13 && bodyBytes[j + 1] == 10)) {
+              j++;
+            }
+            final sizeStr = String.fromCharCodes(bodyBytes.sublist(i, j))
+                .split(';')
+                .first
+                .trim();
+            final size = int.parse(sizeStr, radix: 16);
+            if (size == 0) break;
+            decoded.addAll(bodyBytes.sublist(j + 2, j + 2 + size));
+            i = j + 2 + size + 2;
+          }
+          bodyBytes = decoded;
+        }
+        return utf8.decode(bodyBytes, allowMalformed: true);
+      }
+
+      void expectEnveloped(String seg) {
+        expect(seg.startsWith('BEGIN:VCALENDAR'), isTrue,
+            reason: '每段 calendar-data 必以 BEGIN:VCALENDAR 开头（RFC 4791 §5.1）');
+        expect(seg.endsWith('END:VCALENDAR'), isTrue,
+            reason: '每段 calendar-data 必以 END:VCALENDAR 结尾');
+        expect(seg.contains('BEGIN:VEVENT'), isTrue);
+        expect(seg.contains('END:VEVENT'), isTrue);
+        expect(seg.indexOf('BEGIN:VCALENDAR'),
+            lessThan(seg.indexOf('BEGIN:VEVENT')),
+            reason: '信封在前，VEVENT 被包裹');
+        expect(
+            seg.indexOf('END:VEVENT'), lessThan(seg.indexOf('END:VCALENDAR')));
+      }
+
+      List<String> calendarDataSegments(String xml) => RegExp(
+              r'<c:calendar-data>(.*?)</c:calendar-data>',
+              dotAll: true)
+          .allMatches(xml)
+          .map((m) => m.group(1)!)
+          .toList();
+
+      test('store：toIcsWithEnvelope 结构（头四行 + 裸VEVENT 全文 + 收尾，CRLF）', () {
+        final store = buildStore();
+        final e = store.events['cal_1']!;
+        final env = e.toIcsWithEnvelope();
+        expect(env.startsWith('BEGIN:VCALENDAR\r\n'), isTrue);
+        expect(env.contains('\r\nVERSION:2.0\r\n'), isTrue);
+        expect(env.contains('\r\nPRODID:-//QQ-2BOT-NEW//CalDAV Server//CN\r\n'),
+            isTrue);
+        expect(env.contains('\r\nCALSCALE:GREGORIAN\r\n'), isTrue);
+        expect('BEGIN:VCALENDAR'.allMatches(env).length, 1,
+            reason: '信封不嵌套');
+        expect(env.contains(e.toIcs().replaceAll('\n', '\r\n')), isTrue,
+            reason: '承载现有裸 VEVENT 全文（仅行尾归一）');
+        expect(env.endsWith('END:VEVENT\r\nEND:VCALENDAR'), isTrue);
+        expect(env.replaceAll('\r\n', '').contains('\n'), isFalse,
+            reason: '全 CRLF（无孤立 LF）');
+      });
+
+      test('sync-collection：每段 calendar-data 均带信封', () async {
+        final r = await reqBody('REPORT', '/calendars/2bot/default/',
+            body: '<B:sync-collection xmlns:B="urn:ietf:params:xml:ns:caldav"/>');
+        final segs = calendarDataSegments(r);
+        expect(segs.length, 2, reason: '库内 2 事件');
+        for (final s in segs) {
+          expectEnveloped(s);
+        }
+      });
+
+      test('calendar-multiget：每段 calendar-data 均带信封', () async {
+        final r = await reqBody('REPORT', '/calendars/2bot/default/',
+            body: '<C:calendar-multiget xmlns:C="urn:ietf:params:xml:ns:caldav">'
+                '<D:href xmlns:D="DAV:">/calendars/2bot/default/cal_1.ics</D:href>'
+                '</C:calendar-multiget>');
+        final segs = calendarDataSegments(r);
+        expect(segs.length, 1);
+        expectEnveloped(segs.first);
+      });
+
+      test('calendar-query：每段 calendar-data 均带信封', () async {
+        final r = await reqBody('REPORT', '/calendars/2bot/default/',
+            body: '<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav"/>');
+        final segs = calendarDataSegments(r);
+        expect(segs.length, 2);
+        for (final s in segs) {
+          expectEnveloped(s);
+        }
+      });
+
+      test('单事件 GET：正文即信封（旧断言裸尾 END:VEVENT 同步改为信封尾）', () async {
+        final body = await reqBody('GET', '/calendars/2bot/default/cal_1.ics');
+        expect(body.startsWith('BEGIN:VCALENDAR'), isTrue);
+        expect(body.endsWith('END:VCALENDAR'), isTrue);
+        expectEnveloped(body);
+      });
+
+      test('etag 一致性：PROPFIND D1 事件 etag == 单事件 GET etag（同一信封字节）', () async {
+        final propfind =
+            await reqBody('PROPFIND', '/calendars/2bot/default/');
+        final m = RegExp(
+                r'<d:href>/calendars/2bot/default/cal_1\.ics</d:href>.*?<d:getetag>([^<]+)</d:getetag>',
+                dotAll: true)
+            .firstMatch(propfind);
+        final listTag = m!.group(1)!;
+        final sock = await Socket.connect('127.0.0.1', port);
+        sock.write('GET /calendars/2bot/default/cal_1.ics HTTP/1.1$crlf'
+            'Host: 127.0.0.1$crlf'
+            'Authorization: Basic '
+            '${base64.encode(utf8.encode('2bot:$pass2'))}$crlf'
+            'Connection: close$crlf$crlf');
+        final rawBytes = <int>[];
+        await for (final chunk in sock) {
+          rawBytes.addAll(chunk);
+        }
+        sock.destroy();
+        final head = utf8.decode(rawBytes.sublist(0, rawBytes.length));
+        final getTag =
+            RegExp(r'[Ee][Tt][Aa][Gg]:\s*(\S+)').firstMatch(head)!.group(1)!;
+        expect(listTag, getTag, reason: '列表 etag 必须与实际发送字节（信封版）一致');
+      });
+
+      test('守卫不回退：无 token 的 ICS 仍 401（聚合出口与令牌零改动）', () async {
+        final r401 =
+            await reqBody('GET', '/calendar.ics'); // 无 token
+        expect(r401, isEmpty, reason: '401 空体：守卫语义不变');
+      });
     });
   });
 
