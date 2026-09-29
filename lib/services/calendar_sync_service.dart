@@ -140,6 +140,13 @@ abstract class CalendarMailSource {
   /// WO-78-R3 ①：IDLE 生命周期日志出口（每跳一行）
   void Function(String line)? get onLifecycleLog;
   set onLifecycleLog(void Function(String line)? v);
+
+  /// WO-78-R3 返工：最近一次唤醒原因（'IDLE推送'/'NOOP查件'/'NOOP夹带'）——
+  /// 拉取日志触发原因的归因源；null=未知。
+  String? get lastWakeReason;
+
+  /// WO-78-R3 返工③：当前 INBOX EXISTS（UID 序列重置防御用）；null=不可知
+  Future<int?> inboxExists();
   Future<void> stopIdle();
   Future<void> close();
 }
@@ -154,6 +161,12 @@ class QqImapSource implements CalendarMailSource {
   /// WO-78-R3 ①：IDLE 生命周期日志出口（挂载/重挂/NOOP/推送/断开 每跳一行）
   @override
   void Function(String line)? onLifecycleLog;
+
+  @override
+  String? get lastWakeReason => _client?.lastWakeReason;
+
+  @override
+  Future<int?> inboxExists() => _client?.selectInboxExists() ?? Future.value(null);
 
   QqImapSource(this.config);
 
@@ -252,9 +265,11 @@ class CalendarSyncService {
 
   /// 单次拉取节拍常量（暴露给测试与上层观测）
   static const Duration idleBeat = Duration(minutes: 25);
-  /// WO-78-R3 ②：NOOP 兜底节拍 30s——诊断实证 NOOP 是唯一感知路径时，
-  /// 推送时效上限=本节拍+处理；IDLE 原生推送到达时本节拍仅作死连探针。
-  static const Duration idleNoopBeat = Duration(seconds: 30);
+  /// WO-78-R3 返工实测（5 轮第 1 轮）：QQ 对本连接的 IDLE 【不推 EXISTS】
+  /// （出站后 30s 窗口内无任何推送行，re-SELECT 才看见）→ NOOP 查件是唯一
+  /// 感知路径，节拍 30s 时实测 24.1s（相位平均 +15s）。压到 10s：
+  /// re-SELECT 单次开销 ~200ms/次，端到端 ≈5-8s（验收 ≤10s）。
+  static const Duration idleNoopBeat = Duration(seconds: 10);
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
@@ -463,17 +478,23 @@ class CalendarSyncService {
         final event =
             await source.waitForEvent(beat: idleBeat, noopBeat: idleNoopBeat);
         if (_stopRequested) return;
-        if (event == null) {
-          // 25 分钟节拍到点：DONE + 重发 IDLE（防 30 分钟服务端强断）
-          debugPrint('[WO69] IDLE 节拍到点，重发 IDLE（防 30 分钟强断）');
+        if (event != null && event > 0) {
+          // EXISTS 感知（IDLE 推送 / NOOP 夹带）：秒级增量
+          debugPrint('[WO69] 唤醒 EXISTS=$event，开始秒级增量');
           await source.stopIdle();
+          lastUid = await _syncIncrement(source, lastUid,
+              uidValidity: uidValidity,
+              trigger: source.lastWakeReason ?? '未知来源');
+          await _setStatus(mode: 'idle', result: 'ok');
           continue;
         }
-        // 收到 EXISTS：秒级增量
-        debugPrint('[WO69] IDLE 推送 EXISTS=$event，开始秒级增量');
-        await source.stopIdle();
+        // event == -1（NOOP 节拍哨兵）或 null：轻量 UID 水位线查件——
+        // 返工②诊断：QQ 的 EXISTS 与 UID 水位线不同轴，新件判据一律走水位线。
+        // 空扫（无新件）不做状态写盘（防 10s 节拍写放大）。
+        final boxExists = await source.inboxExists().catchError((_) => null);
         lastUid = await _syncIncrement(source, lastUid,
-            uidValidity: uidValidity, trigger: 'IDLE推送');
+            uidValidity: uidValidity, trigger: 'NOOP查件',
+            lightIdle: true, boxExists: boxExists);
         await _setStatus(mode: 'idle', result: 'ok');
       }
     } finally {
@@ -493,9 +514,24 @@ class CalendarSyncService {
   /// 增量同步：粗筛→精筛→拉全文→提取 ICS→解析→幂等 upsert→推进水位线。
   /// 返回推进后的水位线（调用方保存）。[trigger]=拉取原因（拉取日志可观测）。
   Future<int> _syncIncrement(CalendarMailSource source, int lastUid,
-      {int? uidValidity, String trigger = '启动'}) async {
+      {int? uidValidity, String trigger = '启动', bool lightIdle = false,
+      int? boxExists}) async {
     final sw = Stopwatch()..start();
-    final (:mails, maxSeenUid: maxSeen) = await source.fetchNewSince(lastUid);
+    var (:mails, maxSeenUid: maxSeen) = await source.fetchNewSince(lastUid);
+    // WO-78-R3 返工③：QQ UID 序列重置防御——实测 QQ 在某时刻【静默重置 UID 序列】
+    //（UIDVALIDITY 不变：违反 RFC 3501）：旧水位线(1238) 高于新序列最大 UID，
+    // SEARCH UID n:* 永远空返回 → 水位线机制对该账号失效。防御：粗筛空返回
+    // 且 boxExists < 水位线 → 判定序列重置 → 水位线回退到 boxExists 全量重扫
+    //（幂等 upsert + 台账判重保证无害；新序列 minUID=1/maxUID=EXISTS 实测一致）。
+    if (mails.isEmpty && maxSeen == 0 && boxExists != null && boxExists < lastUid) {
+      // ignore: avoid_print
+      print('[WO78-R3] 检测到 UID 序列重置（水位线=$lastUid > boxExists=$boxExists）'
+          '→ 水位线回退至 $boxExists 全量重扫（幂等）');
+      final retry = await source.fetchNewSince(boxExists);
+      mails = retry.mails;
+      maxSeen = retry.maxSeenUid;
+      lastUid = boxExists;
+    }
     // WO-78-R3：观测行必须进 logcat（debugPrint 有节流丢弃；print 为 WO-70 同款先例）
     // ignore: avoid_print
     print('[WO78] 拉取(触发=$trigger)：水位线=$lastUid，粗筛 maxSeen=$maxSeen，'
@@ -515,7 +551,7 @@ class CalendarSyncService {
         await StorageService.saveCalendarWatermark(
             uidValidity: uidValidity, lastProcessedUid: next);
       }
-      await _touchState(result: 'ok');
+      if (!lightIdle) await _touchState(result: 'ok');
       return next;
     }
 

@@ -345,6 +345,10 @@ class ImapIdleClient {
   void Function(String line)? onLifecycleLog;
   DateTime? _idleMountedAt;
 
+  /// WO-78-R3 返工：最近一次唤醒原因（'IDLE推送' / 'NOOP夹带' / 'NOOP查件'）——
+  /// 上层作为拉取日志的触发原因（归因可观测）
+  String lastWakeReason = '';
+
   void _life(String msg) {
     final line =
         '[WO78-R3] ${DateTime.now().toIso8601String().substring(11, 19)} $msg';
@@ -483,6 +487,12 @@ class ImapIdleClient {
     return selUntagged;
   }
 
+  /// WO-78-R3 返工②诊断：QQ 的 EXISTS 计数与 UID 水位线【不同轴】（实测 R2 邮件
+  /// 未入 INBOX 时 EXISTS 恒定，而水位线体系可见）——新件判据一律以 UID 水位线
+  /// （fetchNewSince 粗筛）为准，EXISTS 仅作夹带提示。NOOP 节拍返回 -1 哨兵，
+  /// 由上层做轻量 UID SEARCH 查件。
+
+
   Future<void> _wakeWaiter() async {
     final w = _dataWaiter;
     if (w != null && !w.isCompleted) {
@@ -530,22 +540,28 @@ class ImapIdleClient {
     while (true) {
       final now = DateTime.now();
       if (now.isAfter(nextNoopAt)) {
-        // —— NOOP 保活节拍 ——
-        _life('NOOP 节拍到点（${noopBeat.inSeconds}s）：DONE → NOOP 探测');
+        // —— 保活节拍（WO-78-R3 返工最终形态）：DONE → 直接重发 IDLE → 哨兵 -1 ——
+        // 实测归因：①QQ 对本连接的 IDLE 不推 EXISTS（静默期零推送行）；
+        // ②QQ 对「IDLE 后发 NOOP」一律立即断连（每次 NOOP 后 服务端关闭连接）。
+        // 故不发 NOOP：DONE→重发 IDLE 是 RFC 2177 标准循环；重挂成功即证明连接
+        // 存活并返回哨兵 -1（上层走 UID 水位线查件）；重挂失败/超时=死连，
+        // 转 ImapClosedException 由上层即时重建（连接即查件）。
+        _life('保活节拍到点（${noopBeat.inSeconds}s）：DONE → 重发 IDLE');
         await stopIdle();
-        final pending = await noop();
-        if (pending != null) {
-          _life('NOOP 夹带 EXISTS=$pending（推送当时未达，兜底感知）→ 立即增量');
-          return pending;
+        bool accepted;
+        try {
+          accepted = await startIdle();
+        } on TimeoutException {
+          throw ImapClosedException('重发 IDLE 超时（死连）');
         }
-        final accepted = await startIdle();
         if (!accepted) {
           _life('重发 IDLE 被拒 → 重建会话');
-          throw ImapCommandException('IDLE', 'NO（NOOP 节拍后重发被拒）');
+          throw ImapClosedException('重发 IDLE 被拒（tagged NO/BAD）');
         }
         nextNoopAt = DateTime.now().add(noopBeat);
         deadline = DateTime.now().add(beat); // 重发即重置 25 分钟纪律窗口
-        continue;
+        lastWakeReason = 'NOOP查件';
+        return -1; // 哨兵：节拍到点，上层做轻量 UID 水位线查件
       }
       final remain = deadline.difference(now);
       if (remain <= Duration.zero) return null;
@@ -560,6 +576,7 @@ class ImapIdleClient {
                       .difference(_idleMountedAt!)
                       .inSeconds
                       .toString();
+              lastWakeReason = 'IDLE推送';
               _life('IDLE 推送 EXISTS=$n（挂载后 ${since}s）→ 立即增量');
               return n;
             }
@@ -618,6 +635,27 @@ class ImapIdleClient {
     );
     if (resp.status != 'OK') {
       throw ImapCommandException('NOOP', resp.status ?? 'NO');
+    }
+    return exists;
+  }
+
+  /// WO-78-R3 返工③：SELECT INBOX 读取当前 EXISTS（UID 序列重置防御用）。
+  Future<int?> selectInboxExists({Duration timeout = const Duration(seconds: 10)}) async {
+    final tag = _nextTag();
+    _cmdStart ??= DateTime.now();
+    _cmdName = 'SELECT';
+    _send('$tag SELECT INBOX');
+    int? exists;
+    final resp = await _readUnit(
+      timeout: timeout,
+      test: (u) => u.tag == tag,
+      collect: (u) {
+        final n = parseExistsCount(u.head);
+        if (n != null) exists = n;
+      },
+    );
+    if (resp.status != 'OK') {
+      throw ImapCommandException('SELECT', resp.status ?? 'NO');
     }
     return exists;
   }
