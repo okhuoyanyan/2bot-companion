@@ -135,7 +135,7 @@ abstract class CalendarMailSource {
       int lastProcessedUid);
 
   Future<bool> startIdle();
-  Future<int?> waitForEvent({required Duration beat});
+  Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)});
   Future<void> stopIdle();
   Future<void> close();
 }
@@ -168,8 +168,9 @@ class QqImapSource implements CalendarMailSource {
   Future<bool> startIdle() => _client!.startIdle();
 
   @override
-  Future<int?> waitForEvent({required Duration beat}) =>
-      _client!.waitForEvent(beat: beat);
+  Future<int?> waitForEvent({required Duration beat,
+          Duration noopBeat = const Duration(seconds: 60)}) =>
+      _client!.waitForEvent(beat: beat, noopBeat: noopBeat);
 
   @override
   Future<void> stopIdle() => _client!.stopIdle();
@@ -241,6 +242,8 @@ class CalendarSyncService {
 
   /// 单次拉取节拍常量（暴露给测试与上层观测）
   static const Duration idleBeat = Duration(minutes: 25);
+  /// WO-78 缺陷②：NOOP 保活节拍——静默死连最坏聋 25 分钟 → 压到 ≤60s+10s 超时
+  static const Duration idleNoopBeat = Duration(seconds: 60);
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
@@ -402,7 +405,8 @@ class CalendarSyncService {
             uidValidity: uidValidity, lastProcessedUid: lastUid);
       }
 
-      lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
+      lastUid = await _syncIncrement(source, lastUid,
+          uidValidity: uidValidity, trigger: '启动');
       _consecutiveFailures = 0;
       _mode = 'idle';
       await _setStatus(mode: 'idle', result: 'ok');
@@ -415,11 +419,13 @@ class CalendarSyncService {
           await _setStatus(mode: 'poll', error: '服务器不接受 IDLE，退化为兜底轮询');
           // 兜底轮询：每 15 分钟整连重拉（服务循环外层 sleep 实现同节奏）
           if (await _sleep(fallbackPollInterval)) return;
-          lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
+          lastUid = await _syncIncrement(source, lastUid,
+              uidValidity: uidValidity, trigger: '轮询');
           await _setStatus(mode: 'poll', result: 'ok');
           continue;
         }
-        final event = await source.waitForEvent(beat: idleBeat);
+        final event =
+            await source.waitForEvent(beat: idleBeat, noopBeat: idleNoopBeat);
         if (_stopRequested) return;
         if (event == null) {
           // 25 分钟节拍到点：DONE + 重发 IDLE（防 30 分钟服务端强断）
@@ -430,7 +436,8 @@ class CalendarSyncService {
         // 收到 EXISTS：秒级增量
         debugPrint('[WO69] IDLE 推送 EXISTS=$event，开始秒级增量');
         await source.stopIdle();
-        lastUid = await _syncIncrement(source, lastUid, uidValidity: uidValidity);
+        lastUid = await _syncIncrement(source, lastUid,
+            uidValidity: uidValidity, trigger: 'IDLE推送');
         await _setStatus(mode: 'idle', result: 'ok');
       }
     } finally {
@@ -448,12 +455,20 @@ class CalendarSyncService {
       _syncIncrement(source, lastUid, uidValidity: uidValidity);
 
   /// 增量同步：粗筛→精筛→拉全文→提取 ICS→解析→幂等 upsert→推进水位线。
-  /// 返回推进后的水位线（调用方保存）。
+  /// 返回推进后的水位线（调用方保存）。[trigger]=拉取原因（拉取日志可观测）。
   Future<int> _syncIncrement(CalendarMailSource source, int lastUid,
-      {int? uidValidity}) async {
+      {int? uidValidity, String trigger = '启动'}) async {
+    final sw = Stopwatch()..start();
     final (:mails, maxSeenUid: maxSeen) = await source.fetchNewSince(lastUid);
-    debugPrint('[WO69] 增量扫描：水位线=$lastUid，粗筛 maxSeen=$maxSeen，'
-        '日历新件=${mails.length} 封');
+    debugPrint('[WO78] 拉取(触发=$trigger)：水位线=$lastUid，粗筛 maxSeen=$maxSeen，'
+        '日历新件=${mails.length} 封（粗筛 ${sw.elapsedMilliseconds}ms）');
+    try {
+      final st = _lastKnownState;
+      final log = (st['imapLog'] as List?) ?? <dynamic>[];
+      log.insert(0,
+          '[WO78] 拉取(触发=$trigger) ${DateTime.now().toIso8601String().substring(11, 19)} 新件=${mails.length}');
+      st['imapLog'] = log.take(6).toList();
+    } catch (_) {}
 
     if (mails.isEmpty) {
       // 空扫也推进（防重复扫），与 NAS 同口径
@@ -474,6 +489,12 @@ class CalendarSyncService {
     final errors = <String>[];
 
     for (final mail in mails) {
+      // WO-78：端到端推送延迟（邮件 Date 头 → 入库），验收口径「推送 X 秒到达」
+      final mailDate = parseRfc5322Date(mail.raw);
+      if (mailDate != null) {
+        final sec = DateTime.now().difference(mailDate).inSeconds;
+        debugPrint('[WO78] 推送 $sec 秒到达（触发=$trigger，UID=${mail.uid}）');
+      }
       final icsText = extractIcsFromMail(mail.raw);
       if (icsText == null) {
         badCount++;
@@ -558,6 +579,35 @@ class CalendarSyncService {
   // ------------------------------------------------------------------
   // 工具
   // ------------------------------------------------------------------
+
+  /// WO-78：从邮件原文解析 RFC 5322 Date 头（QQ 形如
+  /// `Date: Thu, 01 Oct 2026 08:00:12 +0800`）；解析失败返回 null（不猜）。
+  @visibleForTesting
+  static DateTime? parseRfc5322Date(String raw) {
+    final m = RegExp(
+            r'Date:\s*(?:\w{3},?\s+)?(\d{1,2})\s+(\w{3})\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\s+([+-]\d{4})',
+            caseSensitive: false)
+        .firstMatch(raw);
+    if (m == null) return null;
+    const months = {
+      'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+      'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    };
+    final month = months[m.group(2)!.toLowerCase()];
+    if (month == null) return null;
+    final offset = m.group(7)!;
+    final sign = offset[0] == '-' ? -1 : 1;
+    final oh = int.parse(offset.substring(1, 3));
+    final om = int.parse(offset.substring(3, 5));
+    final utc = DateTime.utc(
+        int.parse(m.group(3)!),
+        month,
+        int.parse(m.group(1)!),
+        int.parse(m.group(4)!) - sign * oh,
+        int.parse(m.group(5)!) - sign * om,
+        int.parse(m.group(6)!));
+    return utc; // UTC 时刻（本地差值用 DateTime.now() 差分，天然无歧义）
+  }
 
   Map<String, dynamic> _eventToNativeMap(IcsEvent e) {
     // 结束时间：DTEND 优先，其次 DURATION；全天缺省 1 天、定时缺省 1 小时（防御性）

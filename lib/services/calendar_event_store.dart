@@ -90,11 +90,16 @@ class StoredEvent {
           DateTime.fromMillisecondsSinceEpoch(lastModifiedMs!, isUtc: true))}');
     }
     if (allDay) {
-      final d = DateTime.fromMillisecondsSinceEpoch(dtstartMs).toUtc();
+      // WO-78 缺陷①修复（时区对称硬不变式）：全天 DATE 的毫秒来自
+      // ics_min_parser 的【本地零点】解析（VALUE=DATE → DateTime(y,mo,d) 本地），
+      // 导出必须取【同一时区】的墙钟日期。原 `.toUtc()` 在 UTC+8 上把
+      // 本地零点折成前一日 16:00Z → 全部全天事件错位一天（节假日首当其冲）。
+      // 对称后与 NAS 输入 DATE 行逐字节相等（wo78_all_day_roundtrip_test 钉死）。
+      final d = DateTime.fromMillisecondsSinceEpoch(dtstartMs);
       buf.writeln('DTSTART;VALUE=DATE:'
           '${d.year.toString().padLeft(4, '0')}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}');
       if (endMs != null) {
-        final e = DateTime.fromMillisecondsSinceEpoch(endMs!).toUtc();
+        final e = DateTime.fromMillisecondsSinceEpoch(endMs!);
         buf.writeln('DTEND;VALUE=DATE:'
             '${e.year.toString().padLeft(4, '0')}${e.month.toString().padLeft(2, '0')}${e.day.toString().padLeft(2, '0')}');
       } else {

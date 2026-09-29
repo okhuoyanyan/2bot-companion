@@ -428,7 +428,8 @@ class FakeSource implements CalendarMailSource {
   }
 
   @override
-  Future<int?> waitForEvent({required Duration beat}) async {
+  @override
+  Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)}) async {
     // 真实 IDLE 语义：长阻塞至 close() 唤醒（否则立即 null 会让会话循环
     // 微任务级紧密空转、饿死测试 Timer——此前用例挂死的根因）
     await _idleWake.future;

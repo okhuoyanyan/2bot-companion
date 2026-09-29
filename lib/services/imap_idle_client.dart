@@ -496,10 +496,31 @@ class ImapIdleClient {
 
   /// IDLE 等待。返回 EXISTS 通知里的消息数；节拍到点（应 DONE+重发）返回 null；
   /// 服务端断开/BYE 抛 [ImapClosedException]。
-  Future<int?> waitForEvent({required Duration beat}) async {
-    final deadline = DateTime.now().add(beat);
+  /// WO-78 缺陷②：[noopBeat]（默认 60s）到点即 DONE→NOOP→重发 IDLE——
+  /// ①静默死连（NAT 掉线/无线休眠，无 FIN）最坏聋到 25 分钟节拍，现在
+  ///   ≤ noopBeat+10s 即被 NOOP 超时暴露；②NOOP 响应夹带积压 EXISTS 顺路带回。
+  /// 零生命周期语义变化：上层循环不变。
+  Future<int?> waitForEvent(
+      {required Duration beat,
+      Duration noopBeat = const Duration(seconds: 60)}) async {
+    var deadline = DateTime.now().add(beat);
+    var nextNoopAt = DateTime.now().add(noopBeat);
     while (true) {
-      final remain = deadline.difference(DateTime.now());
+      final now = DateTime.now();
+      if (now.isAfter(nextNoopAt)) {
+        // —— NOOP 保活节拍 ——
+        await stopIdle();
+        final pending = await noop();
+        if (pending != null) return pending;
+        final accepted = await startIdle();
+        if (!accepted) {
+          throw ImapCommandException('IDLE', 'NO（NOOP 节拍后重发被拒）');
+        }
+        nextNoopAt = DateTime.now().add(noopBeat);
+        deadline = DateTime.now().add(beat); // 重发即重置 25 分钟纪律窗口
+        continue;
+      }
+      final remain = deadline.difference(now);
       if (remain <= Duration.zero) return null;
       try {
         if (_assembler.hasUnits) {
@@ -514,8 +535,11 @@ class ImapIdleClient {
           }
           continue;
         }
-        await _waitForData(
-            remain < const Duration(seconds: 1) ? remain : const Duration(seconds: 1));
+        final untilNoop = nextNoopAt.difference(DateTime.now());
+        final wait = untilNoop < remain ? untilNoop : remain;
+        await _waitForData(wait < const Duration(seconds: 1)
+            ? wait
+            : const Duration(seconds: 1));
       } on TimeoutException {
         continue; // 1 秒轮询超时不是节拍超时
       }
@@ -535,6 +559,30 @@ class ImapIdleClient {
     if (resp.status != 'OK') {
       throw ImapCommandException('IDLE-DONE', resp.status ?? 'NO');
     }
+  }
+
+  /// WO-78 缺陷②：NOOP 保活探针（必须在 IDLE 之外发送——RFC 2177 期间只许 DONE）。
+  /// 返回 NOOP 响应里夹带的 EXISTS 数（有→调用方立即增量）；死连接（写缓冲成功
+  /// 而响应不到）→ 10s 超时抛出 → 上层重建会话。聋态窗口从最坏 25 分钟压到
+  /// ≤ noopBeat+10s。
+  Future<int?> noop({Duration timeout = const Duration(seconds: 10)}) async {
+    final tag = _nextTag();
+    _cmdStart ??= DateTime.now();
+    _cmdName = 'NOOP';
+    _send('$tag NOOP');
+    int? exists;
+    final resp = await _readUnit(
+      timeout: timeout,
+      test: (u) => u.tag == tag,
+      collect: (u) {
+        final n = parseExistsCount(u.head);
+        if (n != null) exists = n;
+      },
+    );
+    if (resp.status != 'OK') {
+      throw ImapCommandException('NOOP', resp.status ?? 'NO');
+    }
+    return exists;
   }
 
   /// 增量拉取水位线之后的日历邮件。
