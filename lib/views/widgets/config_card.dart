@@ -11,6 +11,7 @@ import '../../services/storage_service.dart';
 import '../../utils/constants.dart';
 import '../../utils/theme.dart';
 import 'calendar_sync_status_panel.dart';
+import 'keepalive_check_card.dart';
 
 /// 配置表单提交值（WO-36：扩展传输模式与邮箱参数；WO-37：扩展节流档位、静默保活与事件开关）
 class ConfigFormValues {
@@ -723,6 +724,9 @@ class _ConfigCardState extends State<ConfigCard> {
                 label: Text(_isMailMode ? '保存邮箱配置' : '保存中继配置'),
               ),
             ),
+
+            // WO-75 Phase B：保活自检（电池真实状态 + MIUI 指引；零生命周期改动）
+            const KeepaliveCheckCard(),
           ],
         ),
       ),

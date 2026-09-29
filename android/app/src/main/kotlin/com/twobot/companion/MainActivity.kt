@@ -127,6 +127,27 @@ class MainActivity : FlutterActivity(), SensorEventListener {
                         result.error("BATTERY_OPT_ERROR", e.localizedMessage, null)
                     }
                 }
+                // WO-75 Phase B：电池优化忽略状态【真实读取】（不做任何缓存/伪造）
+                "isIgnoringBatteryOptimizations" -> {
+                    try {
+                        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                        val ignoring = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                            pm?.isIgnoringBatteryOptimizations(packageName) == true
+                        result.success(ignoring)
+                    } catch (e: Exception) {
+                        result.error("BATTERY_STATE_ERROR", e.localizedMessage, null)
+                    }
+                }
+                // WO-75 Phase B：MIUI 自启动页「可跳则跳」——跳失败一律返回 false，
+                // 由 Dart 侧回退为纯文字指引（MIUI 无公开检测 API，严禁伪造状态）
+                "openAutostartSettings" -> {
+                    try {
+                        val opened = openAutostartSettings()
+                        result.success(opened)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
                 "openUsageSettings" -> {
                     try {
                         openUsageSettings()
@@ -756,6 +777,37 @@ class MainActivity : FlutterActivity(), SensorEventListener {
             )
         }
         return mode == AppOpsManager.MODE_ALLOWED
+    }
+
+    // WO-75 Phase B：MIUI 自启动管理页跳转（组件不存在/ROM 变更 → false，UI 走文字指引）
+    private fun openAutostartSettings(): Boolean {
+        val miuiIntents = listOf(
+            Intent().apply {
+                component = android.content.ComponentName(
+                    "com.miui.securitycenter",
+                    "com.miui.permcenter.autostart.AutoStartManagementActivity"
+                )
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            },
+            Intent("com.miui.securitycenter.ACTION_AUTO_START").apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+        )
+        for (intent in miuiIntents) {
+            try {
+                startActivity(intent)
+                return true
+            } catch (_: Exception) {
+            }
+        }
+        return try {
+            startActivity(Intent(Settings.ACTION_APPLICATION_SETTINGS).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            })
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun requestIgnoreBatteryOptimizations() {

@@ -10,7 +10,7 @@ import 'package:bot_companion/services/calendar_event_store.dart';
 import 'package:bot_companion/services/cross_isolate_lock.dart';
 import 'package:bot_companion/services/local_caldav_server.dart';
 
-import 'wo74r2_baseline.dart';
+import 'w78_baseline.dart';
 
 /// ============================================================================
 /// WO-70 · 本机只读服务单测（事件模型 + HTTP 路由矩阵 + 只读契约）
