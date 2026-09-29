@@ -182,10 +182,35 @@ class CalendarEventStore {
       };
 
   /// ctag：内容指纹（事件表 + 墓碑表 + 渲染版本）——内容一变必跃迁（#54 教训）
-  String get ctag => wo70HashHex(json.encode(toJson()) + '|rv1');
+  /// WO-78-R2：ctag = 库数据指纹（事件表+墓碑表）+【全部 per-event 服务端 etag】
+  /// （etag 即实际发送 ICS 字节的哈希——渲染任何变化自动传导，根治「忘了 bump
+  /// 渲染版本」失败模式；NAS #54 手机版终修。WO-78 全天 DATE 对称化即首例：
+  /// 渲染变 → 本指纹必变 → 客户端全量重拉自愈）。
+  /// etags 排序后拼接：同数据同渲染 → 指纹稳定（幂等，防每周期全量重拉风暴），
+  /// 与事件插入序无关。
+  String get ctag {
+    // 规范化组合：事件/墓碑按 uid 排序、etags 排序——插入序不进指纹
+    final uids = events.keys.toList()..sort();
+    final dataParts = <String>[];
+    for (final uid in uids) {
+      dataParts.add('$uid:${json.encode(events[uid]!.toJson())}');
+    }
+    final tombUids = tombstones.keys.toList()..sort();
+    final tombParts = <String>[];
+    for (final k in tombUids) {
+      tombParts.add('$k:${tombstones[k]}');
+    }
+    final etags = events.values
+        .map((e) => etagOf(e.toIcsWithEnvelope()))
+        .toList()
+      ..sort();
+    return wo70HashHex('events=[${dataParts.join(',')}]'
+        '|tombs=[${tombParts.join(',')}]'
+        '|ics:${etags.join(',')}');
+  }
 
-  /// sync-token：对齐 NAS 形态 `data:,<version>`
-  String get syncToken => 'data:,${wo70HashHex(json.encode(toJson()) + '|rv1')}';
+  /// sync-token：对齐 NAS 形态 `data:,<version>`（version=同上聚合指纹）
+  String get syncToken => 'data:,$ctag';
 
   /// 应用同步管线下发的一批事件（CANCELLED → 物理移除 + 墓碑）。
   /// 返回 (applied, removed)。幂等：同版本事件重复应用无害。
