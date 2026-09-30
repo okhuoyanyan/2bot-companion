@@ -552,6 +552,67 @@ void main() {
       expect(source.scanCalls, 1, reason: 'RFC n:* 回显形态 ≠ 缺口，兜底常态不重扫');
       expect(next, 1262);
     });
+
+    test('v2-a 真重置：回退重扫低位非空 → 采纳低位基线（序列重置防御保留）', () async {
+      final mail6 = _mail(6, _ics('cal_reset_a', sequence: 0));
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan([], 0),
+        scanScript: [
+          // 初始扫（水位线 1290）：SEARCH 空返回 → boxExists=5 < 1290 触发回退验证
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          // 回退重扫（从 5 起）：新序列低位且活着
+          scan([mail6], 6, candidates: [6]),
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1290, boxExists: 5);
+
+      expect(source.scanCalls, 2);
+      expect(next, 6, reason: '真重置 → 低位基线照常推进');
+      expect(gatewayBatches.single.single['uid'], 'cal_reset_a');
+    });
+
+    test('v2-c 回退重扫空返回 → 判 SEARCH 瞬断，恢复原水位线（带删信箱误鸣修正）',
+        () async {
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1290, boxExists: 1018);
+
+      expect(next, 1290,
+          reason: 'EXISTS=1018 明言有信而扫描空返回 = SEARCH 瞬断，不得把水位线拖到 1018');
+      expect(source.scanCalls, 4,
+          reason: '初始 1 + 回退验证 1 + 空返回重扫 2（有界自愈）');
+      final state = await StorageService.loadCalendarSyncStateAsync();
+      expect(state['lastSuspectedSkip'], isNull,
+          reason: '空返回非缺口，不落跳信标记');
+    });
+
+    test('空返回连击守卫：连续 3 次扫描空返回且 EXISTS 明言有信 → 强制重建（断连语义）',
+        () async {
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      // 第 1、2 次调用：连击累积（长持连接不重建则聋化）
+      await svc.debugSyncIncrement(source, 1290, boxExists: 1018);
+      await svc.debugSyncIncrement(source, 1290, boxExists: 1018);
+      await expectLater(
+        svc.debugSyncIncrement(source, 1290, boxExists: 1018),
+        throwsA(isA<ImapClosedException>()),
+        reason: '连续 3 次空返回 + EXISTS 明言有信 = 连接失智 → 重建',
+      );
+    });
   });
 }
 
@@ -615,15 +676,20 @@ class FakeGateway implements CalendarGateway {
   Future<void> ping() async {}
 }
 
-/// WO-82-R3 追加：三字段扫描结果构造助手（candidates 缺省空 = 无缺口 =
-/// 不触发缺口重扫，既有用例语义零漂移）
+/// WO-82-R3 追加：三字段扫描结果构造助手。candidates 缺省 = 连续候选
+/// 1..maxSeenUid（QQ 星搜索常态回显形态：无缺口、非空返回 → 不触发缺口
+/// 重扫与空返回守卫，既有用例语义零漂移）。显式传 candidates 以模拟
+/// 漏件/空返回剧本。
 ({List<CalendarMail> mails, int maxSeenUid, List<int> candidates}) scan(
         List<CalendarMail> mails, int maxSeenUid,
         {List<int>? candidates}) =>
     (
       mails: mails,
       maxSeenUid: maxSeenUid,
-      candidates: candidates ?? const <int>[]
+      candidates: candidates ??
+          (maxSeenUid > 0
+              ? List<int>.generate(maxSeenUid, (i) => i + 1)
+              : const <int>[]),
     );
 
 class FakeSource implements CalendarMailSource {

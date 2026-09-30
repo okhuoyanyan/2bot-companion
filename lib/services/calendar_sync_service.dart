@@ -322,6 +322,7 @@ class CalendarSyncService {
   CalendarMailSource? _currentSource;
   int _consecutiveFailures = 0;
   int _rebuildCount = 0; // WO-78-R3：连续会话重建计数（防打爆护栏）
+  int _emptySearchStreak = 0; // WO-82-R3：连续 SEARCH 空返回计数（连接失智守卫）
   String _mode = 'off';
 
   /// 主 isolate / 测试用默认构造
@@ -518,6 +519,7 @@ class CalendarSyncService {
       };
     }
     _currentSource = source;
+    _emptySearchStreak = 0; // 失智计数随新会话清零
     // 通道健康探测：未激活（如开机自启、App 尚未打开过）只记录不自断——
     // 打开 App 一次保存设置后服务热重启即挂载通道（自愈路径）
     try {
@@ -598,8 +600,9 @@ class CalendarSyncService {
   /// 测试桥：单测直接驱动增量同步路径（生产零调用）
   @visibleForTesting
   Future<int> debugSyncIncrement(CalendarMailSource source, int lastUid,
-          {int? uidValidity, String trigger = '启动'}) =>
-      _syncIncrement(source, lastUid, uidValidity: uidValidity, trigger: trigger);
+          {int? uidValidity, String trigger = '启动', int? boxExists}) =>
+      _syncIncrement(source, lastUid,
+          uidValidity: uidValidity, trigger: trigger, boxExists: boxExists);
 
   /// WO-82-R3 追加：缺口重扫间隔（测试可缩至毫秒级；生产 5s——QQ 索引滞后
   /// 为秒级瞬态，两轮重扫覆盖 ~10s 窗口）
@@ -621,36 +624,83 @@ class CalendarSyncService {
     // SEARCH UID n:* 永远空返回 → 水位线机制对该账号失效。防御：粗筛空返回
     // 且 boxExists < 水位线 → 判定序列重置 → 水位线回退到 boxExists 全量重扫
     //（幂等 upsert + 台账判重保证无害；新序列 minUID=1/maxUID=EXISTS 实测一致）。
+    // WO-78-R3 返工③ + WO-82-R3 v2（真机实证修正 19:46）：QQ UID 序列重置防御。
+    // 🔴 v2 修正：信箱带历史删除/移出（真机实证 EXISTS=1018 << 最大UID≈1290），
+    // 旧判据「boxExists < 水位线 ⇒ 序列重置」在带删信箱【恒真】→ 每拍误鸣且回退
+    // 重扫遇 SEARCH 瞬断（同刻 NAS 侧同命令返回正常——连接级瞬断）时把会话打进
+    // 降级循环。改为【验证后采纳】三态：
+    //  a) 回退重扫非空且 maxSeen < 回退前水位线 → 真重置（新序列低位且活着）→ 采纳；
+    //  b) 回退重扫非空且 maxSeen ≥ 回退前 → 序列健在 → 恢复原水位线（重扫件台账幂等）；
+    //  c) 回退重扫空返回（EXISTS 明言有信）→ SEARCH 瞬断（非重置）→ 恢复原水位线，
+    //     交下方缺口/空返回重扫自愈。
     if (mails.isEmpty && maxSeen == 0 && boxExists != null && boxExists < lastUid) {
+      final preRollback = lastUid;
       // ignore: avoid_print
-      print('[WO78-R3] 检测到 UID 序列重置（水位线=$lastUid > boxExists=$boxExists）'
-          '→ 水位线回退至 $boxExists 全量重扫（幂等）');
+      print('[WO78-R3] boxExists($boxExists) < 水位线($lastUid) → 回退验证重扫'
+          '（v2 三态：真重置/序列健在/SEARCH 瞬断）');
       final retry = await source.fetchNewSince(boxExists);
-      mails = retry.mails;
-      maxSeen = retry.maxSeenUid;
-      candidates = retry.candidates;
-      lastUid = boxExists;
+      if (retry.mails.isNotEmpty || retry.maxSeenUid > 0) {
+        if (retry.maxSeenUid < preRollback) {
+          // a) 真重置
+          // ignore: avoid_print
+          print('[WO78-R3] 重置验证成立（新基线 max=${retry.maxSeenUid} < '
+              '$preRollback）→ 水位线回退至 $boxExists 全量重扫（幂等）');
+          mails = retry.mails;
+          maxSeen = retry.maxSeenUid;
+          candidates = retry.candidates;
+          lastUid = boxExists;
+        } else {
+          // b) 序列健在
+          // ignore: avoid_print
+          print('[WO78-R3] 序列健在（重扫 max=${retry.maxSeenUid} ≥ $preRollback）'
+              '→ 恢复水位线 $preRollback（重扫件台账幂等去重）');
+          mails = retry.mails;
+          maxSeen = retry.maxSeenUid;
+          candidates = retry.candidates;
+        }
+      } else {
+        // c) SEARCH 瞬断
+        // ignore: avoid_print
+        print('[WO82] 回退重扫空返回（EXISTS=$boxExists 明言有信）→ 判 SEARCH '
+            '瞬断，恢复水位线 $preRollback（交缺口重扫自愈）');
+      }
     }
 
-    // WO-82-R3 追加（12:12 跳信定案）：缺口检测 + 有界重扫。
+    // WO-82-R3 追加（12:12 跳信定案）：缺口/空返回检测 + 有界重扫。
     // 机理实证：QQ UID SEARCH 静默漏件（1263 被漏，34s 后入箱的 1264 反而在列）
-    // + 「空扫推进 maxSeen」语义 = 漏件被永久焊死（幽灵事件 5 天）。防御：
-    // ①候选集相对 (水位线, 最大候选] 存在缺口（SEARCH 漏件指纹）；
-    // ②推送触发却「零新件」（服务端刚说有新件而扫描一无所见——同族漏件形态）。
+    // + 「空扫推进 maxSeen」语义 = 漏件被永久焊死（幽灵事件 5 天）。防御指纹：
+    // ①候选集相对 (水位线, 最大候选] 存在缺口（SEARCH 漏件）；
+    // ②候选集空返回（QQ 星搜索对存在邮件回空——瞬断/失智指纹）；
+    // ③推送触发却「零新件」（服务端刚说有新件而扫描一无所见）。
     // 命中 → 5s×2 重扫（QQ 索引滞后为秒级瞬态）；仍缺口 → 水位线照常推进
     // （防卡死、防重扫风暴）+ [WO82] 疑似跳信行 + 状态标记（即刻可见）。
     var holes = uidHoles(lastUid, candidates);
-    var suspicious = holes.isNotEmpty ||
+    bool suspicious() =>
+        holes.isNotEmpty ||
+        candidates.isEmpty ||
         (trigger == 'IDLE推送' && mails.isEmpty && maxSeen <= lastUid);
-    for (var attempt = 0; suspicious && attempt < 2; attempt++) {
+    for (var attempt = 0; suspicious() && attempt < 2; attempt++) {
       await Future<void>.delayed(skipRetryDelay);
       scan = await source.fetchNewSince(lastUid);
       mails = scan.mails;
       maxSeen = scan.maxSeenUid;
       candidates = scan.candidates;
       holes = uidHoles(lastUid, candidates);
-      suspicious = holes.isNotEmpty ||
-          (trigger == 'IDLE推送' && mails.isEmpty && maxSeen <= lastUid);
+    }
+
+    // WO-82-R3：空返回连击守卫（纯长持配套）。长持下连接不再周期重建——若某
+    // 连接的 SEARCH 持续空返回将永久聋化。连续 3 次空返回且 EXISTS 明言有信
+    // → 判连接失智，转断连语义强制重建会话。
+    if (candidates.isEmpty) {
+      _emptySearchStreak++;
+      if (boxExists != null && boxExists > 0 && _emptySearchStreak >= 3) {
+        final streak = _emptySearchStreak;
+        _emptySearchStreak = 0;
+        throw ImapClosedException('连续 $streak 次 SEARCH 空返回且 '
+            'EXISTS=$boxExists 明言有信（连接失智）→ 重建会话');
+      }
+    } else {
+      _emptySearchStreak = 0;
     }
     if (holes.isNotEmpty) {
       // ignore: avoid_print
