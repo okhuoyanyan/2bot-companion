@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.2+28  # WO-82-R3: 纯长持 IDLE（G3 时序铁律：EXISTS→DONE→tag OK→拉取→重IDLE）+ 90s 兜底节拍（10s 高频拍退役）
+version: 1.6.2+29  # WO-82 终裁: 兜底拍 90s→8s(QQ推送死亡实证,8s拍即感知节拍;架构定稿,仅改常量)
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

@@ -355,10 +355,12 @@ class CalendarSyncService {
   /// WO-82-R3（管理员裁决 2026-09-30）：10s 高频拍退役。历史「QQ 对 IDLE 不推
   /// EXISTS」的真因已改判——旧循环在 IDLE 挂载态发 SELECT/SEARCH（协议违规 →
   /// BAD 断连），连接每拍被杀，推送从未有过存活窗口；非 DONE 本身。纯长持下
-  /// 推送秒级直达（WO-69 首验 1.2s 先例）。90s 兜底查件节拍（对齐遥测通道多日
-  /// 已证节奏）：推送失效的最坏感知窗 ≤90s+查件时长，且重建/LOGIN 频率压到
-  /// 旧版 1/9（降低认证风控风险）。
-  static const Duration idleWatchdogBeat = Duration(seconds: 90);
+  /// 推送秒级直达（WO-69 首验 1.2s 先例）。
+  /// 🔴 管理员终裁（同日收尾令）：QQ 推送实测死亡（C 端真机 5 轮零 EXISTS
+  /// 实证）→ 兜底拍 90s → **8s**，收紧为实际感知节拍（仅改常量，架构定稿）；
+  /// 8s 拍 + NAS 去抖 5s 支撑「QQ 经 BOT 建日程 → KashCal 可见 ≤20s（典型
+  /// ~12s）」终验线。
+  static const Duration idleWatchdogBeat = Duration(seconds: 8);
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。

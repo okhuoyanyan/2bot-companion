@@ -313,14 +313,12 @@ void main() {
   });
 
   group('时效契约常量（工单 ④ 硬指标的守门断言）', () {
-    test('WO-82-R3：兜底看门狗节拍=90s（管理员裁决：替代 10s 高频拍，'
-        '远低于 30min 服务端强断）', () {
+    test('WO-82 终裁：兜底看门狗节拍=8s（QQ 推送实测死亡，8s 拍即感知节拍；'
+        '配 NAS 去抖 5s 支撑 ≤20s 终验线）', () {
       expect(
         CalendarSyncService.idleWatchdogBeat,
-        const Duration(seconds: 90),
+        const Duration(seconds: 8),
       );
-      expect(CalendarSyncService.idleWatchdogBeat,
-          lessThan(const Duration(minutes: 30)));
     });
 
     test('兜底轮询必须是 15 分钟——严禁退化到 1 分钟轮询（QQ 风控 + 耗电）', () {
