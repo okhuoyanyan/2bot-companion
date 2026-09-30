@@ -425,6 +425,12 @@ class FakeSource implements CalendarMailSource {
   void Function(String line)? onLifecycleLog;
 
   @override
+  String? lastWakeReason;
+
+  @override
+  Future<int?> inboxExists() async => null;
+
+  @override
   Future<bool> startIdle() async {
     calls.add('idle');
     return true;
