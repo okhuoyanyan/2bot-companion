@@ -220,23 +220,27 @@ int? parseExistsCount(String head) {
   return int.tryParse(m.group(1)!);
 }
 
-/// SEARCH 响应解析 → UID 列表
+/// SEARCH 响应解析 → UID 列表。
+/// WO-82-R3 取证修正：取【最后一条】`* SEARCH` 行（最新响应优先）——共享
+/// `_scratch` 会残留上一轮的裸 `* SEARCH`（QQ 空结果集的标准形态），先到先得
+/// 会让下一轮的真实结果被陈旧空行遮蔽（20:18/20:26 两度真机实证）。
 List<int> parseSearchUids(List<ImapUnit> units) {
+  final pattern = RegExp(r'^\*\s+SEARCH\b(.*)$', caseSensitive: false);
+  String? best;
   for (final u in units) {
-    final m = RegExp(r'^\*\s+SEARCH\b(.*)$', caseSensitive: false)
-        .firstMatch(u.head);
+    final m = pattern.firstMatch(u.head);
     if (m != null) {
-      return m
-          .group(1)!
-          .trim()
-          .split(RegExp(r'\s+'))
-          .where((s) => s.isNotEmpty)
-          .map((s) => int.tryParse(s) ?? 0)
-          .where((n) => n > 0)
-          .toList();
+      best = m.group(1); // 后者覆盖前者 = 最新响应优先
     }
   }
-  return [];
+  if (best == null) return [];
+  return best
+      .trim()
+      .split(RegExp(r'\s+'))
+      .where((s) => s.isNotEmpty)
+      .map((s) => int.tryParse(s) ?? 0)
+      .where((n) => n > 0)
+      .toList();
 }
 
 /// IMAP 字符串转义（LOGIN 参数用；与 NAS 侧 escapeImapString 同语义）
@@ -299,8 +303,12 @@ class ImapIdleClient {
   String _cmdName = '';
   bool _firstResponseLogged = false;
 
+  /// WO-82-R3：命令级日志同步路由 logcat（[WO78-IMAP] 前缀）——90s 长持节拍下
+  /// 量能可控（12×低于 10s 拍时代），SEARCH 空返回取证需要线上报文级真相。
   void _log(String s) {
     onCommandLog?.call(s);
+    // ignore: avoid_print
+    print('[WO78-IMAP] $s');
   }
 
   /// WO-71 ④：socket 工厂注入（录制回放测试用；生产 = SecureSocket 直连）
@@ -642,6 +650,9 @@ class ImapIdleClient {
   }) async {
     // RFC 3501 怪癖：UID n:* 在 n 大于最大 UID 时返回最大 UID 那封——
     // 结果必须再按 `uid > lastProcessedUid` 过滤（NAS 侧同款处理）。
+    // WO-82-R3：SEARCH 前清空共享 _scratch——上一轮残留的裸 `* SEARCH`（QQ
+    // 空结果集形态）/SELECT 杂项会遮蔽本轮解析（20:18/20:26 真机实证）。
+    _scratch.clear();
     final searchTag = _nextTag();
     _send('$searchTag UID SEARCH UID ${lastProcessedUid + 1}:*');
     final searchResp = await _readUnit(
@@ -653,6 +664,9 @@ class ImapIdleClient {
       throw ImapCommandException('UID SEARCH', searchResp.status ?? 'NO');
     }
     final candidates = parseSearchUids(_scratch);
+    // WO-82-R3：SEARCH 响应观测（候选数 + scratch 单元面——空返回/漏件取证锚点）
+    _log('IMAP .. SEARCH 解析：候选=${candidates.length}，'
+        'scratch=${_scratch.length}单元，scratch尾=${_scratch.isEmpty ? '-' : _scratch.last.head.length > 50 ? _scratch.last.head.substring(0, 50) : _scratch.last.head}');
     final fresh = candidates.where((u) => u > lastProcessedUid).toList()..sort();
     final maxSeenUid =
         candidates.isEmpty ? 0 : candidates.reduce((a, b) => a > b ? a : b);

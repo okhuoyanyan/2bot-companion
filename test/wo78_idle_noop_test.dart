@@ -105,6 +105,17 @@ class _ScriptedImapServer {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('WO-82-R3 取证修正：parseSearchUids 取最后一条 SEARCH 行（最新响应优先）', () {
+    final units = [
+      ImapUnit('* SEARCH', const []), // QQ 空结果集裸形态（上轮残留）
+      ImapUnit('* SEARCH 1028 1029 1299', const []), // 本轮真实结果
+    ];
+    expect(parseSearchUids(units), [1028, 1029, 1299],
+        reason: '先到先得会让裸 SEARCH 永久遮蔽后续真实结果（20:18/20:26 真机实证）');
+    // 单一裸行 = 空结果
+    expect(parseSearchUids([ImapUnit('* SEARCH', const [])]), isEmpty);
+  });
+
   group('WO-82-R3 · 纯长持 IDLE（G3 时序铁律）', () {
     test('推送主路径：挂载期收到 EXISTS → 返回 n>0，挂载期零命令写出', () async {
       final server = await _ScriptedImapServer.bind();
@@ -299,6 +310,39 @@ void main() {
         expect(server.received.toString(), isNot(contains('HEADER.FIELDS')),
             reason: '≤10 封必须一次全文判定（12:12 同族遗漏向量防御）');
         expect(server.received.toString(), contains('BODY.PEEK[]'));
+        await client.close();
+      } finally {
+        ImapIdleClient.socketFactory = null;
+        await server.close();
+      }
+    });
+
+    test('WO-82-R3 取证修正：裸 `* SEARCH` 残留不遮蔽下一轮真实结果（scratch 清扫）',
+        () async {
+      final server = await _ScriptedImapServer.bind();
+      ImapIdleClient.socketFactory =
+          (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
+      try {
+        final client = ImapIdleClient(
+          config: ImapConfig(
+              account: 'acct',
+              authCode: 'code',
+              host: '127.0.0.1',
+              port: server.socket.port),
+        );
+        await client.connect();
+
+        // 第一轮：QQ 空结果集 → 裸 `* SEARCH` 行进共享 scratch
+        server.searchResult = const <int>[];
+        final r1 = await client.fetchNewSince(1297);
+        expect(r1.candidates, isEmpty);
+
+        // 第二轮：真实结果（272 UID 大行）——不得被上轮裸行遮蔽
+        server.searchResult = List<int>.generate(272, (i) => 1028 + i);
+        final r2 = await client.fetchNewSince(1297);
+        expect(r2.candidates.length, 272,
+            reason: '20:18/20:26 真机实证：先到先得解析让重扫结果永久不可见');
+        expect(r2.maxSeenUid, 1299);
         await client.close();
       } finally {
         ImapIdleClient.socketFactory = null;
