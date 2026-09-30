@@ -126,6 +126,26 @@ class CalendarEventLedger {
   }
 }
 
+/// WO-82-R3 追加（12:12 跳信定案）：候选集相对 (lastUid, maxCandidate] 的缺口
+/// 检测——QQ UID SEARCH 会静默漏件（实证：UID 1263 被漏、34s 后入箱的 1264
+/// 反而在列），「空扫推进 maxSeen」语义会把漏件永久焊死。本函数给出缺口 UID
+/// 列表（升序）；候选为空或最大候选 ≤ 水位线时返回空（无更高件=无缺口）。
+@visibleForTesting
+List<int> uidHoles(int lastUid, List<int> candidates) {
+  if (candidates.isEmpty) return const <int>[];
+  var maxC = candidates.first;
+  for (final c in candidates) {
+    if (c > maxC) maxC = c;
+  }
+  if (maxC <= lastUid) return const <int>[];
+  final have = candidates.toSet();
+  final holes = <int>[];
+  for (var u = lastUid + 1; u <= maxC; u++) {
+    if (!have.contains(u)) holes.add(u);
+  }
+  return holes;
+}
+
 /// 原生日历写入通道抽象（生产 = 本机事件库；MethodChannel 为降级回滚面）
 abstract class CalendarGateway {
   /// 批量 upsert；CANCELLED 事件由原生侧按 UID 删除。失败抛异常。
@@ -198,8 +218,8 @@ abstract class CalendarMailSource {
   /// 连接并 SELECT INBOX；返回 UIDVALIDITY（拿不到为 null）
   Future<int?> connect();
 
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
-      int lastProcessedUid);
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(int lastProcessedUid);
 
   Future<bool> startIdle();
   Future<int?> waitForEvent({required Duration beat});
@@ -248,8 +268,8 @@ class QqImapSource implements CalendarMailSource {
   }
 
   @override
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
-      int lastProcessedUid) async {
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(int lastProcessedUid) async {
     return _client!.fetchNewSince(lastProcessedUid);
   }
 
@@ -578,8 +598,13 @@ class CalendarSyncService {
   /// 测试桥：单测直接驱动增量同步路径（生产零调用）
   @visibleForTesting
   Future<int> debugSyncIncrement(CalendarMailSource source, int lastUid,
-          {int? uidValidity}) =>
-      _syncIncrement(source, lastUid, uidValidity: uidValidity);
+          {int? uidValidity, String trigger = '启动'}) =>
+      _syncIncrement(source, lastUid, uidValidity: uidValidity, trigger: trigger);
+
+  /// WO-82-R3 追加：缺口重扫间隔（测试可缩至毫秒级；生产 5s——QQ 索引滞后
+  /// 为秒级瞬态，两轮重扫覆盖 ~10s 窗口）
+  @visibleForTesting
+  Duration skipRetryDelay = const Duration(seconds: 5);
 
   /// 增量同步：粗筛→精筛→拉全文→提取 ICS→解析→幂等 upsert→推进水位线。
   /// 返回推进后的水位线（调用方保存）。[trigger]=拉取原因（拉取日志可观测）。
@@ -587,7 +612,10 @@ class CalendarSyncService {
       {int? uidValidity, String trigger = '启动', bool lightIdle = false,
       int? boxExists}) async {
     final sw = Stopwatch()..start();
-    var (:mails, maxSeenUid: maxSeen) = await source.fetchNewSince(lastUid);
+    var scan = await source.fetchNewSince(lastUid);
+    var mails = scan.mails;
+    var maxSeen = scan.maxSeenUid;
+    var candidates = scan.candidates;
     // WO-78-R3 返工③：QQ UID 序列重置防御——实测 QQ 在某时刻【静默重置 UID 序列】
     //（UIDVALIDITY 不变：违反 RFC 3501）：旧水位线(1238) 高于新序列最大 UID，
     // SEARCH UID n:* 永远空返回 → 水位线机制对该账号失效。防御：粗筛空返回
@@ -600,7 +628,36 @@ class CalendarSyncService {
       final retry = await source.fetchNewSince(boxExists);
       mails = retry.mails;
       maxSeen = retry.maxSeenUid;
+      candidates = retry.candidates;
       lastUid = boxExists;
+    }
+
+    // WO-82-R3 追加（12:12 跳信定案）：缺口检测 + 有界重扫。
+    // 机理实证：QQ UID SEARCH 静默漏件（1263 被漏，34s 后入箱的 1264 反而在列）
+    // + 「空扫推进 maxSeen」语义 = 漏件被永久焊死（幽灵事件 5 天）。防御：
+    // ①候选集相对 (水位线, 最大候选] 存在缺口（SEARCH 漏件指纹）；
+    // ②推送触发却「零新件」（服务端刚说有新件而扫描一无所见——同族漏件形态）。
+    // 命中 → 5s×2 重扫（QQ 索引滞后为秒级瞬态）；仍缺口 → 水位线照常推进
+    // （防卡死、防重扫风暴）+ [WO82] 疑似跳信行 + 状态标记（即刻可见）。
+    var holes = uidHoles(lastUid, candidates);
+    var suspicious = holes.isNotEmpty ||
+        (trigger == 'IDLE推送' && mails.isEmpty && maxSeen <= lastUid);
+    for (var attempt = 0; suspicious && attempt < 2; attempt++) {
+      await Future<void>.delayed(skipRetryDelay);
+      scan = await source.fetchNewSince(lastUid);
+      mails = scan.mails;
+      maxSeen = scan.maxSeenUid;
+      candidates = scan.candidates;
+      holes = uidHoles(lastUid, candidates);
+      suspicious = holes.isNotEmpty ||
+          (trigger == 'IDLE推送' && mails.isEmpty && maxSeen <= lastUid);
+    }
+    if (holes.isNotEmpty) {
+      // ignore: avoid_print
+      print('[WO82] 疑似跳信（缺口 UID=${holes.take(5).join(',')}'
+          '${holes.length > 5 ? ' 等${holes.length}个' : ''}）→ 重扫后仍缺口，'
+          '水位线照常推进至 $maxSeen（已记观测标记，请 NAS 侧对账）');
+      await _recordSkipSuspect(holes, maxSeen);
     }
     // WO-78-R3：观测行必须进 logcat（debugPrint 有节流丢弃；print 为 WO-70 同款先例）
     // ignore: avoid_print
@@ -854,6 +911,21 @@ class CalendarSyncService {
       lastError: error,
       mode: _mode,
     ));
+  }
+
+  /// WO-82-R3 追加：疑似跳信观测标记（缺口 UID + 推进位置）——写入同步状态
+  /// 供设置页/对账即刻可见（12:12 事故的幽灵曾 5 天不可见）。失败静默（观测
+  /// 面不阻断主流程；logcat 行已另行打出）。
+  Future<void> _recordSkipSuspect(List<int> holes, int advancedTo) async {
+    try {
+      final st = _lastKnownState;
+      st['lastSuspectedSkip'] = {
+        'at': DateTime.now().toIso8601String(),
+        'uids': holes.take(20).toList(),
+        'advancedTo': advancedTo,
+      };
+      await StorageService.saveCalendarSyncState(st);
+    } catch (_) {}
   }
 
   /// 错误消息消毒：剥离可能内嵌凭据的异常形态（红线：凭据零外泄）

@@ -18,7 +18,7 @@ import 'package:bot_companion/services/telemetry_mail_transport.dart';
 import 'package:bot_companion/services/telemetry_throttle_scheduler.dart';
 import 'package:bot_companion/services/telemetry_uploader_service.dart';
 
-import 'calendar_sync_service_test.dart' show FakeGateway, FakeSource;
+import 'calendar_sync_service_test.dart' show FakeGateway, FakeSource, scan;
 
 /// ============================================================================
 /// WO-69 · 突发旁路防御单测（追补整改 + 驳回整改 + 第三轮整改 P1/P2）
@@ -301,9 +301,9 @@ void main() {
           '$encoded$crlf--B--$crlf';
       final source = FakeSource(
         uidValidity: 1,
-        result: (
-          mails: [CalendarMail(uid: 900, subject: 'cal', raw: raw)],
-          maxSeenUid: 900,
+        result: scan(
+          [CalendarMail(uid: 900, subject: 'cal', raw: raw)],
+          900,
         ),
       );
       final batches = <List<Map<String, dynamic>>>[];
@@ -447,9 +447,9 @@ void main() {
           '--B--$crlf';
       final source = FakeSource(
         uidValidity: 1,
-        result: (
-          mails: [CalendarMail(uid: 910, subject: 'cal', raw: p1MailRaw)],
-          maxSeenUid: 910,
+        result: scan(
+          [CalendarMail(uid: 910, subject: 'cal', raw: p1MailRaw)],
+          910,
         ),
       );
       final svc = CalendarSyncService.test(

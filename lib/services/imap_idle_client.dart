@@ -527,6 +527,11 @@ class ImapIdleClient {
   /// WO-71 整改 A：UID FETCH 分批上限（单行命令 ≤~2KB，远低于 QQ 丢弃阈值）
   static const int fetchBatchSize = 50;
 
+  /// WO-82-R3 追加：小批全文化上限——fresh 候选 ≤ 此数时跳过头粗筛、一次
+  /// 全文拉取按原文判定（12:12 跳信同族「HEADER FETCH 漏单封」向量防御）。
+  /// 超过则保留头粗筛刷屏护栏。日常节拍新件 1-2 封，恒走全文化。
+  static const int smallBatchFullFetchLimit = 10;
+
   /// WO-82-R3 纯长持 IDLE 等待（G3 时序铁律的客户端半场）。
   ///
   /// 【返回值语义——两种返回都保持 IDLE 挂载态，调用方在发任何命令前必须先
@@ -626,9 +631,12 @@ class ImapIdleClient {
   }
 
   /// 增量拉取水位线之后的日历邮件。
-  /// 返回：[mails]（UID 升序、仅前缀命中）与 [maxSeenUid]（本轮粗筛所见最大 UID——
-  /// **空扫也要返回**，上层据此推进水位线，与 NAS 同口径）。
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
+  /// 返回：[mails]（UID 升序、仅日历命中）、[maxSeenUid]（本轮所见最大 UID——
+  /// **空扫也要返回**，上层据此推进水位线，与 NAS 同口径）与 [candidates]
+  /// （SEARCH 原始候选全集——上层做缺口检测，防御 QQ SEARCH 静默漏件，
+  /// WO-82-R3 追加 12:12 跳信定案）。
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(
     int lastProcessedUid, {
     Duration timeout = const Duration(seconds: 15),
   }) async {
@@ -649,7 +657,55 @@ class ImapIdleClient {
     final maxSeenUid =
         candidates.isEmpty ? 0 : candidates.reduce((a, b) => a > b ? a : b);
     if (fresh.isEmpty) {
-      return (mails: const <CalendarMail>[], maxSeenUid: maxSeenUid);
+      return (
+        mails: const <CalendarMail>[],
+        maxSeenUid: maxSeenUid,
+        candidates: candidates
+      );
+    }
+
+    // WO-82-R3 追加（12:12 跳信定案）：小批全文化——≤[smallBatchFullFetchLimit]
+    // 封时【跳过 SUBJECT 头粗筛】，一次 UID FETCH 全文、主题判定与正文解析
+    // 用同一份字节（杀掉「SEARCH 返回了、HEADER FETCH 响应漏掉单封」的遗漏
+    // 向量——12:12 同族第二形态）。>上限保留头粗筛（刷屏护栏，WO-71 分批纪律）。
+    if (fresh.length <= smallBatchFullFetchLimit) {
+      final mails = <CalendarMail>[];
+      final fullBatches = (fresh.length / fetchBatchSize).ceil();
+      for (var b = 0; b < fullBatches; b++) {
+        final batch = fresh.sublist(b * fetchBatchSize,
+            (b + 1) * fetchBatchSize < fresh.length
+                ? (b + 1) * fetchBatchSize
+                : fresh.length);
+        final fullTag = _nextTag();
+        _send('$fullTag UID FETCH ${batch.join(',')} (UID BODY.PEEK[])');
+        _log('IMAP .. FETCH FULL [小批全文化 ${b + 1}/$fullBatches, '
+            '${batch.length}条] 等待响应…');
+        await _readUnit(
+          timeout: timeout,
+          test: (u) => u.tag == fullTag,
+          collect: _scratch.add,
+        );
+        for (final u in _scratch) {
+          final parsed = parseFullFetchUnit(u);
+          if (parsed == null) continue;
+          // 原文内含完整头部——主题判定与正文同源（QQ 文本搜索键不可用的
+          // 替代精筛继续成立，但判定材料从「头拉取回显」升级为「全文原文」）
+          if (!subjectMatchesPrefix(parsed.raw, AppConstants.calSubjectPrefix)) {
+            continue; // 非日历件（TEL 遥测/人件等）：静默不 surfaced
+          }
+          mails.add(CalendarMail(
+            uid: parsed.uid,
+            subject: '',
+            raw: parsed.raw,
+          ));
+        }
+        _scratch.clear();
+        await Future<void>.delayed(Duration.zero);
+      }
+      mails.sort((a, b) => a.uid.compareTo(b.uid));
+      _log('IMAP == FETCH FULL 小批全文化完成：${fresh.length} 条中'
+          '前缀命中 ${mails.length} 条');
+      return (mails: mails, maxSeenUid: maxSeenUid, candidates: candidates);
     }
 
     // 客户端精筛：拉 SUBJECT 头（QQ 文本搜索键不可用的替代）。
@@ -689,7 +745,11 @@ class ImapIdleClient {
     final matched = matchedHeader..sort();
     _log('IMAP == FETCH HDR 完成：${fresh.length} 条中前缀命中 ${matched.length} 条');
     if (matched.isEmpty) {
-      return (mails: const <CalendarMail>[], maxSeenUid: maxSeenUid);
+      return (
+        mails: const <CalendarMail>[],
+        maxSeenUid: maxSeenUid,
+        candidates: candidates
+      );
     }
 
     // 全文拉取（仅前缀命中集合）——同样分批
@@ -722,7 +782,7 @@ class ImapIdleClient {
       await Future<void>.delayed(Duration.zero);
     }
     mails.sort((a, b) => a.uid.compareTo(b.uid));
-    return (mails: mails, maxSeenUid: maxSeenUid);
+    return (mails: mails, maxSeenUid: maxSeenUid, candidates: candidates);
   }
 
   /// 登出并关闭（尽力而为，绝不抛出）

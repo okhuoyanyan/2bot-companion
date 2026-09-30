@@ -111,12 +111,9 @@ void main() {
     test('正常增量：新事件下发原生 + 水位线推进到 maxSeen', () async {
       final source = FakeSource(
         uidValidity: 1789989266,
-        result: (
-          mails: [
-            _mail(869, _ics('cal_1', sequence: 0)),
-          ],
-          maxSeenUid: 871, // 中间夹了非日历件 870/871
-        ),
+        result: scan([
+          _mail(869, _ics('cal_1', sequence: 0)),
+        ], 871), // 中间夹了非日历件 870/871
       );
       final svc = build(source);
       final next = await svc.debugSyncIncrement(source, 0);
@@ -130,7 +127,7 @@ void main() {
     });
 
     test('幂等重放：同一批邮件再来一次 → 台账判 skip，不再下发', () async {
-      final mails = (mails: [_mail(869, _ics('cal_1', sequence: 0))], maxSeenUid: 869);
+      final mails = scan([_mail(869, _ics('cal_1', sequence: 0))], 869);
       final source = FakeSource(uidValidity: 1, result: mails);
       final svc = build(source);
       await svc.debugSyncIncrement(source, 0);
@@ -144,7 +141,7 @@ void main() {
     test('变更重投：SEQUENCE/LAST-MODIFIED 更新 → 同 UID 更新不新增', () async {
       final source = FakeSource(
         uidValidity: 1,
-        result: (mails: [_mail(869, _ics('cal_1', sequence: 1, lm: '20260927T020000Z'))], maxSeenUid: 869),
+        result: scan([_mail(869, _ics('cal_1', sequence: 1, lm: '20260927T020000Z'))], 869),
       );
       final svc = build(source);
       final ledgerBefore = StorageService.loadCalendarEventLedger()
@@ -159,7 +156,7 @@ void main() {
     test('【契约补充】取消传播：墓碑 SEQUENCE=0 也必须下发删除', () async {
       final source = FakeSource(
         uidValidity: 1,
-        result: (mails: [_mail(869, _ics('cal_gone', sequence: 0, cancelled: true))], maxSeenUid: 869),
+        result: scan([_mail(869, _ics('cal_gone', sequence: 0, cancelled: true))], 869),
       );
       final svc = build(source);
       // 模拟此前已应用过更高版本：台账 sequence=3
@@ -177,13 +174,10 @@ void main() {
     test('坏件越过：附件提取失败不阻塞，水位线仍推进且计数落状态', () async {
       final source = FakeSource(
         uidValidity: 1,
-        result: (
-          mails: [
-            _badMail(869), // 无 ICS 附件（结构超契约 → 提取 null）
-            _mail(870, _ics('cal_2', sequence: 0)),
-          ],
-          maxSeenUid: 870,
-        ),
+        result: scan([
+          _badMail(869), // 无 ICS 附件（结构超契约 → 提取 null）
+          _mail(870, _ics('cal_2', sequence: 0)),
+        ], 870),
       );
       final svc = build(source);
       await svc.debugSyncIncrement(source, 0);
@@ -200,13 +194,10 @@ void main() {
       failGateway = true;
       final source = FakeSource(
         uidValidity: 1,
-        result: (
-          mails: [
-            _mail(869, _ics('cal_ok', sequence: 0)),
-            _mail(870, _ics('cal_late', sequence: 0)),
-          ],
-          maxSeenUid: 870,
-        ),
+        result: scan([
+          _mail(869, _ics('cal_ok', sequence: 0)),
+          _mail(870, _ics('cal_late', sequence: 0)),
+        ], 870),
       );
       final svc = build(source);
       await expectLater(
@@ -221,7 +212,7 @@ void main() {
     });
 
     test('空扫推进：无新邮件也把水位线推到 maxSeen（防重复重扫）', () async {
-      final source = FakeSource(uidValidity: 1, result: (mails: [], maxSeenUid: 900));
+      final source = FakeSource(uidValidity: 1, result: scan([], 900));
       final svc = build(source);
       final next = await svc.debugSyncIncrement(source, 800);
       expect(next, 900);
@@ -260,10 +251,7 @@ void main() {
           '$encoded$crlf--B--$crlf';
       final source = FakeSource(
         uidValidity: 1,
-        result: (
-          mails: [CalendarMail(uid: 950, subject: 'cal', raw: raw)],
-          maxSeenUid: 950,
-        ),
+        result: scan([CalendarMail(uid: 950, subject: 'cal', raw: raw)], 950),
       );
       final svc = CalendarSyncService.test(
         settingsProvider: () => AppSettings(
@@ -292,7 +280,7 @@ void main() {
       await StorageService.init();
       final source = FakeSource(
         uidValidity: 1,
-        result: (mails: [], maxSeenUid: 900),
+        result: scan([], 900),
       );
       final svc = CalendarSyncService.test(
         settingsProvider: () => AppSettings(
@@ -418,6 +406,153 @@ void main() {
       expect(extracted, isNot(contains('broken-inline')));
     });
   });
+
+  group('WO-82-R3 追加 · 跳信防御（12:12 定案：QQ SEARCH 漏件 + 缺口重扫）', () {
+    late List<List<Map<String, dynamic>>> gatewayBatches;
+
+    setUp(() {
+      gatewayBatches = <List<Map<String, dynamic>>>[];
+    });
+
+    CalendarSyncService build(FakeSource source, {bool failGateway = false}) {
+      return CalendarSyncService.test(
+        settingsProvider: () => AppSettings(
+          calendarSyncEnabled: true,
+          mailAccount: 'fixture@example.invalid',
+          mailAuthCode: 'FIXTURE',
+        ),
+        sourceFactory: (_) => source,
+        gateway: FakeGateway(
+          onUpsert: (batch) {
+            if (failGateway) throw StateError('通道未激活(模拟)');
+            gatewayBatches.add(batch);
+          },
+        ),
+      );
+    }
+
+    test('uidHoles 纯函数：漏件缺口/连续候选/无更高件 三态', () {
+      // 12:12 实证形态：水位线 1262，SEARCH 只回了 1264（1263 被漏）
+      expect(uidHoles(1262, [1264]), [1263]);
+      // 连续候选 → 无缺口
+      expect(uidHoles(1262, [1263, 1264, 1265]), isEmpty);
+      // 候选为空 / 最大候选 ≤ 水位线（RFC n:* 怪癖回显）→ 无缺口
+      expect(uidHoles(1264, <int>[]), isEmpty);
+      expect(uidHoles(1264, [1264]), isEmpty);
+      // 首尾双缺口
+      expect(uidHoles(1260, [1262, 1264]), [1261, 1263]);
+    });
+
+    test('缺口重扫补齐：第一轮 SEARCH 漏 1263 → 重扫后补齐并消费（12:12 情景重放）',
+        () async {
+      // 1263=日历取消件（12:12 实物形态）、1264=遥测件（晚 34s 入箱）
+      final calMail = _mail(1263, _ics('cal_1790727728690', cancelled: true));
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan([], 0),
+        scanScript: [
+          // 第一轮：QQ SEARCH 漏件——只回 1264（TEL 非日历件，不出现在 mails）
+          scan(const <CalendarMail>[], 1264, candidates: [1264]),
+          // 重扫第 1 轮：索引已热 → 1263/1264 齐全
+          scan([calMail], 1264, candidates: [1263, 1264]),
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1262);
+
+      expect(source.scanCalls, 2, reason: '缺口触发 1 次重扫');
+      expect(gatewayBatches, hasLength(1), reason: '1263 取消件必须被消费');
+      expect(gatewayBatches.single.single['uid'], 'cal_1790727728690');
+      expect(gatewayBatches.single.single['cancelled'], isTrue);
+      expect(next, 1264, reason: '消费后水位线照常推进');
+      final state = await StorageService.loadCalendarSyncStateAsync();
+      expect(state['lastSuspectedSkip'], isNull,
+          reason: '缺口已补齐，不得留下跳信标记');
+    });
+
+    test('缺口持续：两轮重扫后仍缺口 → 水位线照常推进（防卡死）+ 跳信标记落状态',
+        () async {
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan([], 0),
+        scanScript: [
+          scan(const <CalendarMail>[], 1264, candidates: [1264]),
+          scan(const <CalendarMail>[], 1264, candidates: [1264]),
+          scan(const <CalendarMail>[], 1264, candidates: [1264]),
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1262);
+
+      expect(source.scanCalls, 3, reason: '首轮 + 2 次有界重扫（5s×2 语义）');
+      expect(next, 1264, reason: '缺口不得卡死水位线（防重扫风暴）');
+      final state = await StorageService.loadCalendarSyncStateAsync();
+      final marker = state['lastSuspectedSkip'] as Map<dynamic, dynamic>?;
+      expect(marker, isNotNull, reason: '疑似跳信必须即刻可见（12:12 反例：5 天幽灵）');
+      expect(marker!['uids'], [1263]);
+      expect(marker['advancedTo'], 1264);
+    });
+
+    test('连续候选 + 非日历新件：零重扫零标记（TEL 件高频到达不得放大扫描）', () async {
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan(const <CalendarMail>[], 1266, candidates: [1266]),
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1265);
+
+      expect(source.scanCalls, 1, reason: '候选连续=无缺口，不重扫');
+      expect(next, 1266);
+      final state = await StorageService.loadCalendarSyncStateAsync();
+      expect(state['lastSuspectedSkip'], isNull);
+    });
+
+    test('推送触发零新件（SEARCH 连回显都没给）：有界重扫后放行', () async {
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan([], 0),
+        scanScript: [
+          // 推送刚到却一无所见（同族漏件形态：候选空回）
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1262,
+          trigger: 'IDLE推送');
+
+      expect(source.scanCalls, 3, reason: '推送空扫必须重扫（服务端刚说有新件）');
+      expect(next, 1262, reason: '无新件不得越位推进');
+      final state = await StorageService.loadCalendarSyncStateAsync();
+      expect(state['lastSuspectedSkip'], isNull,
+          reason: '无缺口证据不落跳信标记');
+    });
+
+    test('兜底空扫（非推送触发）：候选只回显水位线本身 → 不重扫（90s 节拍常态）',
+        () async {
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan(const <CalendarMail>[], 1262, candidates: [1262]),
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1262,
+          trigger: '兜底查件');
+
+      expect(source.scanCalls, 1, reason: 'RFC n:* 回显形态 ≠ 缺口，兜底常态不重扫');
+      expect(next, 1262);
+    });
+  });
 }
 
 
@@ -480,9 +615,28 @@ class FakeGateway implements CalendarGateway {
   Future<void> ping() async {}
 }
 
+/// WO-82-R3 追加：三字段扫描结果构造助手（candidates 缺省空 = 无缺口 =
+/// 不触发缺口重扫，既有用例语义零漂移）
+({List<CalendarMail> mails, int maxSeenUid, List<int> candidates}) scan(
+        List<CalendarMail> mails, int maxSeenUid,
+        {List<int>? candidates}) =>
+    (
+      mails: mails,
+      maxSeenUid: maxSeenUid,
+      candidates: candidates ?? const <int>[]
+    );
+
 class FakeSource implements CalendarMailSource {
   final int? uidValidity;
-  final ({List<CalendarMail> mails, int maxSeenUid}) result;
+  final ({List<CalendarMail> mails, int maxSeenUid, List<int> candidates}) result;
+
+  /// WO-82-R3 追加：多轮扫描剧本（非空时按调用序弹出，用尽后停在最后一轮——
+  /// 缺口重扫「第一轮漏件、第二轮补齐」的假源剧本）
+  final List<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>?
+      scanScript;
+
+  /// fetchNewSince 实际调用次数（缺口重扫次数断言用）
+  int scanCalls = 0;
 
   /// WO-71 ③：调用序列记录（断言「水位线空 → 先扫描再 IDLE」）
   final List<String> calls = <String>[];
@@ -491,15 +645,22 @@ class FakeSource implements CalendarMailSource {
   /// 避免「立即 null」造成的紧密空转（那会饿死测试 Timer）
   final Completer<void> _idleWake = Completer<void>();
 
-  FakeSource({required this.uidValidity, required this.result});
+  FakeSource({required this.uidValidity, required this.result, this.scanScript});
 
   @override
   Future<int?> connect() async => uidValidity;
 
   @override
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
-          int lastProcessedUid) async {
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(int lastProcessedUid) async {
+    scanCalls++;
     calls.add('scan');
+    if (scanScript != null && scanScript!.isNotEmpty) {
+      final idx = scanCalls - 1;
+      return scanScript![idx >= scanScript!.length
+          ? scanScript!.length - 1
+          : idx];
+    }
     return result;
   }
 

@@ -21,6 +21,8 @@ class _ScriptedImapServer {
   final StringBuffer received = StringBuffer();
   bool pushExistsAfterIdle = false; // 挂载后 ~100ms 推送 `* 5 EXISTS`
   bool swallowDone = false; // 死连：吞 DONE 的 tagged OK
+  List<int> searchResult = <int>[]; // UID SEARCH 剧本返回
+  Map<int, String> mailboxBodies = <int, String>{}; // UID → 全文原文（FETCH 剧本）
   final List<Socket> _clients = <Socket>[];
   Timer? _pushTimer;
   String? _idleTag;
@@ -76,6 +78,19 @@ class _ScriptedImapServer {
     } else if (line == 'DONE') {
       if (swallowDone) return; // 死连：吞响应
       client.write('${_idleTag ?? 'P0001'} OK\r\n');
+    } else if (line.contains(' UID SEARCH')) {
+      client.write('* SEARCH ${searchResult.join(' ')}\r\n');
+      client.write('${line.split(' ').first} OK\r\n');
+    } else if (line.contains(' BODY.PEEK[]')) {
+      final uidMatch = RegExp(r'UID FETCH ([\d,]+)').firstMatch(line);
+      final uids = uidMatch!.group(1)!.split(',').map(int.parse);
+      for (final uid in uids) {
+        final body = utf8.encode(mailboxBodies[uid] ?? '');
+        client.write('* $uid FETCH (UID $uid BODY[] {${body.length}}\r\n');
+        client.add(body);
+        client.write('\r\n)\r\n');
+      }
+      client.write('${line.split(' ').first} OK\r\n');
     } else {
       client.write('${line.split(' ').first} OK\r\n');
     }
@@ -234,5 +249,61 @@ void main() {
         await server.close();
       }
     }, timeout: const Timeout(Duration(seconds: 40)));
+
+    test('WO-82-R3 追加：小批全文化——头粗筛退役，主题+正文同源一次判定', () async {
+      final server = await _ScriptedImapServer.bind();
+      server.searchResult = [201, 202];
+      server.mailboxBodies = {
+        // TEL 遥测件（非日历）：全文原文含完整头部，主题判定应排除
+        201: 'Subject: X-2BOT-TEL-1790741589052\r\n'
+            'Date: Wed, 30 Sep 2026 04:13:09 GMT\r\n'
+            'Content-Type: text/plain; charset=utf-8\r\n'
+            '\r\n'
+            'telemetry body\r\n',
+        // 日历件（内联形态）：同一份字节里主题+标记段齐全
+        202: 'Subject: X-2BOT-CAL-20260930-1212\r\n'
+            'Date: Wed, 30 Sep 2026 04:12:35 GMT\r\n'
+            'Content-Type: text/plain; charset=utf-8\r\n'
+            '\r\n'
+            '=====2BOT-CAL-BEGIN=====\r\n'
+            'BEGIN:VCALENDAR\r\n'
+            'BEGIN:VEVENT\r\n'
+            'UID:cal_1790727728690\r\n'
+            'SEQUENCE:0\r\n'
+            'STATUS:CANCELLED\r\n'
+            'DTSTART:20260930T041200Z\r\n'
+            'DURATION:PT1H\r\n'
+            'END:VEVENT\r\n'
+            'END:VCALENDAR\r\n'
+            '=====2BOT-CAL-END=====\r\n',
+      };
+      ImapIdleClient.socketFactory =
+          (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
+      try {
+        final client = ImapIdleClient(
+          config: ImapConfig(
+              account: 'acct',
+              authCode: 'code',
+              host: '127.0.0.1',
+              port: server.socket.port),
+        );
+        await client.connect();
+        final r = await client.fetchNewSince(200);
+
+        expect(r.candidates, [201, 202], reason: '候选全集原样上抛（缺口检测素材）');
+        expect(r.maxSeenUid, 202);
+        expect(r.mails.length, 1, reason: 'TEL 件不得 surfaced');
+        expect(r.mails.single.uid, 202);
+        expect(r.mails.single.raw, contains('UID:cal_1790727728690'));
+        // 小批路径不再发 HEADER.FIELDS 头拉取（同源判定=杀「头拉取漏单封」向量）
+        expect(server.received.toString(), isNot(contains('HEADER.FIELDS')),
+            reason: '≤10 封必须一次全文判定（12:12 同族遗漏向量防御）');
+        expect(server.received.toString(), contains('BODY.PEEK[]'));
+        await client.close();
+      } finally {
+        ImapIdleClient.socketFactory = null;
+        await server.close();
+      }
+    });
   });
 }
