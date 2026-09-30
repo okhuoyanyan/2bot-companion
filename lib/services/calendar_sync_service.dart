@@ -326,9 +326,10 @@ class CalendarSyncService {
 
   /// WO-82 终裁（8s 拍配套）：回退验证冷却——带删信箱 boxExists<水位线是
   /// 常态，v2 验证若每拍都跑=每拍 10s 全段重扫（8s 拍下=持续自压）。
-  /// 同水位线 10 分钟内验证过 → 跳过；真重置最坏延迟一个冷却窗发现。
+  /// 🔴 纯时间键（真机 21:30 实证修正：水位线做键会在每次消费后失效——
+  /// 冷却退化成每 ~36s 一轮 11s 重验证）；「序列是否重置」与具体水位线无关，
+  /// 10 分钟内一次「序列健在」结论全局有效。真重置最坏延迟一冷却窗发现。
   DateTime? _rollbackVerifiedAt;
-  int? _rollbackVerifiedWatermark;
   String _mode = 'off';
 
   /// 主 isolate / 测试用默认构造
@@ -643,8 +644,7 @@ class CalendarSyncService {
     //     交下方缺口/空返回重扫自愈。
     if (mails.isEmpty && maxSeen == 0 && boxExists != null && boxExists < lastUid) {
       final preRollback = lastUid;
-      final verifiedRecently = _rollbackVerifiedWatermark == preRollback &&
-          _rollbackVerifiedAt != null &&
+      final verifiedRecently = _rollbackVerifiedAt != null &&
           DateTime.now().difference(_rollbackVerifiedAt!) <
               const Duration(minutes: 10);
       if (!verifiedRecently) {
@@ -653,7 +653,6 @@ class CalendarSyncService {
             '（v2 三态：真重置/序列健在/SEARCH 瞬断）');
         final retry = await source.fetchNewSince(boxExists);
         _rollbackVerifiedAt = DateTime.now();
-        _rollbackVerifiedWatermark = preRollback;
         if (retry.mails.isNotEmpty || retry.maxSeenUid > 0) {
           if (retry.maxSeenUid < preRollback) {
             // a) 真重置

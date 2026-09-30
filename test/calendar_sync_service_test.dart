@@ -593,10 +593,11 @@ void main() {
           reason: '空返回非缺口，不落跳信标记');
     });
 
-    test('终裁配套：回退验证同水位线 10 分钟冷却——第二拍不再重扫（防 8s 拍自压）',
+    test('终裁配套：回退验证 10 分钟纯时间冷却——跨水位线仍有效（防 8s 拍自压）',
         () async {
       // 剧本：拍1初始空 + 拍1回退验证空（瞬断）→ 拍2/拍3 初始回显健康候选
-      //（水位线==max 的常态空闲态；连击守卫要求空返回不得连续 3 拍）
+      //（真机 21:30 实证：水位线做键会在每次消费后失效，冷却退化成每 ~36s
+      // 一轮 11s 重验证；「序列是否重置」与水位线无关 → 纯时间键）
       final echo = scan(const <CalendarMail>[], 1304, candidates: [1304]);
       final source = FakeSource(
         uidValidity: 1,
@@ -614,13 +615,15 @@ void main() {
       await svc.debugSyncIncrement(source, 1304, boxExists: 1032);
       expect(source.scanCalls, 2, reason: '拍1：初始 + 回退验证');
 
-      await svc.debugSyncIncrement(source, 1304, boxExists: 1032);
+      // 拍2：水位线已因消费推进到 1306——纯时间冷却仍须跳过回退验证
+      final next2 = await svc.debugSyncIncrement(source, 1306, boxExists: 1032);
       expect(source.scanCalls, 3,
-          reason: '同水位线冷却期内（10min）不得再跑回退验证重扫——'
-              '8s 拍下每拍 10s 全段重扫 = 持续自压（真机 21:21 实证）');
+          reason: '10min 内不同水位线也不得再跑回退验证重扫——'
+              '8s 拍下每拍 10s 全段重扫 = 持续自压（真机 21:30 实证）');
+      expect(next2, 1306);
 
-      final next = await svc.debugSyncIncrement(source, 1304, boxExists: 1032);
-      expect(next, 1304, reason: '冷却期水位线稳定不漂移');
+      final next3 = await svc.debugSyncIncrement(source, 1306, boxExists: 1032);
+      expect(next3, 1306, reason: '冷却期水位线稳定不漂移');
       expect(source.scanCalls, 4);
     });
 
