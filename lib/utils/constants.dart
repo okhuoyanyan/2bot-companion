@@ -55,6 +55,18 @@ class AppConstants {
   static const String secKeyMailCryptKey = 'sec_mail_crypt_key';
 
   // ============================================================
+  // WO-84 WebDAV 优先快路（坚果云 ctag 明文 GET 比对 → 变化才全量 GET）
+  // ============================================================
+  /// 坚果云账号（登录邮箱，非敏感 → SharedPreferences）
+  static const String keyWebdavUser = 'pref_webdav_user';
+  /// 坚果云文件夹（非敏感 → SharedPreferences；也接受完整 http(s) URL 覆盖，测试/迁移两用）
+  static const String keyWebdavFolder = 'pref_webdav_folder';
+  /// 坚果云应用密码（**凭据 → 仅安全存储**，纪律与 mailAuthCode 同款）
+  static const String secKeyWebdavPass = 'sec_webdav_pass';
+  /// 前后台分档桥（主 isolate 生命周期写，FGS isolate 每拍读；true=前台 8s / false=后台 30s）
+  static const String keyCalSyncForeground = 'pref_cal_sync_foreground';
+
+  // ============================================================
   // WO-69 日历自动同步（自写 IMAP IDLE 拉取 ICS → 自建本地日历）
   // ============================================================
   /// 日历投递邮件主题前缀（WO-68-SPEC §7 冻结契约默认值，与 NAS 侧 calendar.delivery.subjectPrefix 默认值逐字一致）

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -12,6 +13,72 @@ import 'calendar_mail_extract.dart';
 import 'ics_min_parser.dart';
 import 'imap_idle_client.dart';
 import 'storage_service.dart';
+
+/// ============================================================================
+/// WO-82-R1: 日历邮件正文内联标记契约（与 NAS 端 plugins/core/calendar.js 严格对齐）
+/// ============================================================================
+const String calInlineBegin = '=====2BOT-CAL-BEGIN=====';
+const String calInlineEnd = '=====2BOT-CAL-END=====';
+
+/// 从纯文本中寻找内联 ICS 标记段。
+/// 找不到返回 null；残缺（有 begin 无 end，或内容不含 BEGIN:VCALENDAR）返回 null。
+String? _extractInlineIcsFromText(String text) {
+  final beginIdx = text.indexOf(calInlineBegin);
+  if (beginIdx < 0) return null;
+  final afterBegin = beginIdx + calInlineBegin.length;
+  final endIdx = text.indexOf(calInlineEnd, afterBegin);
+  if (endIdx < 0) {
+    // 标记残缺：有 begin 却无 end
+    return null;
+  }
+  final content = text.substring(afterBegin, endIdx).trim();
+  if (!content.contains('BEGIN:VCALENDAR')) {
+    // 标记残缺/内容损坏
+    return null;
+  }
+  return content;
+}
+
+/// WO-82-R1: 双形态日历正文提取（解析增正文标记段，附件/内联都认，并存时标记段优先，残缺降级）
+///
+/// 1. 优先提取正文内联标记段（=====2BOT-CAL-BEGIN===== ... =====2BOT-CAL-END=====）
+/// 2. 标记段残缺（例如有 BEGIN 缺 END）或未匹配时，降级提取附件（extractIcsFromMail）
+/// 3. 并存时标记段优先
+String? extractIcsFromMailDual(String raw) {
+  // A. 直接从原始报文中尝试提取内联标记段
+  if (raw.contains(calInlineBegin)) {
+    final direct = _extractInlineIcsFromText(raw);
+    if (direct != null) {
+      return direct;
+    }
+    // raw 包含 begin 但匹配失败 → 标记残缺，直接降级到附件提取
+    return extractIcsFromMail(raw);
+  }
+
+  // B. 若 raw 未直接包含 begin，但正文可能经过 MIME 传输编码（如 base64）
+  final headerEnd = raw.indexOf('\r\n\r\n');
+  final sep = headerEnd >= 0 ? 4 : (raw.indexOf('\n\n') >= 0 ? 2 : -1);
+  if (sep >= 0) {
+    final headerBlock = raw.substring(0, sep == 4 ? headerEnd : raw.indexOf('\n\n'));
+    final body = raw.substring(sep == 4 ? headerEnd + 4 : raw.indexOf('\n\n') + 2);
+    final lowerHeader = headerBlock.toLowerCase();
+    if (lowerHeader.contains('content-transfer-encoding: base64')) {
+      try {
+        final decoded = utf8.decode(
+            base64Decode(body.replaceAll(RegExp(r'\s+'), '')),
+            allowMalformed: true);
+        final fromDecoded = _extractInlineIcsFromText(decoded);
+        if (fromDecoded != null) {
+          return fromDecoded;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // C. 降级走既有附件提取
+  return extractIcsFromMail(raw);
+}
+
 
 /// ============================================================================
 /// WO-69 · 日历自动同步编排（IDLE 主路径秒级推送 + 15 分钟兜底轮询）
@@ -57,6 +124,26 @@ class CalendarEventLedger {
       if (e.cancelled) 'cancelled': true,
     };
   }
+}
+
+/// WO-82-R3 追加（12:12 跳信定案）：候选集相对 (lastUid, maxCandidate] 的缺口
+/// 检测——QQ UID SEARCH 会静默漏件（实证：UID 1263 被漏、34s 后入箱的 1264
+/// 反而在列），「空扫推进 maxSeen」语义会把漏件永久焊死。本函数给出缺口 UID
+/// 列表（升序）；候选为空或最大候选 ≤ 水位线时返回空（无更高件=无缺口）。
+@visibleForTesting
+List<int> uidHoles(int lastUid, List<int> candidates) {
+  if (candidates.isEmpty) return const <int>[];
+  var maxC = candidates.first;
+  for (final c in candidates) {
+    if (c > maxC) maxC = c;
+  }
+  if (maxC <= lastUid) return const <int>[];
+  final have = candidates.toSet();
+  final holes = <int>[];
+  for (var u = lastUid + 1; u <= maxC; u++) {
+    if (!have.contains(u)) holes.add(u);
+  }
+  return holes;
 }
 
 /// 原生日历写入通道抽象（生产 = 本机事件库；MethodChannel 为降级回滚面）
@@ -126,22 +213,65 @@ class MethodChannelCalendarGateway implements CalendarGateway {
   }
 }
 
+/// ============================================================================
+/// WO-84 WebDAV 优先快路（坚果云 ctag 明文比对）
+/// ============================================================================
+/// HTTP 429/503：限频 → 立即进入熔断退避（60s/120s），严禁 8s 死磕
+class WebdavRateLimitedException implements Exception {
+  final int statusCode;
+  WebdavRateLimitedException(this.statusCode);
+  @override
+  String toString() => 'WebDAV 限频（HTTP $statusCode）';
+}
+
+/// 其它非 2xx（404=文件夹未就绪/401=凭据错/5xx 等）：计入连续失败
+class WebdavUnreachableException implements Exception {
+  final int statusCode;
+  WebdavUnreachableException(this.statusCode);
+  @override
+  String toString() => 'WebDAV 不可达（HTTP $statusCode）';
+}
+
+/// WO-84：由三字段解析 WebDAV base（🔒 三字段全非空才启用快路；空=禁用）。
+/// folder 规则：完整 http(s) URL → 逐字使用（测试/迁移覆盖）；`dav/…` → 视为
+/// 已含 dav 根；其余 → 拼到坚果云 dav 根下。返回值恒以 `/` 结尾。
+@visibleForTesting
+String? webdavBaseFromSettings(String user, String pass, String folder) {
+  if (user.trim().isEmpty || pass.trim().isEmpty || folder.trim().isEmpty) {
+    return null;
+  }
+  final f = folder.trim();
+  // scheme 大小写不敏感（RFC 3986；兼容大写输入路径）
+  final lower = f.toLowerCase();
+  if (lower.startsWith('http://') || lower.startsWith('https://')) {
+    return f.endsWith('/') ? f : '$f/';
+  }
+  const host = 'https://dav.jianguoyun.com';
+  final clean = f.replaceAll(RegExp(r'^/+|/+$'), '');
+  if (clean.isEmpty) return null;
+  final cleanLower = clean.toLowerCase();
+  if (cleanLower == 'dav' || cleanLower.startsWith('dav/')) {
+    return '$host/$clean/';
+  }
+  return '$host/dav/$clean/';
+}
+
 /// 邮件源抽象（生产 = QQ IMAP；测试 = 假实现）
 abstract class CalendarMailSource {
   /// 连接并 SELECT INBOX；返回 UIDVALIDITY（拿不到为 null）
   Future<int?> connect();
 
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
-      int lastProcessedUid);
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(int lastProcessedUid);
 
   Future<bool> startIdle();
-  Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)});
+  Future<int?> waitForEvent({required Duration beat});
 
   /// WO-78-R3 ①：IDLE 生命周期日志出口（每跳一行）
   void Function(String line)? get onLifecycleLog;
   set onLifecycleLog(void Function(String line)? v);
 
-  /// WO-78-R3 返工：最近一次唤醒原因（'IDLE推送'/'NOOP查件'/'NOOP夹带'）——
+  /// WO-82-R3：最近一次唤醒原因（'IDLE推送'/'兜底查件'）——
   /// 拉取日志触发原因的归因源；null=未知。
   String? get lastWakeReason;
 
@@ -181,8 +311,8 @@ class QqImapSource implements CalendarMailSource {
   }
 
   @override
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
-      int lastProcessedUid) async {
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(int lastProcessedUid) async {
     return _client!.fetchNewSince(lastProcessedUid);
   }
 
@@ -190,9 +320,8 @@ class QqImapSource implements CalendarMailSource {
   Future<bool> startIdle() => _client!.startIdle();
 
   @override
-  Future<int?> waitForEvent({required Duration beat,
-          Duration noopBeat = const Duration(seconds: 60)}) =>
-      _client!.waitForEvent(beat: beat, noopBeat: noopBeat);
+  Future<int?> waitForEvent({required Duration beat}) =>
+      _client!.waitForEvent(beat: beat);
 
   @override
   Future<void> stopIdle() => _client!.stopIdle();
@@ -236,6 +365,14 @@ class CalendarSyncService {
   CalendarMailSource? _currentSource;
   int _consecutiveFailures = 0;
   int _rebuildCount = 0; // WO-78-R3：连续会话重建计数（防打爆护栏）
+  int _emptySearchStreak = 0; // WO-82-R3：连续 SEARCH 空返回计数（连接失智守卫）
+
+  /// WO-82 终裁（8s 拍配套）：回退验证冷却——带删信箱 boxExists<水位线是
+  /// 常态，v2 验证若每拍都跑=每拍 10s 全段重扫（8s 拍下=持续自压）。
+  /// 🔴 纯时间键（真机 21:30 实证修正：水位线做键会在每次消费后失效——
+  /// 冷却退化成每 ~36s 一轮 11s 重验证）；「序列是否重置」与具体水位线无关，
+  /// 10 分钟内一次「序列健在」结论全局有效。真重置最坏延迟一冷却窗发现。
+  DateTime? _rollbackVerifiedAt;
   String _mode = 'off';
 
   /// 主 isolate / 测试用默认构造
@@ -263,13 +400,23 @@ class CalendarSyncService {
     this.onStatus,
   });
 
-  /// 单次拉取节拍常量（暴露给测试与上层观测）
-  static const Duration idleBeat = Duration(minutes: 25);
-  /// WO-78-R3 返工实测（5 轮第 1 轮）：QQ 对本连接的 IDLE 【不推 EXISTS】
-  /// （出站后 30s 窗口内无任何推送行，re-SELECT 才看见）→ NOOP 查件是唯一
-  /// 感知路径，节拍 30s 时实测 24.1s（相位平均 +15s）。压到 10s：
-  /// re-SELECT 单次开销 ~200ms/次，端到端 ≈5-8s（验收 ≤10s）。
-  static const Duration idleNoopBeat = Duration(seconds: 10);
+  /// 节拍常量（WO-84 终架构：WebDAV 优先、邮件兜底）
+  ///
+  /// 沿革：WO-82-R3 退役 10s 高频拍（挂载态发命令的协议违规致推送死亡）→
+  /// 管理员终裁 8s IMAP 拍 → **WO-84**：8s 拍让位给 WebDAV ctag 快路（坚果云
+  /// 纯文本 GET，绕开 QQ 索引层；未变零全量 GET 的配额红线），IMAP 邮件轮询
+  /// 降为 90s 兜底（QQ 推送死亡 + 索引滞后 25-35s 实证下，邮件通道只承担兜底）。
+  /// 🔒 前后台分档：WebDAV 前台 8s / 后台 FGS 30s（主 isolate 生命周期写 pref，
+  /// FGS isolate 每拍读——WO-70 跨 isolate 同款模式）。
+  static const Duration webdavForegroundBeat = Duration(seconds: 8);
+  static const Duration webdavBackgroundBeat = Duration(seconds: 30);
+  /// 邮件兜底轮询节拍（WebDAV 优先架构下的 IMAP 感知节拍）
+  static const Duration mailFallbackBeat = Duration(seconds: 90);
+  /// 🔒 频控熔断阶梯：429/503 或连续 2 次失败 → 60s/120s 指数退避，严禁 8s 死磕
+  static const List<Duration> webdavBackoffLadder = [
+    Duration(seconds: 60),
+    Duration(seconds: 120),
+  ];
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
@@ -300,9 +447,13 @@ class CalendarSyncService {
         'accountSet=${settings.mailAccount.trim().isNotEmpty} '
         'authSet=${settings.mailAuthCode.trim().isNotEmpty} '
         'running=$_running server=${CalendarLocalService.instance.isRunning}');
+    final webdavReady = webdavBaseFromSettings(
+            settings.webdavUser, settings.webdavPass, settings.webdavFolder) !=
+        null;
     final shouldRun = settings.calendarSyncEnabled &&
-        settings.mailAccount.trim().isNotEmpty &&
-        settings.mailAuthCode.trim().isNotEmpty;
+        ((settings.mailAccount.trim().isNotEmpty &&
+                settings.mailAuthCode.trim().isNotEmpty) ||
+            webdavReady);
     // 本机只读服务与 IMAP 解耦：开关开即服务（IMAP 凭据缺失只影响拉取，
     // 不影响对外提供已同步内容；服务常驻由 tick 自愈维持）
     try {
@@ -326,18 +477,207 @@ class CalendarSyncService {
     }
   }
 
-  /// 启动同步循环（幂等）
+  // ------------------------------------------------------------------
+  // WO-84 WebDAV 优先快路轮询器（坚果云）
+  // ------------------------------------------------------------------
+
+  Timer? _webdavTimer;
+  bool _webdavInFlight = false;
+  String? _lastWebdavCtag;
+  int _webdavFailStreak = 0;
+  bool _webdavBackoffActive = false;
+  int _webdavBackoffLevel = 0; // 退避档位：首次进入=60s，退避中再失败升 120s
+
+  void _startWebdavPoller() {
+    _lastWebdavCtag = null;
+    _webdavFailStreak = 0;
+    _webdavBackoffActive = false;
+    _scheduleWebdavTick(Duration.zero); // 启动即刻首探
+  }
+
+  void _scheduleWebdavTick(Duration delay) {
+    _webdavTimer?.cancel();
+    _webdavTimer = Timer(delay, _webdavTick);
+  }
+
+  void _stopWebdavPoller() {
+    _webdavTimer?.cancel();
+    _webdavTimer = null;
+    _webdavInFlight = false;
+  }
+
+  Duration get _webdavCurrentBackoff =>
+      webdavBackoffLadder[_webdavBackoffLevel.clamp(0, webdavBackoffLadder.length - 1)];
+
+  /// 🔒 失败记账：429/503 立即熔断；其它失败连续 ≥2 次熔断。
+  /// 阶梯语义：首次进入=60s；退避中再失败升 120s（封顶）；成功清零。
+  /// 熔断进入只打一行日志（静默回落邮件兜底的可见锚点），期间不刷屏。
+  @visibleForTesting
+  void noteWebdavFailure(String why, {bool rateLimited = false}) {
+    _webdavFailStreak++;
+    if (rateLimited || _webdavFailStreak >= 2) {
+      if (!_webdavBackoffActive) {
+        _webdavBackoffActive = true;
+        _webdavBackoffLevel = 0;
+        // ignore: avoid_print
+        print('[WO84] WebDAV 熔断退避 ${_webdavCurrentBackoff.inSeconds}s（$why）'
+            '→ 邮件兜底承接（${mailFallbackBeat.inSeconds}s）');
+      } else {
+        _webdavBackoffLevel =
+            (_webdavBackoffLevel + 1).clamp(0, webdavBackoffLadder.length - 1);
+      }
+    }
+  }
+
+  /// 成功记账：清失败链 + 解除熔断（一行恢复日志）
+  @visibleForTesting
+  void noteWebdavSuccess() {
+    _webdavFailStreak = 0;
+    _webdavBackoffLevel = 0;
+    if (_webdavBackoffActive) {
+      _webdavBackoffActive = false;
+      // ignore: avoid_print
+      print('[WO84] WebDAV 熔断解除，恢复快路节拍');
+    }
+  }
+
+  /// 测试观测：熔断中的下一拍间隔（Duration.zero = 正常分档节拍调度）
+  @visibleForTesting
+  Duration get webdavNextIntervalForTest =>
+      _webdavBackoffActive ? _webdavCurrentBackoff : Duration.zero;
+
+  Future<void> _webdavTick() async {
+    if (_stopRequested) return;
+    var tier = webdavForegroundBeat;
+    try {
+      await StorageService.reloadPrefs();
+      // 🔒 前后台分档：主 isolate 生命周期写 pref → FGS 每拍读（跨 isolate 桥）
+      final foreground = StorageService.prefs
+              .getBool(AppConstants.keyCalSyncForeground) ??
+          false;
+      tier = foreground ? webdavForegroundBeat : webdavBackgroundBeat;
+    } catch (_) {}
+    try {
+      final s = settingsProvider();
+      final base =
+          webdavBaseFromSettings(s.webdavUser, s.webdavPass, s.webdavFolder);
+      if (base == null) {
+        // 空=禁用快路：不发任何网络请求，低频自检等配置变化
+        _scheduleWebdavTick(webdavBackgroundBeat);
+        return;
+      }
+      if (_webdavInFlight) {
+        _scheduleWebdavTick(tier);
+        return;
+      }
+      _webdavInFlight = true;
+      try {
+        await webdavProbeAndSync(base);
+        noteWebdavSuccess();
+      } on WebdavRateLimitedException catch (e) {
+        noteWebdavFailure(e.toString(), rateLimited: true);
+      } catch (e) {
+        noteWebdavFailure(_safeMessage(e));
+      } finally {
+        _webdavInFlight = false;
+      }
+    } catch (_) {
+      // 🔴 WebDAV 异常绝不崩服务：邮件兜底无缝承接（90s 拍独立运转）
+    }
+    if (_stopRequested) return;
+    _scheduleWebdavTick(_webdavBackoffActive ? _webdavCurrentBackoff : tier);
+  }
+
+  /// 单拍探测（供轮询器与单测调用）：GET ctag.txt（明文，与内存值比对）→
+  /// 未变 = 本拍结束（零全量 GET，配额红线）；变化 = GET calendar.ics →
+  /// 走既有解析/台账/应用管线。ctag 仅在应用成功后提交（失败不消费，下拍重拉）。
+  @visibleForTesting
+  Future<void> webdavProbeAndSync(String base,
+      {HttpClient? customClient}) async {
+    final settings = settingsProvider();
+    final auth =
+        'Basic ${base64.encode(utf8.encode('${settings.webdavUser}:${settings.webdavPass}'))}';
+    final uri = Uri.parse(base);
+    final client = customClient ??
+        (HttpClient()..connectionTimeout = const Duration(seconds: 3));
+    try {
+      // 🔒 纯文本 GET ctag（禁 PROPFIND/XML——Flutter 无 XML 解析器，WO-74 同款雷）
+      final ctag = (await _webdavGetText(client, uri, 'ctag.txt', auth)).trim();
+      if (ctag == _lastWebdavCtag) return; // 未变：零全量 GET
+      final icsText = await _webdavGetText(client, uri, 'calendar.ics', auth);
+      final applied = await _applyIcsSnapshot(icsText);
+      _lastWebdavCtag = ctag; // 应用成功才提交 ctag（失败不消费变更）
+      if (applied > 0) {
+        // ignore: avoid_print
+        print('[WO84] WebDAV ctag 变化 → 拉取并应用 $applied 条');
+      }
+    } finally {
+      if (customClient == null) {
+        client.close(force: true);
+      }
+    }
+  }
+
+  Future<String> _webdavGetText(
+      HttpClient client, Uri base, String file, String auth) async {
+    final req = await client
+        .openUrl('GET', base.resolve(file))
+        .timeout(const Duration(seconds: 5));
+    req.headers.set(HttpHeaders.authorizationHeader, auth);
+    final resp = await req.close().timeout(const Duration(seconds: 5));
+    try {
+      if (resp.statusCode == 429 || resp.statusCode == 503) {
+        throw WebdavRateLimitedException(resp.statusCode);
+      }
+      if (resp.statusCode != 200) {
+        throw WebdavUnreachableException(resp.statusCode);
+      }
+      return await utf8.decodeStream(resp).timeout(const Duration(seconds: 5));
+    } finally {
+      try {
+        await resp.drain<void>();
+      } catch (_) {}
+    }
+  }
+
+  /// 全量 ICS 快照 → 既有解析/台账判新/分批应用管线（幂等；返回应用条数）
+  Future<int> _applyIcsSnapshot(String icsText) async {
+    final parsed = parseIcs(icsText);
+    if (parsed.events.isEmpty) return 0;
+    final ledger =
+        CalendarEventLedger(StorageService.loadCalendarEventLedger());
+    final decided = <IcsEvent>[];
+    for (final e in parsed.events) {
+      if (ledger.decideFor(e) == LedgerDecision.apply) {
+        decided.add(e);
+        ledger.recordApplied(e);
+      }
+    }
+    if (decided.isEmpty) return 0;
+    const batchSize = 50;
+    for (var i = 0; i < decided.length; i += batchSize) {
+      final chunk = decided.sublist(i,
+          (i + batchSize) < decided.length ? i + batchSize : decided.length);
+      await gateway.upsertEvents(chunk.map(_eventToNativeMap).toList());
+    }
+    await StorageService.saveCalendarEventLedger(ledger.entries);
+    return decided.length;
+  }
+
+  /// 启动同步循环（幂等）：IMAP 邮件会话（90s 兜底）+ WebDAV 快路轮询器（8s/30s 分档）
   void start() {
     if (_running) return;
     _running = true;
     _stopRequested = false;
     _loop = _runLoop();
+    _startWebdavPoller();
   }
 
   /// 停止（关连接、唤醒等待）
   Future<void> stop() async {
     _stopRequested = true;
     _running = false;
+    _stopWebdavPoller();
     _mode = 'off';
     _setStatus(mode: 'off');
     try {
@@ -361,9 +701,24 @@ class CalendarSyncService {
     while (!_stopRequested) {
       try {
         final settings = settingsProvider();
-        if (!settings.calendarSyncEnabled ||
-            settings.mailAccount.trim().isEmpty ||
-            settings.mailAuthCode.trim().isEmpty) {
+        final mailReady = settings.mailAccount.trim().isNotEmpty &&
+            settings.mailAuthCode.trim().isNotEmpty;
+        final webdavReady = webdavBaseFromSettings(
+                settings.webdavUser, settings.webdavPass, settings.webdavFolder) !=
+            null;
+        if (!settings.calendarSyncEnabled) {
+          _mode = 'off';
+          _setStatus(mode: 'off');
+          if (await _sleep(const Duration(seconds: 60))) return;
+          continue;
+        }
+        if (!mailReady) {
+          // WO-84：WebDAV-only 模式——IMAP 会话让位，快路轮询器独立承载（mode=webdav）
+          if (webdavReady) {
+            _mode = 'webdav';
+            if (await _sleep(const Duration(seconds: 30))) return;
+            continue;
+          }
           _mode = 'off';
           _setStatus(mode: 'off');
           if (await _sleep(const Duration(seconds: 60))) return;
@@ -373,7 +728,7 @@ class CalendarSyncService {
         // 会话正常退出（stop）即返回
         if (_stopRequested) return;
       } on ImapClosedException catch (e) {
-        // WO-78-R3 ②：连接断开（BYE/FIN/NOOP 超时暴露的死连）≠ 持久性失败——
+        // WO-78-R3 ②/WO-82-R3：连接断开（BYE/FIN/DONE 无响应暴露的死连）≠ 持久性失败——
         // 立即重建会话（连接即做一次增量同步），不吃 60s 退避（旧路径白等）。
         // 防打爆护栏：连续重建 >3 次（flapping 网络）→ 30s 冷却；
         // 成功同步会把 _consecutiveFailures 清零 → 顺带解除冷却。
@@ -430,6 +785,7 @@ class CalendarSyncService {
       };
     }
     _currentSource = source;
+    _emptySearchStreak = 0; // 失智计数随新会话清零
     // 通道健康探测：未激活（如开机自启、App 尚未打开过）只记录不自断——
     // 打开 App 一次保存设置后服务热重启即挂载通道（自愈路径）
     try {
@@ -462,7 +818,7 @@ class CalendarSyncService {
       _mode = 'idle';
       await _setStatus(mode: 'idle', result: 'ok');
 
-      // IDLE 长连接循环
+      // IDLE 长连接循环（WO-82-R3 纯长持：推送主路径 + 90s 兜底，全程 G3 时序）
       while (!_stopRequested) {
         final accepted = await source.startIdle();
         if (!accepted) {
@@ -475,27 +831,30 @@ class CalendarSyncService {
           await _setStatus(mode: 'poll', result: 'ok');
           continue;
         }
-        final event =
-            await source.waitForEvent(beat: idleBeat, noopBeat: idleNoopBeat);
+        // 🔴 G3 时序铁律（WO-82-R3）：waitForEvent 的两种返回——EXISTS 推送
+        // （n>0）与 90s 兜底节拍（null）——都【保持 IDLE 挂载态】。发任何命令
+        // 前必须先 stopIdle（②DONE → ③等 tag OK IDLE completed），之后才允许
+        // ④SELECT/UID SEARCH/FETCH，循环顶部 ⑤重发 IDLE。挂载态直接发命令 =
+        // 协议违规 → BAD 断连（WO-82 实证「连接每拍被服务端关闭」的真因）。
+        // WO-84：邮件通道降为 90s 兜底节拍（WebDAV 快路承载 8s/30s 感知）
+        final event = await source.waitForEvent(beat: mailFallbackBeat);
         if (_stopRequested) return;
-        if (event != null && event > 0) {
-          // EXISTS 感知（IDLE 推送 / NOOP 夹带）：秒级增量
-          debugPrint('[WO69] 唤醒 EXISTS=$event，开始秒级增量');
-          await source.stopIdle();
-          lastUid = await _syncIncrement(source, lastUid,
-              uidValidity: uidValidity,
-              trigger: source.lastWakeReason ?? '未知来源');
-          await _setStatus(mode: 'idle', result: 'ok');
-          continue;
+        final pushed = event != null && event > 0;
+        // ②③ DONE → tag OK（死连在此暴露为 ImapClosedException → 即时重建）
+        await source.stopIdle();
+        if (pushed) {
+          debugPrint('[WO69] 推送唤醒 EXISTS=$event → G3 序列拉取');
         }
-        // event == -1（NOOP 节拍哨兵）或 null：轻量 UID 水位线查件——
-        // 返工②诊断：QQ 的 EXISTS 与 UID 水位线不同轴，新件判据一律走水位线。
-        // 空扫（无新件）不做状态写盘（防 10s 节拍写放大）。
+        // ④ 查件（未挂载态，协议合法）：SELECT EXISTS 供 UID 序列重置防御 +
+        // UID 水位线增量（QQ 的 EXISTS 与 UID 水位线不同轴，新件判据走水位线）。
         final boxExists = await source.inboxExists().catchError((_) => null);
         lastUid = await _syncIncrement(source, lastUid,
-            uidValidity: uidValidity, trigger: 'NOOP查件',
-            lightIdle: true, boxExists: boxExists);
+            uidValidity: uidValidity,
+            trigger: source.lastWakeReason ?? (pushed ? 'IDLE推送' : '兜底查件'),
+            lightIdle: !pushed, // 兜底空扫不写状态盘（防节拍写放大）
+            boxExists: boxExists);
         await _setStatus(mode: 'idle', result: 'ok');
+        // ⑤ 循环顶部 startIdle 重挂
       }
     } finally {
       try {
@@ -508,8 +867,14 @@ class CalendarSyncService {
   /// 测试桥：单测直接驱动增量同步路径（生产零调用）
   @visibleForTesting
   Future<int> debugSyncIncrement(CalendarMailSource source, int lastUid,
-          {int? uidValidity}) =>
-      _syncIncrement(source, lastUid, uidValidity: uidValidity);
+          {int? uidValidity, String trigger = '启动', int? boxExists}) =>
+      _syncIncrement(source, lastUid,
+          uidValidity: uidValidity, trigger: trigger, boxExists: boxExists);
+
+  /// WO-82-R3 追加：缺口重扫间隔（测试可缩至毫秒级；生产 5s——QQ 索引滞后
+  /// 为秒级瞬态，两轮重扫覆盖 ~10s 窗口）
+  @visibleForTesting
+  Duration skipRetryDelay = const Duration(seconds: 5);
 
   /// 增量同步：粗筛→精筛→拉全文→提取 ICS→解析→幂等 upsert→推进水位线。
   /// 返回推进后的水位线（调用方保存）。[trigger]=拉取原因（拉取日志可观测）。
@@ -517,20 +882,107 @@ class CalendarSyncService {
       {int? uidValidity, String trigger = '启动', bool lightIdle = false,
       int? boxExists}) async {
     final sw = Stopwatch()..start();
-    var (:mails, maxSeenUid: maxSeen) = await source.fetchNewSince(lastUid);
+    var scan = await source.fetchNewSince(lastUid);
+    var mails = scan.mails;
+    var maxSeen = scan.maxSeenUid;
+    var candidates = scan.candidates;
     // WO-78-R3 返工③：QQ UID 序列重置防御——实测 QQ 在某时刻【静默重置 UID 序列】
     //（UIDVALIDITY 不变：违反 RFC 3501）：旧水位线(1238) 高于新序列最大 UID，
     // SEARCH UID n:* 永远空返回 → 水位线机制对该账号失效。防御：粗筛空返回
     // 且 boxExists < 水位线 → 判定序列重置 → 水位线回退到 boxExists 全量重扫
     //（幂等 upsert + 台账判重保证无害；新序列 minUID=1/maxUID=EXISTS 实测一致）。
+    // WO-78-R3 返工③ + WO-82-R3 v2（真机实证修正 19:46）：QQ UID 序列重置防御。
+    // 🔴 v2 修正：信箱带历史删除/移出（真机实证 EXISTS=1018 << 最大UID≈1290），
+    // 旧判据「boxExists < 水位线 ⇒ 序列重置」在带删信箱【恒真】→ 每拍误鸣且回退
+    // 重扫遇 SEARCH 瞬断（同刻 NAS 侧同命令返回正常——连接级瞬断）时把会话打进
+    // 降级循环。改为【验证后采纳】三态：
+    //  a) 回退重扫非空且 maxSeen < 回退前水位线 → 真重置（新序列低位且活着）→ 采纳；
+    //  b) 回退重扫非空且 maxSeen ≥ 回退前 → 序列健在 → 恢复原水位线（重扫件台账幂等）；
+    //  c) 回退重扫空返回（EXISTS 明言有信）→ SEARCH 瞬断（非重置）→ 恢复原水位线，
+    //     交下方缺口/空返回重扫自愈。
     if (mails.isEmpty && maxSeen == 0 && boxExists != null && boxExists < lastUid) {
+      final preRollback = lastUid;
+      final verifiedRecently = _rollbackVerifiedAt != null &&
+          DateTime.now().difference(_rollbackVerifiedAt!) <
+              const Duration(minutes: 10);
+      if (!verifiedRecently) {
+        // ignore: avoid_print
+        print('[WO78-R3] boxExists($boxExists) < 水位线($lastUid) → 回退验证重扫'
+            '（v2 三态：真重置/序列健在/SEARCH 瞬断）');
+        final retry = await source.fetchNewSince(boxExists);
+        _rollbackVerifiedAt = DateTime.now();
+        if (retry.mails.isNotEmpty || retry.maxSeenUid > 0) {
+          if (retry.maxSeenUid < preRollback) {
+            // a) 真重置
+            // ignore: avoid_print
+            print('[WO78-R3] 重置验证成立（新基线 max=${retry.maxSeenUid} < '
+                '$preRollback）→ 水位线回退至 $boxExists 全量重扫（幂等）');
+            mails = retry.mails;
+            maxSeen = retry.maxSeenUid;
+            candidates = retry.candidates;
+            lastUid = boxExists;
+          } else {
+            // b) 序列健在
+            // ignore: avoid_print
+            print('[WO78-R3] 序列健在（重扫 max=${retry.maxSeenUid} ≥ $preRollback）'
+                '→ 恢复水位线 $preRollback（重扫件台账幂等去重）');
+            mails = retry.mails;
+            maxSeen = retry.maxSeenUid;
+            candidates = retry.candidates;
+          }
+        } else {
+          // c) SEARCH 瞬断
+          // ignore: avoid_print
+          print('[WO82] 回退重扫空返回（EXISTS=$boxExists 明言有信）→ 判 SEARCH '
+              '瞬断，恢复水位线 $preRollback（交缺口重扫自愈）');
+        }
+      }
+      // verifiedRecently=true → 静默跳过（8s 拍常态路径零开销零日志）
+    }
+
+    // WO-82-R3 追加（12:12 跳信定案）：缺口检测 + 有界重扫。
+    // 机理实证：QQ UID SEARCH 静默漏件（1263 被漏，34s 后入箱的 1264 反而在列）
+    // + 「空扫推进 maxSeen」语义 = 漏件被永久焊死（幽灵事件 5 天）。防御指纹：
+    // 候选集相对 (水位线, 最大候选] 存在缺口（SEARCH 漏件），或推送触发却
+    // 「零新件」（服务端刚说有新件而扫描一无所见）。
+    // 🔴 WO-82 终裁（8s 拍配套）：candidates.isEmpty 不再是通用怀疑指纹——
+    // 水位线==服务器 max 是常态空闲态，QQ 按怪癖回空，8s 拍下每拍空烧 2×5s
+    // 重试不可接受；空扫怀疑保留给推送触发（有 EXISTS 证据才值得重扫）。
+    // 命中 → 5s×2 重扫（QQ 索引滞后为秒级瞬态）；仍缺口 → 水位线照常推进
+    // （防卡死、防重扫风暴）+ [WO82] 疑似跳信行 + 状态标记（即刻可见）。
+    var holes = uidHoles(lastUid, candidates);
+    bool suspicious() =>
+        holes.isNotEmpty ||
+        (trigger == 'IDLE推送' && mails.isEmpty && maxSeen <= lastUid);
+    for (var attempt = 0; suspicious() && attempt < 2; attempt++) {
+      await Future<void>.delayed(skipRetryDelay);
+      scan = await source.fetchNewSince(lastUid);
+      mails = scan.mails;
+      maxSeen = scan.maxSeenUid;
+      candidates = scan.candidates;
+      holes = uidHoles(lastUid, candidates);
+    }
+
+    // WO-82-R3：空返回连击守卫（纯长持配套）。长持下连接不再周期重建——若某
+    // 连接的 SEARCH 持续空返回将永久聋化。连续 3 次空返回且 EXISTS 明言有信
+    // → 判连接失智，转断连语义强制重建会话。
+    if (candidates.isEmpty) {
+      _emptySearchStreak++;
+      if (boxExists != null && boxExists > 0 && _emptySearchStreak >= 3) {
+        final streak = _emptySearchStreak;
+        _emptySearchStreak = 0;
+        throw ImapClosedException('连续 $streak 次 SEARCH 空返回且 '
+            'EXISTS=$boxExists 明言有信（连接失智）→ 重建会话');
+      }
+    } else {
+      _emptySearchStreak = 0;
+    }
+    if (holes.isNotEmpty) {
       // ignore: avoid_print
-      print('[WO78-R3] 检测到 UID 序列重置（水位线=$lastUid > boxExists=$boxExists）'
-          '→ 水位线回退至 $boxExists 全量重扫（幂等）');
-      final retry = await source.fetchNewSince(boxExists);
-      mails = retry.mails;
-      maxSeen = retry.maxSeenUid;
-      lastUid = boxExists;
+      print('[WO82] 疑似跳信（缺口 UID=${holes.take(5).join(',')}'
+          '${holes.length > 5 ? ' 等${holes.length}个' : ''}）→ 重扫后仍缺口，'
+          '水位线照常推进至 $maxSeen（已记观测标记，请 NAS 侧对账）');
+      await _recordSkipSuspect(holes, maxSeen);
     }
     // WO-78-R3：观测行必须进 logcat（debugPrint 有节流丢弃；print 为 WO-70 同款先例）
     // ignore: avoid_print
@@ -563,17 +1015,18 @@ class CalendarSyncService {
     final errors = <String>[];
 
     for (final mail in mails) {
-      // WO-78：端到端推送延迟（邮件 Date 头 → 入库），验收口径「推送 X 秒到达」
+      // WO-78/WO-82-R3-G4：端到端推送延迟（邮件 Date 头=NAS 发出时刻 → 入库侧
+      // 到达），验收「推送行 ≤5s」的回测硬证据行（logcat 时间戳可对表）
       final mailDate = parseRfc5322Date(mail.raw);
       if (mailDate != null) {
         final sec = DateTime.now().difference(mailDate).inSeconds;
         // ignore: avoid_print
-        print('[WO78] 推送 $sec 秒到达（触发=$trigger，UID=${mail.uid}）');
+        print('[WO78] 推送到达（延迟 ${sec}s）→ 拉取（触发=$trigger，UID=${mail.uid}）');
       }
-      final icsText = extractIcsFromMail(mail.raw);
+      final icsText = extractIcsFromMailDual(mail.raw);
       if (icsText == null) {
         badCount++;
-        errors.add('UID ${mail.uid}: 附件提取失败（结构超契约）');
+        errors.add('UID ${mail.uid}: 日历正文/附件提取失败（结构超契约）');
         handledUid = mail.uid; // 坏件越过：重试无益，记错不阻塞
         continue;
       }
@@ -783,6 +1236,21 @@ class CalendarSyncService {
       lastError: error,
       mode: _mode,
     ));
+  }
+
+  /// WO-82-R3 追加：疑似跳信观测标记（缺口 UID + 推进位置）——写入同步状态
+  /// 供设置页/对账即刻可见（12:12 事故的幽灵曾 5 天不可见）。失败静默（观测
+  /// 面不阻断主流程；logcat 行已另行打出）。
+  Future<void> _recordSkipSuspect(List<int> holes, int advancedTo) async {
+    try {
+      final st = _lastKnownState;
+      st['lastSuspectedSkip'] = {
+        'at': DateTime.now().toIso8601String(),
+        'uids': holes.take(20).toList(),
+        'advancedTo': advancedTo,
+      };
+      await StorageService.saveCalendarSyncState(st);
+    } catch (_) {}
   }
 
   /// 错误消息消毒：剥离可能内嵌凭据的异常形态（红线：凭据零外泄）

@@ -20,6 +20,7 @@ class StorageService {
   static const FlutterSecureStorage _secure = FlutterSecureStorage();
   static String _mailAuthCode = '';
   static String _mailCryptKey = '';
+  static String _webdavPass = '';
 
   /// 测试辅助：清空静态缓存（WO-69 单测隔离用；生产代码严禁调用）
   @visibleForTesting
@@ -27,6 +28,7 @@ class StorageService {
     _prefs = null;
     _mailAuthCode = '';
     _mailCryptKey = '';
+    _webdavPass = '';
   }
 
   static Future<void> init() async {
@@ -34,11 +36,13 @@ class StorageService {
     try {
       _mailAuthCode = await _secure.read(key: AppConstants.secKeyMailAuthCode) ?? '';
       _mailCryptKey = await _secure.read(key: AppConstants.secKeyMailCryptKey) ?? '';
+      _webdavPass = await _secure.read(key: AppConstants.secKeyWebdavPass) ?? '';
     } catch (_) {
       // 安全存储不可用（极旧机型/未初始化）时保持空串：mail 模式会被发送前置校验拦下并提示，
       // 绝不静默降级为明文存储。
       _mailAuthCode = '';
       _mailCryptKey = '';
+      _webdavPass = '';
     }
   }
 
@@ -98,6 +102,9 @@ class StorageService {
       placeLabels: placeLabels,
       calendarSyncEnabled:
           p.getBool(AppConstants.keyCalendarSyncEnabled) ?? false,
+      webdavUser: p.getString(AppConstants.keyWebdavUser) ?? '',
+      webdavPass: _webdavPass,
+      webdavFolder: p.getString(AppConstants.keyWebdavFolder) ?? '',
     );
   }
 
@@ -115,6 +122,9 @@ class StorageService {
     String? mailSubjectPrefix,
     String? mailAuthCode,
     String? mailCryptKey,
+    String? webdavUser,
+    String? webdavFolder,
+    String? webdavPass,
   }) async {
     final p = prefs;
     await p.setString(AppConstants.keyRelayUrl, relayUrl.trim());
@@ -140,6 +150,17 @@ class StorageService {
     if (mailCryptKey != null) {
       _mailCryptKey = mailCryptKey.trim();
       await _secure.write(key: AppConstants.secKeyMailCryptKey, value: _mailCryptKey);
+    }
+    // WO-84：坚果云凭据（应用密码走安全存储，null=不修改；账号/文件夹非敏感走 prefs）
+    if (webdavUser != null) {
+      await p.setString(AppConstants.keyWebdavUser, webdavUser.trim());
+    }
+    if (webdavFolder != null) {
+      await p.setString(AppConstants.keyWebdavFolder, webdavFolder.trim());
+    }
+    if (webdavPass != null) {
+      _webdavPass = webdavPass.trim();
+      await _secure.write(key: AppConstants.secKeyWebdavPass, value: _webdavPass);
     }
   }
 

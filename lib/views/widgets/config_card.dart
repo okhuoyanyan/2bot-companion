@@ -29,6 +29,11 @@ class ConfigFormValues {
   final Map<String, bool> eventSwitches;
   final bool calendarSyncEnabled;
 
+  /// WO-84 WebDAV 优先快路（坚果云）；应用密码留空 = 保持既有凭据不变
+  final String webdavUser;
+  final String webdavFolder;
+  final String webdavPass;
+
   const ConfigFormValues({
     required this.relayUrl,
     required this.deviceToken,
@@ -43,6 +48,9 @@ class ConfigFormValues {
     required this.silenceTimeoutHours,
     required this.eventSwitches,
     required this.calendarSyncEnabled,
+    required this.webdavUser,
+    required this.webdavFolder,
+    required this.webdavPass,
   });
 }
 
@@ -67,6 +75,9 @@ class _ConfigCardState extends State<ConfigCard> {
   late final TextEditingController _mailAccountController;
   late final TextEditingController _mailRecipientController;
   late final TextEditingController _mailAuthCodeController;
+  late final TextEditingController _webdavUserController;
+  late final TextEditingController _webdavPassController;
+  late final TextEditingController _webdavFolderController;
   late final TextEditingController _mailKeyController;
   late final TextEditingController _subjectPrefixController;
   late final TextEditingController _silenceHoursController;
@@ -99,6 +110,9 @@ class _ConfigCardState extends State<ConfigCard> {
     _mailAccountController = TextEditingController(text: s.mailAccount);
     _mailRecipientController = TextEditingController(text: s.mailRecipient);
     _mailAuthCodeController = TextEditingController(text: s.mailAuthCode);
+    _webdavUserController = TextEditingController(text: s.webdavUser);
+    _webdavPassController = TextEditingController(text: s.webdavPass);
+    _webdavFolderController = TextEditingController(text: s.webdavFolder);
     _mailKeyController = TextEditingController(text: s.mailCryptKey);
     _subjectPrefixController = TextEditingController(text: s.mailSubjectPrefix);
     _silenceHoursController =
@@ -118,6 +132,9 @@ class _ConfigCardState extends State<ConfigCard> {
     _mailAccountController.dispose();
     _mailRecipientController.dispose();
     _mailAuthCodeController.dispose();
+    _webdavUserController.dispose();
+    _webdavPassController.dispose();
+    _webdavFolderController.dispose();
     _mailKeyController.dispose();
     _subjectPrefixController.dispose();
     _silenceHoursController.dispose();
@@ -197,6 +214,10 @@ class _ConfigCardState extends State<ConfigCard> {
       silenceTimeoutHours: silenceHours,
       eventSwitches: _eventSwitches,
       calendarSyncEnabled: _calendarSyncEnabled,
+      // WO-84：应用密码留空 = 保持既有凭据不变（安全存储不回显）
+      webdavUser: _webdavUserController.text.trim(),
+      webdavFolder: _webdavFolderController.text.trim(),
+      webdavPass: _webdavPassController.text,
     ));
   }
 
@@ -713,6 +734,47 @@ class _ConfigCardState extends State<ConfigCard> {
               },
             ),
             _buildIcsSubscription(),
+            const SizedBox(height: 12),
+            // WO-84：坚果云 WebDAV 快路凭据（空=禁用；应用密码走安全存储不入日志）
+            TextField(
+              controller: _webdavUserController,
+              keyboardType: TextInputType.emailAddress,
+              style: const TextStyle(
+                  fontSize: 13, color: AppTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: '坚果云账号 (WO-84 WebDAV 快路)',
+                hintText: '坚果云登录邮箱',
+                prefixIcon: Icon(Icons.cloud_outlined,
+                    size: 20, color: AppTheme.secondarySky),
+              ),
+            ),
+            TextField(
+              controller: _webdavPassController,
+              obscureText: true,
+              style: const TextStyle(
+                  fontSize: 13, color: AppTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: '坚果云应用密码',
+                hintText: '留空 = 保持已存密码不变',
+                helperText: '「应用密码」非登录密码（坚果云账户设置生成）；仅存安全存储，不入日志',
+                prefixIcon: Icon(Icons.key_outlined,
+                    size: 20, color: AppTheme.secondarySky),
+              ),
+            ),
+            TextField(
+              controller: _webdavFolderController,
+              style: const TextStyle(
+                  fontSize: 13,
+                  fontFamily: 'monospace',
+                  color: AppTheme.textPrimary),
+              decoration: const InputDecoration(
+                labelText: '坚果云文件夹',
+                hintText: '2bot-cal',
+                helperText: '三项齐备=启用快路（前台 8s/后台 30s），空=禁用；也支持完整 URL',
+                prefixIcon: Icon(Icons.folder_outlined,
+                    size: 20, color: AppTheme.secondarySky),
+              ),
+            ),
             _buildTelemetryAttempts(),
             const SizedBox(height: 20),
 

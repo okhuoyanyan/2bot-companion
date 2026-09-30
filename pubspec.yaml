@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.2+27  # WO-78-R3 返工③：QQ UID 序列静默重置防御（SEARCH 空返回→水位线回退重扫）+ 保活节拍终版（零NOOP）
+version: 1.6.2+30  # WO-84: WebDAV优先快路(坚果云ctag明文GET比对,变化才全量GET)+邮件降90s兜底+频控熔断60/120s+前后台8s/30s分档
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

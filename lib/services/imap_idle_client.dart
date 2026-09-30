@@ -20,8 +20,9 @@ import '../utils/constants.dart';
 ///
 /// IDLE 实测结论（WO-69 开工首验 2026-09-26，真机真邮箱）：
 ///  - SMTP 投递（MTA 入信）→ IDLE 推 `* n EXISTS` 约 1.2 秒（主路径成立）；
-///  - 单次 IDLE 30.0 分钟被服务端断开（= RFC 2177 的 29 分钟重发纪律上限）→
-///    调用方须按 ≤29 分钟周期 DONE+重发 IDLE（25 分钟节拍由上层编排）。
+///  - 单次 IDLE 30.0 分钟被服务端断开（= RFC 2177 的 29 分钟重发纪律上限）。
+/// WO-82-R3 终版形态：纯长持 IDLE（挂载期零命令打断，推送秒级直达）+
+/// 90s 兜底节拍（上层 DONE→查件→重挂，远低于 30min 强断线，25min 重发纪律自然满足）。
 /// 连接/会话参数（凭据来自 flutter_secure_storage 缓存，不落明文）
 class ImapConfig {
   final String account;
@@ -219,23 +220,27 @@ int? parseExistsCount(String head) {
   return int.tryParse(m.group(1)!);
 }
 
-/// SEARCH 响应解析 → UID 列表
+/// SEARCH 响应解析 → UID 列表。
+/// WO-82-R3 取证修正：取【最后一条】`* SEARCH` 行（最新响应优先）——共享
+/// `_scratch` 会残留上一轮的裸 `* SEARCH`（QQ 空结果集的标准形态），先到先得
+/// 会让下一轮的真实结果被陈旧空行遮蔽（20:18/20:26 两度真机实证）。
 List<int> parseSearchUids(List<ImapUnit> units) {
+  final pattern = RegExp(r'^\*\s+SEARCH\b(.*)$', caseSensitive: false);
+  String? best;
   for (final u in units) {
-    final m = RegExp(r'^\*\s+SEARCH\b(.*)$', caseSensitive: false)
-        .firstMatch(u.head);
+    final m = pattern.firstMatch(u.head);
     if (m != null) {
-      return m
-          .group(1)!
-          .trim()
-          .split(RegExp(r'\s+'))
-          .where((s) => s.isNotEmpty)
-          .map((s) => int.tryParse(s) ?? 0)
-          .where((n) => n > 0)
-          .toList();
+      best = m.group(1); // 后者覆盖前者 = 最新响应优先
     }
   }
-  return [];
+  if (best == null) return [];
+  return best
+      .trim()
+      .split(RegExp(r'\s+'))
+      .where((s) => s.isNotEmpty)
+      .map((s) => int.tryParse(s) ?? 0)
+      .where((n) => n > 0)
+      .toList();
 }
 
 /// IMAP 字符串转义（LOGIN 参数用；与 NAS 侧 escapeImapString 同语义）
@@ -298,8 +303,12 @@ class ImapIdleClient {
   String _cmdName = '';
   bool _firstResponseLogged = false;
 
+  /// WO-82-R3：命令级日志同步路由 logcat（[WO78-IMAP] 前缀）——90s 长持节拍下
+  /// 量能可控（12×低于 10s 拍时代），SEARCH 空返回取证需要线上报文级真相。
   void _log(String s) {
     onCommandLog?.call(s);
+    // ignore: avoid_print
+    print('[WO78-IMAP] $s');
   }
 
   /// WO-71 ④：socket 工厂注入（录制回放测试用；生产 = SecureSocket 直连）
@@ -345,7 +354,7 @@ class ImapIdleClient {
   void Function(String line)? onLifecycleLog;
   DateTime? _idleMountedAt;
 
-  /// WO-78-R3 返工：最近一次唤醒原因（'IDLE推送' / 'NOOP夹带' / 'NOOP查件'）——
+  /// WO-82-R3：最近一次唤醒原因（'IDLE推送' / '兜底查件'）——
   /// 上层作为拉取日志的触发原因（归因可观测）
   String lastWakeReason = '';
 
@@ -512,7 +521,7 @@ class ImapIdleClient {
     if (cont.isContinuation) {
       _idleTag = tag;
       _idleMountedAt = DateTime.now();
-      _life(_reAttach ? 'IDLE 重挂（NOOP 节拍循环）' : 'IDLE 挂载');
+      _life(_reAttach ? 'IDLE 重挂（兜底节拍循环）' : 'IDLE 挂载');
       _reAttach = true;
       return true;
     }
@@ -526,72 +535,59 @@ class ImapIdleClient {
   /// WO-71 整改 A：UID FETCH 分批上限（单行命令 ≤~2KB，远低于 QQ 丢弃阈值）
   static const int fetchBatchSize = 50;
 
-  /// IDLE 等待。返回 EXISTS 通知里的消息数；节拍到点（应 DONE+重发）返回 null；
+  /// WO-82-R3 追加：小批全文化上限——fresh 候选 ≤ 此数时跳过头粗筛、一次
+  /// 全文拉取按原文判定（12:12 跳信同族「HEADER FETCH 漏单封」向量防御）。
+  /// 超过则保留头粗筛刷屏护栏。日常节拍新件 1-2 封，恒走全文化。
+  static const int smallBatchFullFetchLimit = 10;
+
+  /// WO-82-R3 纯长持 IDLE 等待（G3 时序铁律的客户端半场）。
+  ///
+  /// 【返回值语义——两种返回都保持 IDLE 挂载态，调用方在发任何命令前必须先
+  /// stopIdle()（DONE → 等待 `tag OK IDLE completed`）】：
+  ///  - `n > 0`：收到 `* n EXISTS` 服务端推送。调用方必须走 G3 完整序列：
+  ///    ②stopIdle（DONE→tag OK）→ ④UID SEARCH/FETCH 拉取 → ⑤重发 IDLE。
+  ///    🔴 严禁挂载态直接 UID SEARCH/FETCH / SELECT——QQ 回 BAD 并断连
+  ///    （WO-82 实证「连接每拍被服务端关闭」的真因即旧版挂载态发 SELECT/SEARCH）；
+  ///  - `null`：兜底节拍（90s，管理员裁决 2026-09-30：替代 10s 高频拍，对齐
+  ///    遥测通道多日已证节奏并降低认证频率风险）到点。调用方同样先 stopIdle
+  ///    再做 UID 水位线查件，然后重发 IDLE。
   /// 服务端断开/BYE 抛 [ImapClosedException]。
-  /// WO-78 缺陷②：[noopBeat]（默认 60s）到点即 DONE→NOOP→重发 IDLE——
-  /// ①静默死连（NAT 掉线/无线休眠，无 FIN）最坏聋到 25 分钟节拍，现在
-  ///   ≤ noopBeat+10s 即被 NOOP 超时暴露；②NOOP 响应夹带积压 EXISTS 顺路带回。
-  /// 零生命周期语义变化：上层循环不变。
-  Future<int?> waitForEvent(
-      {required Duration beat,
-      Duration noopBeat = const Duration(seconds: 60)}) async {
+  /// 挂载期间本方法【零命令写出】（不发 NOOP、不发 DONE）——推送主路径不被打断；
+  /// 死连检测移交调用方的 stopIdle（超时=死连 → ImapClosedException → 即时重建）。
+  Future<int?> waitForEvent({required Duration beat}) async {
     var deadline = DateTime.now().add(beat);
-    var nextNoopAt = DateTime.now().add(noopBeat);
     while (true) {
-      final now = DateTime.now();
-      if (now.isAfter(nextNoopAt)) {
-        // —— 保活节拍（WO-78-R3 返工最终形态）：DONE → 直接重发 IDLE → 哨兵 -1 ——
-        // 实测归因：①QQ 对本连接的 IDLE 不推 EXISTS（静默期零推送行）；
-        // ②QQ 对「IDLE 后发 NOOP」一律立即断连（每次 NOOP 后 服务端关闭连接）。
-        // 故不发 NOOP：DONE→重发 IDLE 是 RFC 2177 标准循环；重挂成功即证明连接
-        // 存活并返回哨兵 -1（上层走 UID 水位线查件）；重挂失败/超时=死连，
-        // 转 ImapClosedException 由上层即时重建（连接即查件）。
-        _life('保活节拍到点（${noopBeat.inSeconds}s）：DONE → 重发 IDLE');
-        await stopIdle();
-        bool accepted;
-        try {
-          accepted = await startIdle();
-        } on TimeoutException {
-          throw ImapClosedException('重发 IDLE 超时（死连）');
-        }
-        if (!accepted) {
-          _life('重发 IDLE 被拒 → 重建会话');
-          throw ImapClosedException('重发 IDLE 被拒（tagged NO/BAD）');
-        }
-        nextNoopAt = DateTime.now().add(noopBeat);
-        deadline = DateTime.now().add(beat); // 重发即重置 25 分钟纪律窗口
-        lastWakeReason = 'NOOP查件';
-        return -1; // 哨兵：节拍到点，上层做轻量 UID 水位线查件
-      }
-      final remain = deadline.difference(now);
-      if (remain <= Duration.zero) return null;
-      try {
-        if (_assembler.hasUnits) {
-          for (final u in _assembler.takeUnits()) {
-            final n = parseExistsCount(u.head);
-            if (n != null) {
-              final since = _idleMountedAt == null
-                  ? '?'
-                  : DateTime.now()
-                      .difference(_idleMountedAt!)
-                      .inSeconds
-                      .toString();
-              lastWakeReason = 'IDLE推送';
-              _life('IDLE 推送 EXISTS=$n（挂载后 ${since}s）→ 立即增量');
-              return n;
-            }
-            if (u.isContinuation) continue;
-            if (u.head.toUpperCase().contains('* BYE')) {
-              throw ImapClosedException('IDLE 期间服务端 BYE');
-            }
-            // 其它 untagged（EXPUNGE/RECENT 等）忽略
+      if (_assembler.hasUnits) {
+        for (final u in _assembler.takeUnits()) {
+          final n = parseExistsCount(u.head);
+          if (n != null) {
+            final since = _idleMountedAt == null
+                ? '?'
+                : DateTime.now()
+                    .difference(_idleMountedAt!)
+                    .inSeconds
+                    .toString();
+            lastWakeReason = 'IDLE推送';
+            _life('IDLE 推送 EXISTS=$n（挂载后 ${since}s）→ DONE→拉取（G3）');
+            return n;
           }
-          continue;
+          if (u.isContinuation) continue;
+          if (u.head.toUpperCase().contains('* BYE')) {
+            throw ImapClosedException('IDLE 期间服务端 BYE');
+          }
+          // 其它 untagged（RECENT/EXPUNGE 等）忽略
         }
-        final untilNoop = nextNoopAt.difference(DateTime.now());
-        final wait = untilNoop < remain ? untilNoop : remain;
-        await _waitForData(wait < const Duration(seconds: 1)
-            ? wait
+        continue;
+      }
+      final remain = deadline.difference(DateTime.now());
+      if (remain <= Duration.zero) {
+        // 兜底节拍到点：挂载态原样返回（DONE 由调用方统一发起——G3 时序单点化）
+        lastWakeReason = '兜底查件';
+        return null;
+      }
+      try {
+        await _waitForData(remain < const Duration(seconds: 1)
+            ? remain
             : const Duration(seconds: 1));
       } on TimeoutException {
         continue; // 1 秒轮询超时不是节拍超时
@@ -599,44 +595,26 @@ class ImapIdleClient {
     }
   }
 
-  /// 结束 IDLE（DONE）
+  /// 结束 IDLE（DONE → 等待 `tag OK IDLE completed`）——G3 第②③步。
+  /// WO-82-R3 死连语义：DONE 无响应（超时）或被拒（tagged NO/BAD）一律抛
+  /// [ImapClosedException] → 上层即时重建会话（连接即查件），不吃通用退避。
   Future<void> stopIdle({Duration timeout = const Duration(seconds: 10)}) async {
     final tag = _idleTag;
     if (tag == null) return;
     _idleTag = null;
     _send('DONE');
-    final resp = await _readUnit(
-      timeout: timeout,
-      test: (u) => u.tag == tag,
-    );
-    if (resp.status != 'OK') {
-      throw ImapCommandException('IDLE-DONE', resp.status ?? 'NO');
+    final ImapUnit resp;
+    try {
+      resp = await _readUnit(
+        timeout: timeout,
+        test: (u) => u.tag == tag,
+      );
+    } on TimeoutException {
+      throw ImapClosedException('DONE 无响应（死连，${timeout.inSeconds}s）');
     }
-  }
-
-  /// WO-78 缺陷②：NOOP 保活探针（必须在 IDLE 之外发送——RFC 2177 期间只许 DONE）。
-  /// 返回 NOOP 响应里夹带的 EXISTS 数（有→调用方立即增量）；死连接（写缓冲成功
-  /// 而响应不到）→ 10s 超时抛出 → 上层重建会话。聋态窗口从最坏 25 分钟压到
-  /// ≤ noopBeat+10s。
-  Future<int?> noop({Duration timeout = const Duration(seconds: 10)}) async {
-    final tag = _nextTag();
-    _cmdStart ??= DateTime.now();
-    _cmdName = 'NOOP';
-    _life('NOOP 探针发出（兜底感知）');
-    _send('$tag NOOP');
-    int? exists;
-    final resp = await _readUnit(
-      timeout: timeout,
-      test: (u) => u.tag == tag,
-      collect: (u) {
-        final n = parseExistsCount(u.head);
-        if (n != null) exists = n;
-      },
-    );
     if (resp.status != 'OK') {
-      throw ImapCommandException('NOOP', resp.status ?? 'NO');
+      throw ImapClosedException('IDLE-DONE 被拒（tagged ${resp.status ?? 'NO'}）');
     }
-    return exists;
   }
 
   /// WO-78-R3 返工③：SELECT INBOX 读取当前 EXISTS（UID 序列重置防御用）。
@@ -661,14 +639,20 @@ class ImapIdleClient {
   }
 
   /// 增量拉取水位线之后的日历邮件。
-  /// 返回：[mails]（UID 升序、仅前缀命中）与 [maxSeenUid]（本轮粗筛所见最大 UID——
-  /// **空扫也要返回**，上层据此推进水位线，与 NAS 同口径）。
-  Future<({List<CalendarMail> mails, int maxSeenUid})> fetchNewSince(
+  /// 返回：[mails]（UID 升序、仅日历命中）、[maxSeenUid]（本轮所见最大 UID——
+  /// **空扫也要返回**，上层据此推进水位线，与 NAS 同口径）与 [candidates]
+  /// （SEARCH 原始候选全集——上层做缺口检测，防御 QQ SEARCH 静默漏件，
+  /// WO-82-R3 追加 12:12 跳信定案）。
+  Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
+      fetchNewSince(
     int lastProcessedUid, {
     Duration timeout = const Duration(seconds: 15),
   }) async {
     // RFC 3501 怪癖：UID n:* 在 n 大于最大 UID 时返回最大 UID 那封——
     // 结果必须再按 `uid > lastProcessedUid` 过滤（NAS 侧同款处理）。
+    // WO-82-R3：SEARCH 前清空共享 _scratch——上一轮残留的裸 `* SEARCH`（QQ
+    // 空结果集形态）/SELECT 杂项会遮蔽本轮解析（20:18/20:26 真机实证）。
+    _scratch.clear();
     final searchTag = _nextTag();
     _send('$searchTag UID SEARCH UID ${lastProcessedUid + 1}:*');
     final searchResp = await _readUnit(
@@ -680,11 +664,62 @@ class ImapIdleClient {
       throw ImapCommandException('UID SEARCH', searchResp.status ?? 'NO');
     }
     final candidates = parseSearchUids(_scratch);
+    // WO-82-R3：SEARCH 响应观测（候选数 + scratch 单元面——空返回/漏件取证锚点）
+    _log('IMAP .. SEARCH 解析：候选=${candidates.length}，'
+        'scratch=${_scratch.length}单元，scratch尾=${_scratch.isEmpty ? '-' : _scratch.last.head.length > 50 ? _scratch.last.head.substring(0, 50) : _scratch.last.head}');
     final fresh = candidates.where((u) => u > lastProcessedUid).toList()..sort();
     final maxSeenUid =
         candidates.isEmpty ? 0 : candidates.reduce((a, b) => a > b ? a : b);
     if (fresh.isEmpty) {
-      return (mails: const <CalendarMail>[], maxSeenUid: maxSeenUid);
+      return (
+        mails: const <CalendarMail>[],
+        maxSeenUid: maxSeenUid,
+        candidates: candidates
+      );
+    }
+
+    // WO-82-R3 追加（12:12 跳信定案）：小批全文化——≤[smallBatchFullFetchLimit]
+    // 封时【跳过 SUBJECT 头粗筛】，一次 UID FETCH 全文、主题判定与正文解析
+    // 用同一份字节（杀掉「SEARCH 返回了、HEADER FETCH 响应漏掉单封」的遗漏
+    // 向量——12:12 同族第二形态）。>上限保留头粗筛（刷屏护栏，WO-71 分批纪律）。
+    if (fresh.length <= smallBatchFullFetchLimit) {
+      final mails = <CalendarMail>[];
+      final fullBatches = (fresh.length / fetchBatchSize).ceil();
+      for (var b = 0; b < fullBatches; b++) {
+        final batch = fresh.sublist(b * fetchBatchSize,
+            (b + 1) * fetchBatchSize < fresh.length
+                ? (b + 1) * fetchBatchSize
+                : fresh.length);
+        final fullTag = _nextTag();
+        _send('$fullTag UID FETCH ${batch.join(',')} (UID BODY.PEEK[])');
+        _log('IMAP .. FETCH FULL [小批全文化 ${b + 1}/$fullBatches, '
+            '${batch.length}条] 等待响应…');
+        await _readUnit(
+          timeout: timeout,
+          test: (u) => u.tag == fullTag,
+          collect: _scratch.add,
+        );
+        for (final u in _scratch) {
+          final parsed = parseFullFetchUnit(u);
+          if (parsed == null) continue;
+          // 原文内含完整头部——主题判定与正文同源（QQ 文本搜索键不可用的
+          // 替代精筛继续成立，但判定材料从「头拉取回显」升级为「全文原文」）
+          if (!subjectMatchesPrefix(parsed.raw, AppConstants.calSubjectPrefix)) {
+            continue; // 非日历件（TEL 遥测/人件等）：静默不 surfaced
+          }
+          mails.add(CalendarMail(
+            uid: parsed.uid,
+            subject: '',
+            raw: parsed.raw,
+          ));
+        }
+        _scratch.clear();
+        await Future<void>.delayed(Duration.zero);
+      }
+      mails.sort((a, b) => a.uid.compareTo(b.uid));
+      _log('IMAP == FETCH FULL 小批全文化完成：${fresh.length} 条中'
+          '前缀命中 ${mails.length} 条');
+      return (mails: mails, maxSeenUid: maxSeenUid, candidates: candidates);
     }
 
     // 客户端精筛：拉 SUBJECT 头（QQ 文本搜索键不可用的替代）。
@@ -724,7 +759,11 @@ class ImapIdleClient {
     final matched = matchedHeader..sort();
     _log('IMAP == FETCH HDR 完成：${fresh.length} 条中前缀命中 ${matched.length} 条');
     if (matched.isEmpty) {
-      return (mails: const <CalendarMail>[], maxSeenUid: maxSeenUid);
+      return (
+        mails: const <CalendarMail>[],
+        maxSeenUid: maxSeenUid,
+        candidates: candidates
+      );
     }
 
     // 全文拉取（仅前缀命中集合）——同样分批
@@ -757,7 +796,7 @@ class ImapIdleClient {
       await Future<void>.delayed(Duration.zero);
     }
     mails.sort((a, b) => a.uid.compareTo(b.uid));
-    return (mails: mails, maxSeenUid: maxSeenUid);
+    return (mails: mails, maxSeenUid: maxSeenUid, candidates: candidates);
   }
 
   /// 登出并关闭（尽力而为，绝不抛出）

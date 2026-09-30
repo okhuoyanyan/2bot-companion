@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/app_settings.dart';
+import '../utils/constants.dart';
 import '../models/device_telemetry.dart';
 import '../services/background_task_service.dart';
 import '../services/storage_service.dart';
@@ -73,6 +74,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _checkNotificationPermission();
       _checkServiceStatus();
     }
+    // WO-84 前后台分档桥：写 pref → FGS isolate 的 WebDAV 轮询器每拍读
+    //（前台 8s / 后台 FGS 30s）。paused/inactive/detached 一律按后台。
+    try {
+      final fg = state == AppLifecycleState.resumed;
+      StorageService.prefs.setBool(AppConstants.keyCalSyncForeground, fg);
+    } catch (_) {}
   }
 
   /// 初始化加载本地配置与状态
@@ -284,6 +291,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       mailSubjectPrefix: values.mailSubjectPrefix,
       mailAuthCode: values.mailAuthCode.isEmpty ? null : values.mailAuthCode,
       mailCryptKey: values.mailCryptKey.isEmpty ? null : values.mailCryptKey,
+      // WO-84：坚果云快路（应用密码留空 = 保持既有凭据不变）
+      webdavUser: values.webdavUser,
+      webdavFolder: values.webdavFolder,
+      webdavPass: values.webdavPass.isEmpty ? null : values.webdavPass,
     );
 
     await StorageService.saveThrottleAndEventConfig(
