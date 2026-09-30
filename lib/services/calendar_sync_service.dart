@@ -213,6 +213,44 @@ class MethodChannelCalendarGateway implements CalendarGateway {
   }
 }
 
+/// ============================================================================
+/// WO-84 WebDAV 优先快路（坚果云 ctag 明文比对）
+/// ============================================================================
+/// HTTP 429/503：限频 → 立即进入熔断退避（60s/120s），严禁 8s 死磕
+class WebdavRateLimitedException implements Exception {
+  final int statusCode;
+  WebdavRateLimitedException(this.statusCode);
+  @override
+  String toString() => 'WebDAV 限频（HTTP $statusCode）';
+}
+
+/// 其它非 2xx（404=文件夹未就绪/401=凭据错/5xx 等）：计入连续失败
+class WebdavUnreachableException implements Exception {
+  final int statusCode;
+  WebdavUnreachableException(this.statusCode);
+  @override
+  String toString() => 'WebDAV 不可达（HTTP $statusCode）';
+}
+
+/// WO-84：由三字段解析 WebDAV base（🔒 三字段全非空才启用快路；空=禁用）。
+/// folder 规则：完整 http(s) URL → 逐字使用（测试/迁移覆盖）；`dav/…` → 视为
+/// 已含 dav 根；其余 → 拼到坚果云 dav 根下。返回值恒以 `/` 结尾。
+@visibleForTesting
+String? webdavBaseFromSettings(String user, String pass, String folder) {
+  if (user.trim().isEmpty || pass.trim().isEmpty || folder.trim().isEmpty) {
+    return null;
+  }
+  final f = folder.trim();
+  if (f.startsWith('http://') || f.startsWith('https://')) {
+    return f.endsWith('/') ? f : '$f/';
+  }
+  const host = 'https://dav.jianguoyun.com';
+  final clean = f.replaceAll(RegExp(r'^/+|/+$'), '');
+  if (clean.isEmpty) return null;
+  if (clean == 'dav' || clean.startsWith('dav/')) return '$host/$clean/';
+  return '$host/dav/$clean/';
+}
+
 /// 邮件源抽象（生产 = QQ IMAP；测试 = 假实现）
 abstract class CalendarMailSource {
   /// 连接并 SELECT INBOX；返回 UIDVALIDITY（拿不到为 null）
@@ -357,17 +395,23 @@ class CalendarSyncService {
     this.onStatus,
   });
 
-  /// 单次拉取节拍常量（暴露给测试与上层观测）
+  /// 节拍常量（WO-84 终架构：WebDAV 优先、邮件兜底）
   ///
-  /// WO-82-R3（管理员裁决 2026-09-30）：10s 高频拍退役。历史「QQ 对 IDLE 不推
-  /// EXISTS」的真因已改判——旧循环在 IDLE 挂载态发 SELECT/SEARCH（协议违规 →
-  /// BAD 断连），连接每拍被杀，推送从未有过存活窗口；非 DONE 本身。纯长持下
-  /// 推送秒级直达（WO-69 首验 1.2s 先例）。
-  /// 🔴 管理员终裁（同日收尾令）：QQ 推送实测死亡（C 端真机 5 轮零 EXISTS
-  /// 实证）→ 兜底拍 90s → **8s**，收紧为实际感知节拍（仅改常量，架构定稿）；
-  /// 8s 拍 + NAS 去抖 5s 支撑「QQ 经 BOT 建日程 → KashCal 可见 ≤20s（典型
-  /// ~12s）」终验线。
-  static const Duration idleWatchdogBeat = Duration(seconds: 8);
+  /// 沿革：WO-82-R3 退役 10s 高频拍（挂载态发命令的协议违规致推送死亡）→
+  /// 管理员终裁 8s IMAP 拍 → **WO-84**：8s 拍让位给 WebDAV ctag 快路（坚果云
+  /// 纯文本 GET，绕开 QQ 索引层；未变零全量 GET 的配额红线），IMAP 邮件轮询
+  /// 降为 90s 兜底（QQ 推送死亡 + 索引滞后 25-35s 实证下，邮件通道只承担兜底）。
+  /// 🔒 前后台分档：WebDAV 前台 8s / 后台 FGS 30s（主 isolate 生命周期写 pref，
+  /// FGS isolate 每拍读——WO-70 跨 isolate 同款模式）。
+  static const Duration webdavForegroundBeat = Duration(seconds: 8);
+  static const Duration webdavBackgroundBeat = Duration(seconds: 30);
+  /// 邮件兜底轮询节拍（WebDAV 优先架构下的 IMAP 感知节拍）
+  static const Duration mailFallbackBeat = Duration(seconds: 90);
+  /// 🔒 频控熔断阶梯：429/503 或连续 2 次失败 → 60s/120s 指数退避，严禁 8s 死磕
+  static const List<Duration> webdavBackoffLadder = [
+    Duration(seconds: 60),
+    Duration(seconds: 120),
+  ];
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
@@ -398,9 +442,13 @@ class CalendarSyncService {
         'accountSet=${settings.mailAccount.trim().isNotEmpty} '
         'authSet=${settings.mailAuthCode.trim().isNotEmpty} '
         'running=$_running server=${CalendarLocalService.instance.isRunning}');
+    final webdavReady = webdavBaseFromSettings(
+            settings.webdavUser, settings.webdavPass, settings.webdavFolder) !=
+        null;
     final shouldRun = settings.calendarSyncEnabled &&
-        settings.mailAccount.trim().isNotEmpty &&
-        settings.mailAuthCode.trim().isNotEmpty;
+        ((settings.mailAccount.trim().isNotEmpty &&
+                settings.mailAuthCode.trim().isNotEmpty) ||
+            webdavReady);
     // 本机只读服务与 IMAP 解耦：开关开即服务（IMAP 凭据缺失只影响拉取，
     // 不影响对外提供已同步内容；服务常驻由 tick 自愈维持）
     try {
@@ -424,18 +472,207 @@ class CalendarSyncService {
     }
   }
 
-  /// 启动同步循环（幂等）
+  // ------------------------------------------------------------------
+  // WO-84 WebDAV 优先快路轮询器（坚果云）
+  // ------------------------------------------------------------------
+
+  Timer? _webdavTimer;
+  bool _webdavInFlight = false;
+  String? _lastWebdavCtag;
+  int _webdavFailStreak = 0;
+  bool _webdavBackoffActive = false;
+  int _webdavBackoffLevel = 0; // 退避档位：首次进入=60s，退避中再失败升 120s
+
+  void _startWebdavPoller() {
+    _lastWebdavCtag = null;
+    _webdavFailStreak = 0;
+    _webdavBackoffActive = false;
+    _scheduleWebdavTick(Duration.zero); // 启动即刻首探
+  }
+
+  void _scheduleWebdavTick(Duration delay) {
+    _webdavTimer?.cancel();
+    _webdavTimer = Timer(delay, _webdavTick);
+  }
+
+  void _stopWebdavPoller() {
+    _webdavTimer?.cancel();
+    _webdavTimer = null;
+    _webdavInFlight = false;
+  }
+
+  Duration get _webdavCurrentBackoff =>
+      webdavBackoffLadder[_webdavBackoffLevel.clamp(0, webdavBackoffLadder.length - 1)];
+
+  /// 🔒 失败记账：429/503 立即熔断；其它失败连续 ≥2 次熔断。
+  /// 阶梯语义：首次进入=60s；退避中再失败升 120s（封顶）；成功清零。
+  /// 熔断进入只打一行日志（静默回落邮件兜底的可见锚点），期间不刷屏。
+  @visibleForTesting
+  void noteWebdavFailure(String why, {bool rateLimited = false}) {
+    _webdavFailStreak++;
+    if (rateLimited || _webdavFailStreak >= 2) {
+      if (!_webdavBackoffActive) {
+        _webdavBackoffActive = true;
+        _webdavBackoffLevel = 0;
+        // ignore: avoid_print
+        print('[WO84] WebDAV 熔断退避 ${_webdavCurrentBackoff.inSeconds}s（$why）'
+            '→ 邮件兜底承接（${mailFallbackBeat.inSeconds}s）');
+      } else {
+        _webdavBackoffLevel =
+            (_webdavBackoffLevel + 1).clamp(0, webdavBackoffLadder.length - 1);
+      }
+    }
+  }
+
+  /// 成功记账：清失败链 + 解除熔断（一行恢复日志）
+  @visibleForTesting
+  void noteWebdavSuccess() {
+    _webdavFailStreak = 0;
+    _webdavBackoffLevel = 0;
+    if (_webdavBackoffActive) {
+      _webdavBackoffActive = false;
+      // ignore: avoid_print
+      print('[WO84] WebDAV 熔断解除，恢复快路节拍');
+    }
+  }
+
+  /// 测试观测：熔断中的下一拍间隔（Duration.zero = 正常分档节拍调度）
+  @visibleForTesting
+  Duration get webdavNextIntervalForTest =>
+      _webdavBackoffActive ? _webdavCurrentBackoff : Duration.zero;
+
+  Future<void> _webdavTick() async {
+    if (_stopRequested) return;
+    var tier = webdavForegroundBeat;
+    try {
+      await StorageService.reloadPrefs();
+      // 🔒 前后台分档：主 isolate 生命周期写 pref → FGS 每拍读（跨 isolate 桥）
+      final foreground = StorageService.prefs
+              .getBool(AppConstants.keyCalSyncForeground) ??
+          false;
+      tier = foreground ? webdavForegroundBeat : webdavBackgroundBeat;
+    } catch (_) {}
+    try {
+      final s = settingsProvider();
+      final base =
+          webdavBaseFromSettings(s.webdavUser, s.webdavPass, s.webdavFolder);
+      if (base == null) {
+        // 空=禁用快路：不发任何网络请求，低频自检等配置变化
+        _scheduleWebdavTick(webdavBackgroundBeat);
+        return;
+      }
+      if (_webdavInFlight) {
+        _scheduleWebdavTick(tier);
+        return;
+      }
+      _webdavInFlight = true;
+      try {
+        await webdavProbeAndSync(base);
+        noteWebdavSuccess();
+      } on WebdavRateLimitedException catch (e) {
+        noteWebdavFailure(e.toString(), rateLimited: true);
+      } catch (e) {
+        noteWebdavFailure(_safeMessage(e));
+      } finally {
+        _webdavInFlight = false;
+      }
+    } catch (_) {
+      // 🔴 WebDAV 异常绝不崩服务：邮件兜底无缝承接（90s 拍独立运转）
+    }
+    if (_stopRequested) return;
+    _scheduleWebdavTick(_webdavBackoffActive ? _webdavCurrentBackoff : tier);
+  }
+
+  /// 单拍探测（供轮询器与单测调用）：GET ctag.txt（明文，与内存值比对）→
+  /// 未变 = 本拍结束（零全量 GET，配额红线）；变化 = GET calendar.ics →
+  /// 走既有解析/台账/应用管线。ctag 仅在应用成功后提交（失败不消费，下拍重拉）。
+  @visibleForTesting
+  Future<void> webdavProbeAndSync(String base,
+      {HttpClient? customClient}) async {
+    final settings = settingsProvider();
+    final auth =
+        'Basic ${base64.encode(utf8.encode('${settings.webdavUser}:${settings.webdavPass}'))}';
+    final uri = Uri.parse(base);
+    final client = customClient ??
+        (HttpClient()..connectionTimeout = const Duration(seconds: 3));
+    try {
+      // 🔒 纯文本 GET ctag（禁 PROPFIND/XML——Flutter 无 XML 解析器，WO-74 同款雷）
+      final ctag = (await _webdavGetText(client, uri, 'ctag.txt', auth)).trim();
+      if (ctag == _lastWebdavCtag) return; // 未变：零全量 GET
+      final icsText = await _webdavGetText(client, uri, 'calendar.ics', auth);
+      final applied = await _applyIcsSnapshot(icsText);
+      _lastWebdavCtag = ctag; // 应用成功才提交 ctag（失败不消费变更）
+      if (applied > 0) {
+        // ignore: avoid_print
+        print('[WO84] WebDAV ctag 变化 → 拉取并应用 $applied 条');
+      }
+    } finally {
+      if (customClient == null) {
+        client.close(force: true);
+      }
+    }
+  }
+
+  Future<String> _webdavGetText(
+      HttpClient client, Uri base, String file, String auth) async {
+    final req = await client
+        .openUrl('GET', base.resolve(file))
+        .timeout(const Duration(seconds: 5));
+    req.headers.set(HttpHeaders.authorizationHeader, auth);
+    final resp = await req.close().timeout(const Duration(seconds: 5));
+    try {
+      if (resp.statusCode == 429 || resp.statusCode == 503) {
+        throw WebdavRateLimitedException(resp.statusCode);
+      }
+      if (resp.statusCode != 200) {
+        throw WebdavUnreachableException(resp.statusCode);
+      }
+      return await utf8.decodeStream(resp).timeout(const Duration(seconds: 5));
+    } finally {
+      try {
+        await resp.drain<void>();
+      } catch (_) {}
+    }
+  }
+
+  /// 全量 ICS 快照 → 既有解析/台账判新/分批应用管线（幂等；返回应用条数）
+  Future<int> _applyIcsSnapshot(String icsText) async {
+    final parsed = parseIcs(icsText);
+    if (parsed.events.isEmpty) return 0;
+    final ledger =
+        CalendarEventLedger(StorageService.loadCalendarEventLedger());
+    final decided = <IcsEvent>[];
+    for (final e in parsed.events) {
+      if (ledger.decideFor(e) == LedgerDecision.apply) {
+        decided.add(e);
+        ledger.recordApplied(e);
+      }
+    }
+    if (decided.isEmpty) return 0;
+    const batchSize = 50;
+    for (var i = 0; i < decided.length; i += batchSize) {
+      final chunk = decided.sublist(i,
+          (i + batchSize) < decided.length ? i + batchSize : decided.length);
+      await gateway.upsertEvents(chunk.map(_eventToNativeMap).toList());
+    }
+    await StorageService.saveCalendarEventLedger(ledger.entries);
+    return decided.length;
+  }
+
+  /// 启动同步循环（幂等）：IMAP 邮件会话（90s 兜底）+ WebDAV 快路轮询器（8s/30s 分档）
   void start() {
     if (_running) return;
     _running = true;
     _stopRequested = false;
     _loop = _runLoop();
+    _startWebdavPoller();
   }
 
   /// 停止（关连接、唤醒等待）
   Future<void> stop() async {
     _stopRequested = true;
     _running = false;
+    _stopWebdavPoller();
     _mode = 'off';
     _setStatus(mode: 'off');
     try {
@@ -459,9 +696,24 @@ class CalendarSyncService {
     while (!_stopRequested) {
       try {
         final settings = settingsProvider();
-        if (!settings.calendarSyncEnabled ||
-            settings.mailAccount.trim().isEmpty ||
-            settings.mailAuthCode.trim().isEmpty) {
+        final mailReady = settings.mailAccount.trim().isNotEmpty &&
+            settings.mailAuthCode.trim().isNotEmpty;
+        final webdavReady = webdavBaseFromSettings(
+                settings.webdavUser, settings.webdavPass, settings.webdavFolder) !=
+            null;
+        if (!settings.calendarSyncEnabled) {
+          _mode = 'off';
+          _setStatus(mode: 'off');
+          if (await _sleep(const Duration(seconds: 60))) return;
+          continue;
+        }
+        if (!mailReady) {
+          // WO-84：WebDAV-only 模式——IMAP 会话让位，快路轮询器独立承载（mode=webdav）
+          if (webdavReady) {
+            _mode = 'webdav';
+            if (await _sleep(const Duration(seconds: 30))) return;
+            continue;
+          }
           _mode = 'off';
           _setStatus(mode: 'off');
           if (await _sleep(const Duration(seconds: 60))) return;
@@ -579,7 +831,8 @@ class CalendarSyncService {
         // 前必须先 stopIdle（②DONE → ③等 tag OK IDLE completed），之后才允许
         // ④SELECT/UID SEARCH/FETCH，循环顶部 ⑤重发 IDLE。挂载态直接发命令 =
         // 协议违规 → BAD 断连（WO-82 实证「连接每拍被服务端关闭」的真因）。
-        final event = await source.waitForEvent(beat: idleWatchdogBeat);
+        // WO-84：邮件通道降为 90s 兜底节拍（WebDAV 快路承载 8s/30s 感知）
+        final event = await source.waitForEvent(beat: mailFallbackBeat);
         if (_stopRequested) return;
         final pushed = event != null && event > 0;
         // ②③ DONE → tag OK（死连在此暴露为 ImapClosedException → 即时重建）

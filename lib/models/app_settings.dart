@@ -47,6 +47,15 @@ class AppSettings {
   /// WO-69 日历自动同步开关（默认关，与 NAS 侧 calendar.delivery.enabled=false 对称）
   bool calendarSyncEnabled;
 
+  /// WO-84 WebDAV 优先快路：坚果云账号（登录邮箱；非敏感）
+  String webdavUser;
+
+  /// WO-84 WebDAV 应用密码（凭据 → 仅安全存储，内存态；纪律与 mailAuthCode 同款）
+  String webdavPass;
+
+  /// WO-84 WebDAV 文件夹（如 2bot-cal；也接受完整 http(s) URL 覆盖）。三者全非空 = 快路启用
+  String webdavFolder;
+
   static Map<String, bool> get defaultEventSwitches => {
     'unlock': true,
     'lock': true,
@@ -80,6 +89,9 @@ class AppSettings {
     Map<String, bool>? eventSwitches,
     Map<String, String>? placeLabels,
     this.calendarSyncEnabled = false,
+    this.webdavUser = '',
+    this.webdavPass = '',
+    this.webdavFolder = '',
   })  : eventSwitches = eventSwitches ?? Map.from(defaultEventSwitches),
         placeLabels = placeLabels ?? {};
 
@@ -135,6 +147,9 @@ class AppSettings {
     Map<String, bool>? eventSwitches,
     Map<String, String>? placeLabels,
     bool? calendarSyncEnabled,
+    String? webdavUser,
+    String? webdavPass,
+    String? webdavFolder,
   }) {
     return AppSettings(
       relayUrl: relayUrl ?? this.relayUrl,
@@ -154,6 +169,9 @@ class AppSettings {
           throttleIntervalSeconds ?? this.throttleIntervalSeconds,
       silenceTimeoutHours: silenceTimeoutHours ?? this.silenceTimeoutHours,
       calendarSyncEnabled: calendarSyncEnabled ?? this.calendarSyncEnabled,
+      webdavUser: webdavUser ?? this.webdavUser,
+      webdavPass: webdavPass ?? this.webdavPass,
+      webdavFolder: webdavFolder ?? this.webdavFolder,
       eventSwitches: eventSwitches ?? Map.from(this.eventSwitches),
       placeLabels: placeLabels ?? Map.from(this.placeLabels),
     );

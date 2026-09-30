@@ -313,12 +313,23 @@ void main() {
   });
 
   group('时效契约常量（工单 ④ 硬指标的守门断言）', () {
-    test('WO-82 终裁：兜底看门狗节拍=8s（QQ 推送实测死亡，8s 拍即感知节拍；'
-        '配 NAS 去抖 5s 支撑 ≤20s 终验线）', () {
+    test('WO-84 终架构：WebDAV 前台 8s / 后台 FGS 30s / 邮件兜底 90s + 熔断 60/120s', () {
       expect(
-        CalendarSyncService.idleWatchdogBeat,
+        CalendarSyncService.webdavForegroundBeat,
         const Duration(seconds: 8),
       );
+      expect(
+        CalendarSyncService.webdavBackgroundBeat,
+        const Duration(seconds: 30),
+      );
+      expect(
+        CalendarSyncService.mailFallbackBeat,
+        const Duration(seconds: 90),
+      );
+      expect(CalendarSyncService.webdavBackoffLadder, [
+        const Duration(seconds: 60),
+        const Duration(seconds: 120),
+      ]);
     });
 
     test('兜底轮询必须是 15 分钟——严禁退化到 1 分钟轮询（QQ 风控 + 耗电）', () {
@@ -644,6 +655,146 @@ void main() {
         throwsA(isA<ImapClosedException>()),
         reason: '连续 3 次空返回 + EXISTS 明言有信 = 连接失智 → 重建',
       );
+    });
+  });
+
+  group('WO-84 WebDAV 优先快路（坚果云 ctag 明文比对 + 熔断 + 配额红线）', () {
+    test('base 解析器：三字段全非空才启用；空=禁用；文件夹归一化；完整 URL 覆盖', () {
+      // 任一字段空 = 禁用
+      expect(webdavBaseFromSettings('', 'pass', '2bot-cal'), isNull);
+      expect(webdavBaseFromSettings('a@b.c', '', '2bot-cal'), isNull);
+      expect(webdavBaseFromSettings('a@b.c', 'pass', '  '), isNull);
+      // 坚果云默认主机拼接
+      expect(webdavBaseFromSettings('a@b.c', 'pass', '2bot-cal'),
+          'https://dav.jianguoyun.com/dav/2bot-cal/');
+      // 斜杠归一化（防 /dav 双拼）
+      expect(webdavBaseFromSettings('a@b.c', 'pass', '/dav/2bot-cal/'),
+          'https://dav.jianguoyun.com/dav/2bot-cal/');
+      // 完整 URL 覆盖（测试/迁移两用）
+      expect(
+          webdavBaseFromSettings(
+              'a@b.c', 'pass', 'http://10.0.0.2:8080/dav/x/'),
+          'http://10.0.0.2:8080/dav/x/');
+      expect(
+          webdavBaseFromSettings('a@b.c', 'pass', 'http://10.0.0.2:8080/dav/x'),
+          'http://10.0.0.2:8080/dav/x/');
+    });
+
+    test('熔断状态机：429 立即熔断 60s→120s；单次失败不熔断；成功解除', () {
+      final svc = CalendarSyncService.test(
+        settingsProvider: () => AppSettings(calendarSyncEnabled: true),
+        sourceFactory: (_) =>
+            FakeSource(uidValidity: 1, result: scan([], 0)),
+        gateway: FakeGateway(onUpsert: (_) {}),
+      );
+      // 单次普通失败：不熔断（连续 2 次才熔断）
+      svc.noteWebdavFailure('超时');
+      // 429：立即熔断 60s
+      svc.noteWebdavFailure('WebDAV 限频（HTTP 429）', rateLimited: true);
+      expect(svc.webdavNextIntervalForTest, const Duration(seconds: 60));
+      // 退避中继续失败：阶梯升到 120s
+      svc.noteWebdavFailure('WebDAV 限频（HTTP 503）', rateLimited: true);
+      expect(svc.webdavNextIntervalForTest, const Duration(seconds: 120));
+      // 成功：解除熔断、清失败链
+      svc.noteWebdavSuccess();
+      expect(svc.webdavNextIntervalForTest, Duration.zero,
+          reason: '零=按正常分档节拍（8s/30s）调度');
+      // 普通失败连续 2 次：熔断 60s
+      svc.noteWebdavFailure('超时1');
+      expect(svc.webdavNextIntervalForTest, Duration.zero, reason: '第 1 次不熔断');
+      svc.noteWebdavFailure('超时2');
+      expect(svc.webdavNextIntervalForTest, const Duration(seconds: 60));
+    });
+
+    test('配额红线 + 快路管线：ctag 未变零全量 GET；变化才拉取并应用（台账幂等）',
+        () async {
+      final icsBody = _ics('wo84-event-1');
+      late HttpServer dav;
+      int ctagGets = 0, icsGets = 0;
+      String ctag = 'w84-1';
+      dav = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      dav.listen((req) async {
+        if (req.headers.value('authorization') !=
+            'Basic ${base64.encode(utf8.encode('user@example.invalid:apppass'))}') {
+          req.response.statusCode = 401;
+          await req.response.close();
+          return;
+        }
+        if (req.uri!.path.endsWith('ctag.txt')) {
+          ctagGets++;
+          req.response.write(ctag);
+          await req.response.close();
+        } else if (req.uri!.path.endsWith('calendar.ics')) {
+          icsGets++;
+          req.response.headers.contentType =
+              ContentType('text', 'calendar', charset: 'utf-8');
+          req.response.write(icsBody);
+          await req.response.close();
+        } else {
+          req.response.statusCode = 404;
+          await req.response.close();
+        }
+      });
+      try {
+        final batches = <List<Map<String, dynamic>>>[];
+        final svc = CalendarSyncService.test(
+          settingsProvider: () => AppSettings(
+            calendarSyncEnabled: true,
+            webdavUser: 'user@example.invalid',
+            webdavPass: 'apppass',
+            webdavFolder: 'http://127.0.0.1:${dav.port}/dav/2bot-cal/',
+          ),
+          sourceFactory: (_) => FakeSource(uidValidity: 1, result: scan([], 0)),
+          gateway: FakeGateway(onUpsert: (b) => batches.add(b)),
+        );
+        final base = 'http://127.0.0.1:${dav.port}/dav/2bot-cal/';
+
+        // 拍 1：首次 ctag → 拉 ics → 应用 1 条
+        await svc.webdavProbeAndSync(base);
+        expect(ctagGets, 1);
+        expect(icsGets, 1);
+        expect(batches.single.single['uid'], 'wo84-event-1');
+
+        // 拍 2/3：ctag 未变 → 只做 ctag GET，零全量 GET（配额红线）
+        await svc.webdavProbeAndSync(base);
+        await svc.webdavProbeAndSync(base);
+        expect(ctagGets, 3);
+        expect(icsGets, 1, reason: 'ctag 未变严禁重复全量 GET');
+
+        // ctag 变化 → 重拉；台账判 skip（同版本重复投递）→ 应用 0 但仍提交 ctag
+        ctag = 'w84-2';
+        await svc.webdavProbeAndSync(base);
+        expect(ctagGets, 4);
+        expect(icsGets, 2);
+        expect(batches.length, 1, reason: '同版本事件台账判 skip 不重复下发');
+      } finally {
+        await dav.close(force: true);
+      }
+    });
+
+    test('不可达静默回落：探测抛出不崩服务；熔断记账进入 60s 退避（邮件兜底承接）',
+        () async {
+      final svc = CalendarSyncService.test(
+        settingsProvider: () => AppSettings(
+          calendarSyncEnabled: true,
+          webdavUser: 'u',
+          webdavPass: 'p',
+          webdavFolder: 'http://127.0.0.1:59999/dav/x/',
+        ),
+        sourceFactory: (_) => FakeSource(uidValidity: 1, result: scan([], 0)),
+        gateway: FakeGateway(onUpsert: (_) {}),
+      );
+      // 探测直接调用会抛（_webdavTick 才是承接面）——异常类型不限定（socket/DNS 等）
+      await expectLater(
+        svc.webdavProbeAndSync('http://127.0.0.1:59999/dav/x/'),
+        throwsA(anything),
+      );
+      // 模拟 tick 的记账路径：连续 2 次失败 → 熔断 60s（一行回落日志），服务不崩
+      svc.noteWebdavFailure('SocketException');
+      expect(svc.webdavNextIntervalForTest, Duration.zero);
+      svc.noteWebdavFailure('SocketException');
+      expect(svc.webdavNextIntervalForTest, const Duration(seconds: 60),
+          reason: 'WebDAV 不可达 → 静默回落邮件兜底（90s 独立运转）');
     });
   });
 }
