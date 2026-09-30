@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -12,6 +13,72 @@ import 'calendar_mail_extract.dart';
 import 'ics_min_parser.dart';
 import 'imap_idle_client.dart';
 import 'storage_service.dart';
+
+/// ============================================================================
+/// WO-82-R1: 日历邮件正文内联标记契约（与 NAS 端 plugins/core/calendar.js 严格对齐）
+/// ============================================================================
+const String calInlineBegin = '=====2BOT-CAL-BEGIN=====';
+const String calInlineEnd = '=====2BOT-CAL-END=====';
+
+/// 从纯文本中寻找内联 ICS 标记段。
+/// 找不到返回 null；残缺（有 begin 无 end，或内容不含 BEGIN:VCALENDAR）返回 null。
+String? _extractInlineIcsFromText(String text) {
+  final beginIdx = text.indexOf(calInlineBegin);
+  if (beginIdx < 0) return null;
+  final afterBegin = beginIdx + calInlineBegin.length;
+  final endIdx = text.indexOf(calInlineEnd, afterBegin);
+  if (endIdx < 0) {
+    // 标记残缺：有 begin 却无 end
+    return null;
+  }
+  final content = text.substring(afterBegin, endIdx).trim();
+  if (!content.contains('BEGIN:VCALENDAR')) {
+    // 标记残缺/内容损坏
+    return null;
+  }
+  return content;
+}
+
+/// WO-82-R1: 双形态日历正文提取（解析增正文标记段，附件/内联都认，并存时标记段优先，残缺降级）
+///
+/// 1. 优先提取正文内联标记段（=====2BOT-CAL-BEGIN===== ... =====2BOT-CAL-END=====）
+/// 2. 标记段残缺（例如有 BEGIN 缺 END）或未匹配时，降级提取附件（extractIcsFromMail）
+/// 3. 并存时标记段优先
+String? extractIcsFromMailDual(String raw) {
+  // A. 直接从原始报文中尝试提取内联标记段
+  if (raw.contains(calInlineBegin)) {
+    final direct = _extractInlineIcsFromText(raw);
+    if (direct != null) {
+      return direct;
+    }
+    // raw 包含 begin 但匹配失败 → 标记残缺，直接降级到附件提取
+    return extractIcsFromMail(raw);
+  }
+
+  // B. 若 raw 未直接包含 begin，但正文可能经过 MIME 传输编码（如 base64）
+  final headerEnd = raw.indexOf('\r\n\r\n');
+  final sep = headerEnd >= 0 ? 4 : (raw.indexOf('\n\n') >= 0 ? 2 : -1);
+  if (sep >= 0) {
+    final headerBlock = raw.substring(0, sep == 4 ? headerEnd : raw.indexOf('\n\n'));
+    final body = raw.substring(sep == 4 ? headerEnd + 4 : raw.indexOf('\n\n') + 2);
+    final lowerHeader = headerBlock.toLowerCase();
+    if (lowerHeader.contains('content-transfer-encoding: base64')) {
+      try {
+        final decoded = utf8.decode(
+            base64Decode(body.replaceAll(RegExp(r'\s+'), '')),
+            allowMalformed: true);
+        final fromDecoded = _extractInlineIcsFromText(decoded);
+        if (fromDecoded != null) {
+          return fromDecoded;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // C. 降级走既有附件提取
+  return extractIcsFromMail(raw);
+}
+
 
 /// ============================================================================
 /// WO-69 · 日历自动同步编排（IDLE 主路径秒级推送 + 15 分钟兜底轮询）
@@ -570,10 +637,10 @@ class CalendarSyncService {
         // ignore: avoid_print
         print('[WO78] 推送 $sec 秒到达（触发=$trigger，UID=${mail.uid}）');
       }
-      final icsText = extractIcsFromMail(mail.raw);
+      final icsText = extractIcsFromMailDual(mail.raw);
       if (icsText == null) {
         badCount++;
-        errors.add('UID ${mail.uid}: 附件提取失败（结构超契约）');
+        errors.add('UID ${mail.uid}: 日历正文/附件提取失败（结构超契约）');
         handledUid = mail.uid; // 坏件越过：重试无益，记错不阻塞
         continue;
       }

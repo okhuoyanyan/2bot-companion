@@ -337,7 +337,84 @@ void main() {
       );
     });
   });
+
+  group('WO-82-R1 解析器双形态（附件 / 内联 / 并存 / 标记残缺降级）', () {
+    final icsAtt = _ics('att-uid-001');
+    final icsInline = _ics('inline-uid-002');
+
+    test('例 1【纯附件】：无正文标记，标准 calendar.ics base64 附件正常解析', () {
+      final mail = _mail(101, icsAtt);
+      final extracted = extractIcsFromMailDual(mail.raw);
+      expect(extracted, isNotNull);
+      expect(extracted, contains('UID:att-uid-001'));
+    });
+
+    test('例 2【纯内联】：正文标记包裹 ICS，无附件，直接提取内联内容', () {
+      final raw = 'Subject: ${AppConstants.calSubjectPrefix}20260930-1000\r\n'
+          'Content-Type: text/plain; charset=utf-8\r\n'
+          '\r\n'
+          '2BOT 日历投递 (内联格式)\r\n\r\n'
+          '$calInlineBegin\r\n'
+          '$icsInline\r\n'
+          '$calInlineEnd\r\n';
+      final extracted = extractIcsFromMailDual(raw);
+      expect(extracted, isNotNull);
+      expect(extracted, contains('UID:inline-uid-002'));
+    });
+
+    test('例 3【并存优先】：正文内联标记与附件并存，标记段优先生效', () {
+      final encodedAtt = base64Of(utf8.encode(icsAtt));
+      final raw = 'Subject: ${AppConstants.calSubjectPrefix}20260930-1001\r\n'
+          'Content-Type: multipart/mixed; boundary=B_DUAL\r\n'
+          '\r\n'
+          '--B_DUAL\r\n'
+          'Content-Type: text/plain; charset=utf-8\r\n'
+          '\r\n'
+          '2BOT 日历投递 (双形态并存)\r\n'
+          '$calInlineBegin\r\n'
+          '$icsInline\r\n'
+          '$calInlineEnd\r\n'
+          '--B_DUAL\r\n'
+          'Content-Type: text/calendar; name=calendar.ics\r\n'
+          'Content-Transfer-Encoding: base64\r\n'
+          '\r\n'
+          '$encodedAtt\r\n'
+          '--B_DUAL--\r\n';
+      final extracted = extractIcsFromMailDual(raw);
+      expect(extracted, isNotNull);
+      expect(extracted, contains('UID:inline-uid-002'),
+          reason: '并存时必须标记段优先，不得取附件');
+      expect(extracted, isNot(contains('UID:att-uid-001')));
+    });
+
+    test('例 4【标记残缺降级】：正文有 BEGIN 但缺少 END，降级并成功提取附件', () {
+      final encodedAtt = base64Of(utf8.encode(icsAtt));
+      final raw = 'Subject: ${AppConstants.calSubjectPrefix}20260930-1002\r\n'
+          'Content-Type: multipart/mixed; boundary=B_BROKEN\r\n'
+          '\r\n'
+          '--B_BROKEN\r\n'
+          'Content-Type: text/plain; charset=utf-8\r\n'
+          '\r\n'
+          '2BOT 日历投递 (标记残缺)\r\n'
+          '$calInlineBegin\r\n'
+          'BEGIN:VCALENDAR\r\n'
+          'UID:broken-inline\r\n'
+          '（注意：此处人为省略 calInlineEnd）\r\n'
+          '--B_BROKEN\r\n'
+          'Content-Type: text/calendar; name=calendar.ics\r\n'
+          'Content-Transfer-Encoding: base64\r\n'
+          '\r\n'
+          '$encodedAtt\r\n'
+          '--B_BROKEN--\r\n';
+      final extracted = extractIcsFromMailDual(raw);
+      expect(extracted, isNotNull, reason: '标记残缺必须平滑降级，不得直接报错');
+      expect(extracted, contains('UID:att-uid-001'),
+          reason: '降级后应成功提取附件中的 ICS');
+      expect(extracted, isNot(contains('broken-inline')));
+    });
+  });
 }
+
 
 // ---------------------------------------------------------------------------
 // 测试夹具（example.invalid 域名纪律；无真实凭据、无真实邮件）
