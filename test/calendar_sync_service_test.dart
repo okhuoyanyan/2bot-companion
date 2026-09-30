@@ -720,11 +720,11 @@ void main() {
           await req.response.close();
           return;
         }
-        if (req.uri!.path.endsWith('ctag.txt')) {
+        if (req.uri.path.endsWith('ctag.txt')) {
           ctagGets++;
           req.response.write(ctag);
           await req.response.close();
-        } else if (req.uri!.path.endsWith('calendar.ics')) {
+        } else if (req.uri.path.endsWith('calendar.ics')) {
           icsGets++;
           req.response.headers.contentType =
               ContentType('text', 'calendar', charset: 'utf-8');
