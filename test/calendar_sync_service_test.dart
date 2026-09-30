@@ -586,11 +586,42 @@ void main() {
 
       expect(next, 1290,
           reason: 'EXISTS=1018 明言有信而扫描空返回 = SEARCH 瞬断，不得把水位线拖到 1018');
-      expect(source.scanCalls, 4,
-          reason: '初始 1 + 回退验证 1 + 空返回重扫 2（有界自愈）');
+      expect(source.scanCalls, 2,
+          reason: '初始 1 + 回退验证 1（空返回已不作通用怀疑指纹——8s 拍防自压）');
       final state = await StorageService.loadCalendarSyncStateAsync();
       expect(state['lastSuspectedSkip'], isNull,
           reason: '空返回非缺口，不落跳信标记');
+    });
+
+    test('终裁配套：回退验证同水位线 10 分钟冷却——第二拍不再重扫（防 8s 拍自压）',
+        () async {
+      // 剧本：拍1初始空 + 拍1回退验证空（瞬断）→ 拍2/拍3 初始回显健康候选
+      //（水位线==max 的常态空闲态；连击守卫要求空返回不得连续 3 拍）
+      final echo = scan(const <CalendarMail>[], 1304, candidates: [1304]);
+      final source = FakeSource(
+        uidValidity: 1,
+        result: echo,
+        scanScript: [
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          echo,
+          echo,
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      await svc.debugSyncIncrement(source, 1304, boxExists: 1032);
+      expect(source.scanCalls, 2, reason: '拍1：初始 + 回退验证');
+
+      await svc.debugSyncIncrement(source, 1304, boxExists: 1032);
+      expect(source.scanCalls, 3,
+          reason: '同水位线冷却期内（10min）不得再跑回退验证重扫——'
+              '8s 拍下每拍 10s 全段重扫 = 持续自压（真机 21:21 实证）');
+
+      final next = await svc.debugSyncIncrement(source, 1304, boxExists: 1032);
+      expect(next, 1304, reason: '冷却期水位线稳定不漂移');
+      expect(source.scanCalls, 4);
     });
 
     test('空返回连击守卫：连续 3 次扫描空返回且 EXISTS 明言有信 → 强制重建（断连语义）',

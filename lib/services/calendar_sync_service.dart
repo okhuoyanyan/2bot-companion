@@ -323,6 +323,12 @@ class CalendarSyncService {
   int _consecutiveFailures = 0;
   int _rebuildCount = 0; // WO-78-R3：连续会话重建计数（防打爆护栏）
   int _emptySearchStreak = 0; // WO-82-R3：连续 SEARCH 空返回计数（连接失智守卫）
+
+  /// WO-82 终裁（8s 拍配套）：回退验证冷却——带删信箱 boxExists<水位线是
+  /// 常态，v2 验证若每拍都跑=每拍 10s 全段重扫（8s 拍下=持续自压）。
+  /// 同水位线 10 分钟内验证过 → 跳过；真重置最坏延迟一个冷却窗发现。
+  DateTime? _rollbackVerifiedAt;
+  int? _rollbackVerifiedWatermark;
   String _mode = 'off';
 
   /// 主 isolate / 测试用默认构造
@@ -637,49 +643,59 @@ class CalendarSyncService {
     //     交下方缺口/空返回重扫自愈。
     if (mails.isEmpty && maxSeen == 0 && boxExists != null && boxExists < lastUid) {
       final preRollback = lastUid;
-      // ignore: avoid_print
-      print('[WO78-R3] boxExists($boxExists) < 水位线($lastUid) → 回退验证重扫'
-          '（v2 三态：真重置/序列健在/SEARCH 瞬断）');
-      final retry = await source.fetchNewSince(boxExists);
-      if (retry.mails.isNotEmpty || retry.maxSeenUid > 0) {
-        if (retry.maxSeenUid < preRollback) {
-          // a) 真重置
-          // ignore: avoid_print
-          print('[WO78-R3] 重置验证成立（新基线 max=${retry.maxSeenUid} < '
-              '$preRollback）→ 水位线回退至 $boxExists 全量重扫（幂等）');
-          mails = retry.mails;
-          maxSeen = retry.maxSeenUid;
-          candidates = retry.candidates;
-          lastUid = boxExists;
-        } else {
-          // b) 序列健在
-          // ignore: avoid_print
-          print('[WO78-R3] 序列健在（重扫 max=${retry.maxSeenUid} ≥ $preRollback）'
-              '→ 恢复水位线 $preRollback（重扫件台账幂等去重）');
-          mails = retry.mails;
-          maxSeen = retry.maxSeenUid;
-          candidates = retry.candidates;
-        }
-      } else {
-        // c) SEARCH 瞬断
+      final verifiedRecently = _rollbackVerifiedWatermark == preRollback &&
+          _rollbackVerifiedAt != null &&
+          DateTime.now().difference(_rollbackVerifiedAt!) <
+              const Duration(minutes: 10);
+      if (!verifiedRecently) {
         // ignore: avoid_print
-        print('[WO82] 回退重扫空返回（EXISTS=$boxExists 明言有信）→ 判 SEARCH '
-            '瞬断，恢复水位线 $preRollback（交缺口重扫自愈）');
+        print('[WO78-R3] boxExists($boxExists) < 水位线($lastUid) → 回退验证重扫'
+            '（v2 三态：真重置/序列健在/SEARCH 瞬断）');
+        final retry = await source.fetchNewSince(boxExists);
+        _rollbackVerifiedAt = DateTime.now();
+        _rollbackVerifiedWatermark = preRollback;
+        if (retry.mails.isNotEmpty || retry.maxSeenUid > 0) {
+          if (retry.maxSeenUid < preRollback) {
+            // a) 真重置
+            // ignore: avoid_print
+            print('[WO78-R3] 重置验证成立（新基线 max=${retry.maxSeenUid} < '
+                '$preRollback）→ 水位线回退至 $boxExists 全量重扫（幂等）');
+            mails = retry.mails;
+            maxSeen = retry.maxSeenUid;
+            candidates = retry.candidates;
+            lastUid = boxExists;
+          } else {
+            // b) 序列健在
+            // ignore: avoid_print
+            print('[WO78-R3] 序列健在（重扫 max=${retry.maxSeenUid} ≥ $preRollback）'
+                '→ 恢复水位线 $preRollback（重扫件台账幂等去重）');
+            mails = retry.mails;
+            maxSeen = retry.maxSeenUid;
+            candidates = retry.candidates;
+          }
+        } else {
+          // c) SEARCH 瞬断
+          // ignore: avoid_print
+          print('[WO82] 回退重扫空返回（EXISTS=$boxExists 明言有信）→ 判 SEARCH '
+              '瞬断，恢复水位线 $preRollback（交缺口重扫自愈）');
+        }
       }
+      // verifiedRecently=true → 静默跳过（8s 拍常态路径零开销零日志）
     }
 
-    // WO-82-R3 追加（12:12 跳信定案）：缺口/空返回检测 + 有界重扫。
+    // WO-82-R3 追加（12:12 跳信定案）：缺口检测 + 有界重扫。
     // 机理实证：QQ UID SEARCH 静默漏件（1263 被漏，34s 后入箱的 1264 反而在列）
     // + 「空扫推进 maxSeen」语义 = 漏件被永久焊死（幽灵事件 5 天）。防御指纹：
-    // ①候选集相对 (水位线, 最大候选] 存在缺口（SEARCH 漏件）；
-    // ②候选集空返回（QQ 星搜索对存在邮件回空——瞬断/失智指纹）；
-    // ③推送触发却「零新件」（服务端刚说有新件而扫描一无所见）。
+    // 候选集相对 (水位线, 最大候选] 存在缺口（SEARCH 漏件），或推送触发却
+    // 「零新件」（服务端刚说有新件而扫描一无所见）。
+    // 🔴 WO-82 终裁（8s 拍配套）：candidates.isEmpty 不再是通用怀疑指纹——
+    // 水位线==服务器 max 是常态空闲态，QQ 按怪癖回空，8s 拍下每拍空烧 2×5s
+    // 重试不可接受；空扫怀疑保留给推送触发（有 EXISTS 证据才值得重扫）。
     // 命中 → 5s×2 重扫（QQ 索引滞后为秒级瞬态）；仍缺口 → 水位线照常推进
     // （防卡死、防重扫风暴）+ [WO82] 疑似跳信行 + 状态标记（即刻可见）。
     var holes = uidHoles(lastUid, candidates);
     bool suspicious() =>
         holes.isNotEmpty ||
-        candidates.isEmpty ||
         (trigger == 'IDLE推送' && mails.isEmpty && maxSeen <= lastUid);
     for (var attempt = 0; suspicious() && attempt < 2; attempt++) {
       await Future<void>.delayed(skipRetryDelay);
