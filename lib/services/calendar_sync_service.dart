@@ -241,13 +241,18 @@ String? webdavBaseFromSettings(String user, String pass, String folder) {
     return null;
   }
   final f = folder.trim();
-  if (f.startsWith('http://') || f.startsWith('https://')) {
+  // scheme 大小写不敏感（RFC 3986；兼容大写输入路径）
+  final lower = f.toLowerCase();
+  if (lower.startsWith('http://') || lower.startsWith('https://')) {
     return f.endsWith('/') ? f : '$f/';
   }
   const host = 'https://dav.jianguoyun.com';
   final clean = f.replaceAll(RegExp(r'^/+|/+$'), '');
   if (clean.isEmpty) return null;
-  if (clean == 'dav' || clean.startsWith('dav/')) return '$host/$clean/';
+  final cleanLower = clean.toLowerCase();
+  if (cleanLower == 'dav' || cleanLower.startsWith('dav/')) {
+    return '$host/$clean/';
+  }
   return '$host/dav/$clean/';
 }
 
