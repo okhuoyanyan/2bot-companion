@@ -202,13 +202,13 @@ abstract class CalendarMailSource {
       int lastProcessedUid);
 
   Future<bool> startIdle();
-  Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)});
+  Future<int?> waitForEvent({required Duration beat});
 
   /// WO-78-R3 ①：IDLE 生命周期日志出口（每跳一行）
   void Function(String line)? get onLifecycleLog;
   set onLifecycleLog(void Function(String line)? v);
 
-  /// WO-78-R3 返工：最近一次唤醒原因（'IDLE推送'/'NOOP查件'/'NOOP夹带'）——
+  /// WO-82-R3：最近一次唤醒原因（'IDLE推送'/'兜底查件'）——
   /// 拉取日志触发原因的归因源；null=未知。
   String? get lastWakeReason;
 
@@ -257,9 +257,8 @@ class QqImapSource implements CalendarMailSource {
   Future<bool> startIdle() => _client!.startIdle();
 
   @override
-  Future<int?> waitForEvent({required Duration beat,
-          Duration noopBeat = const Duration(seconds: 60)}) =>
-      _client!.waitForEvent(beat: beat, noopBeat: noopBeat);
+  Future<int?> waitForEvent({required Duration beat}) =>
+      _client!.waitForEvent(beat: beat);
 
   @override
   Future<void> stopIdle() => _client!.stopIdle();
@@ -331,12 +330,14 @@ class CalendarSyncService {
   });
 
   /// 单次拉取节拍常量（暴露给测试与上层观测）
-  static const Duration idleBeat = Duration(minutes: 25);
-  /// WO-78-R3 返工实测（5 轮第 1 轮）：QQ 对本连接的 IDLE 【不推 EXISTS】
-  /// （出站后 30s 窗口内无任何推送行，re-SELECT 才看见）→ NOOP 查件是唯一
-  /// 感知路径，节拍 30s 时实测 24.1s（相位平均 +15s）。压到 10s：
-  /// re-SELECT 单次开销 ~200ms/次，端到端 ≈5-8s（验收 ≤10s）。
-  static const Duration idleNoopBeat = Duration(seconds: 10);
+  ///
+  /// WO-82-R3（管理员裁决 2026-09-30）：10s 高频拍退役。历史「QQ 对 IDLE 不推
+  /// EXISTS」的真因已改判——旧循环在 IDLE 挂载态发 SELECT/SEARCH（协议违规 →
+  /// BAD 断连），连接每拍被杀，推送从未有过存活窗口；非 DONE 本身。纯长持下
+  /// 推送秒级直达（WO-69 首验 1.2s 先例）。90s 兜底查件节拍（对齐遥测通道多日
+  /// 已证节奏）：推送失效的最坏感知窗 ≤90s+查件时长，且重建/LOGIN 频率压到
+  /// 旧版 1/9（降低认证风控风险）。
+  static const Duration idleWatchdogBeat = Duration(seconds: 90);
   static const Duration fallbackPollInterval = Duration(minutes: 15);
 
   /// WO-69 追补整改（急件解耦）：会话失败退避——**严禁秒级热重试**。
@@ -440,7 +441,7 @@ class CalendarSyncService {
         // 会话正常退出（stop）即返回
         if (_stopRequested) return;
       } on ImapClosedException catch (e) {
-        // WO-78-R3 ②：连接断开（BYE/FIN/NOOP 超时暴露的死连）≠ 持久性失败——
+        // WO-78-R3 ②/WO-82-R3：连接断开（BYE/FIN/DONE 无响应暴露的死连）≠ 持久性失败——
         // 立即重建会话（连接即做一次增量同步），不吃 60s 退避（旧路径白等）。
         // 防打爆护栏：连续重建 >3 次（flapping 网络）→ 30s 冷却；
         // 成功同步会把 _consecutiveFailures 清零 → 顺带解除冷却。
@@ -529,7 +530,7 @@ class CalendarSyncService {
       _mode = 'idle';
       await _setStatus(mode: 'idle', result: 'ok');
 
-      // IDLE 长连接循环
+      // IDLE 长连接循环（WO-82-R3 纯长持：推送主路径 + 90s 兜底，全程 G3 时序）
       while (!_stopRequested) {
         final accepted = await source.startIdle();
         if (!accepted) {
@@ -542,27 +543,29 @@ class CalendarSyncService {
           await _setStatus(mode: 'poll', result: 'ok');
           continue;
         }
-        final event =
-            await source.waitForEvent(beat: idleBeat, noopBeat: idleNoopBeat);
+        // 🔴 G3 时序铁律（WO-82-R3）：waitForEvent 的两种返回——EXISTS 推送
+        // （n>0）与 90s 兜底节拍（null）——都【保持 IDLE 挂载态】。发任何命令
+        // 前必须先 stopIdle（②DONE → ③等 tag OK IDLE completed），之后才允许
+        // ④SELECT/UID SEARCH/FETCH，循环顶部 ⑤重发 IDLE。挂载态直接发命令 =
+        // 协议违规 → BAD 断连（WO-82 实证「连接每拍被服务端关闭」的真因）。
+        final event = await source.waitForEvent(beat: idleWatchdogBeat);
         if (_stopRequested) return;
-        if (event != null && event > 0) {
-          // EXISTS 感知（IDLE 推送 / NOOP 夹带）：秒级增量
-          debugPrint('[WO69] 唤醒 EXISTS=$event，开始秒级增量');
-          await source.stopIdle();
-          lastUid = await _syncIncrement(source, lastUid,
-              uidValidity: uidValidity,
-              trigger: source.lastWakeReason ?? '未知来源');
-          await _setStatus(mode: 'idle', result: 'ok');
-          continue;
+        final pushed = event != null && event > 0;
+        // ②③ DONE → tag OK（死连在此暴露为 ImapClosedException → 即时重建）
+        await source.stopIdle();
+        if (pushed) {
+          debugPrint('[WO69] 推送唤醒 EXISTS=$event → G3 序列拉取');
         }
-        // event == -1（NOOP 节拍哨兵）或 null：轻量 UID 水位线查件——
-        // 返工②诊断：QQ 的 EXISTS 与 UID 水位线不同轴，新件判据一律走水位线。
-        // 空扫（无新件）不做状态写盘（防 10s 节拍写放大）。
+        // ④ 查件（未挂载态，协议合法）：SELECT EXISTS 供 UID 序列重置防御 +
+        // UID 水位线增量（QQ 的 EXISTS 与 UID 水位线不同轴，新件判据走水位线）。
         final boxExists = await source.inboxExists().catchError((_) => null);
         lastUid = await _syncIncrement(source, lastUid,
-            uidValidity: uidValidity, trigger: 'NOOP查件',
-            lightIdle: true, boxExists: boxExists);
+            uidValidity: uidValidity,
+            trigger: source.lastWakeReason ?? (pushed ? 'IDLE推送' : '兜底查件'),
+            lightIdle: !pushed, // 兜底空扫不写状态盘（防节拍写放大）
+            boxExists: boxExists);
         await _setStatus(mode: 'idle', result: 'ok');
+        // ⑤ 循环顶部 startIdle 重挂
       }
     } finally {
       try {
@@ -630,12 +633,13 @@ class CalendarSyncService {
     final errors = <String>[];
 
     for (final mail in mails) {
-      // WO-78：端到端推送延迟（邮件 Date 头 → 入库），验收口径「推送 X 秒到达」
+      // WO-78/WO-82-R3-G4：端到端推送延迟（邮件 Date 头=NAS 发出时刻 → 入库侧
+      // 到达），验收「推送行 ≤5s」的回测硬证据行（logcat 时间戳可对表）
       final mailDate = parseRfc5322Date(mail.raw);
       if (mailDate != null) {
         final sec = DateTime.now().difference(mailDate).inSeconds;
         // ignore: avoid_print
-        print('[WO78] 推送 $sec 秒到达（触发=$trigger，UID=${mail.uid}）');
+        print('[WO78] 推送到达（延迟 ${sec}s）→ 拉取（触发=$trigger，UID=${mail.uid}）');
       }
       final icsText = extractIcsFromMailDual(mail.raw);
       if (icsText == null) {

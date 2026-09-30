@@ -6,21 +6,23 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bot_companion/services/imap_idle_client.dart';
 
-/// WO-78-R3 返工 · IDLE 保活节拍终版（DONE→重发 IDLE→哨兵 -1，零 NOOP）
+/// WO-82-R3 · 纯长持 IDLE（G3 时序铁律）· 10s NOOP 高频拍退役
 ///
-/// 真机归因实证（架构师实测 + 本机 logcat）：
-/// ① QQ 对本连接的 IDLE 不推 EXISTS（出站后静默期零推送行）；
-/// ② QQ 对「IDLE 后发 NOOP」一律立即断连（每次 NOOP 后 服务端关闭连接）；
-/// 故终版节拍 = DONE → 直接重发 IDLE（RFC 2177 标准循环）→ 哨兵 -1，
-/// 新件判定由上层走 UID 水位线（fetchNewSince）；重发失败/超时 = 死连，
-/// 转 ImapClosedException 由上层即时重建（连接即查件）。
+/// 管理员裁决 2026-09-30：10s 拍退役、90s 兜底地板；主路径 = 长持 IDLE 推送。
+/// 历史归因改判：「连接每拍被服务端关闭」的真因是旧循环在【挂载态】发
+/// SELECT/SEARCH（协议违规 → BAD 断连），非 DONE 本身。
+/// G3 铁律：收到 `* n EXISTS` 后 —— ①读信号 → ②发 DONE → ③等
+/// `tag OK IDLE completed` → ④UID SEARCH/FETCH → ⑤重发 IDLE。
+/// 本套件钉死：waitForEvent 两种返回都【保持挂载态】（挂载期零命令写出），
+/// UID SEARCH 必须出现在 DONE 之后；死连由 stopIdle 超时暴露为断连语义。
 
 class _ScriptedImapServer {
   final ServerSocket socket;
   final StringBuffer received = StringBuffer();
-  bool rejectIdleReissue = false; // 重发 IDLE 回 tagged NO
-  bool swallowIdleReissue = false; // 死连：吞重发 IDLE 的 continuation
-  bool _reissueSeen = false;
+  bool pushExistsAfterIdle = false; // 挂载后 ~100ms 推送 `* 5 EXISTS`
+  bool swallowDone = false; // 死连：吞 DONE 的 tagged OK
+  final List<Socket> _clients = <Socket>[];
+  Timer? _pushTimer;
   String? _idleTag;
 
   _ScriptedImapServer._(this.socket);
@@ -33,6 +35,7 @@ class _ScriptedImapServer {
   }
 
   void _onClient(Socket client) {
+    _clients.add(client);
     client.write('* OK IMAP4rev1 Ready\r\n'); // IMAP 问候语（连接即发）
     final buf = <int>[];
     client.listen((data) {
@@ -61,33 +64,36 @@ class _ScriptedImapServer {
     } else if (line.contains(' SELECT INBOX')) {
       client.write('${line.split(' ').first} OK [READ-WRITE] done\r\n');
     } else if (line.endsWith(' IDLE')) {
-      if (_reissueSeen) {
-        // 重发轮
-        if (swallowIdleReissue) return; // 死连：吞 continuation
-        if (rejectIdleReissue) {
-          client.write('${line.split(' ').first} NO\r\n');
-          return;
-        }
-      }
-      _reissueSeen = true;
       _idleTag = line.split(' ').first;
       client.write('+ idling\r\n');
+      if (pushExistsAfterIdle) {
+        _pushTimer = Timer(const Duration(milliseconds: 100), () {
+          for (final c in _clients) {
+            c.write('* 5 EXISTS\r\n');
+          }
+        });
+      }
     } else if (line == 'DONE') {
+      if (swallowDone) return; // 死连：吞响应
       client.write('${_idleTag ?? 'P0001'} OK\r\n');
     } else {
       client.write('${line.split(' ').first} OK\r\n');
     }
   }
 
-  Future<void> close() => socket.close();
+  Future<void> close() async {
+    _pushTimer?.cancel();
+    await socket.close();
+  }
 }
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  group('WO-78-R3 返工 · 保活节拍终版（零 NOOP）', () {
-    test('哨兵：节拍到点 → DONE+重发 IDLE → 返回 -1 + 归因 NOOP查件', () async {
+  group('WO-82-R3 · 纯长持 IDLE（G3 时序铁律）', () {
+    test('推送主路径：挂载期收到 EXISTS → 返回 n>0，挂载期零命令写出', () async {
       final server = await _ScriptedImapServer.bind();
+      server.pushExistsAfterIdle = true;
       ImapIdleClient.socketFactory =
           (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
       try {
@@ -102,18 +108,15 @@ void main() {
         client.onLifecycleLog = hops.add;
         await client.connect();
         expect(await client.startIdle(), isTrue);
-        final n = await client.waitForEvent(
-            beat: const Duration(seconds: 10),
-            noopBeat: const Duration(milliseconds: 300));
-        expect(n, -1, reason: '哨兵 -1：上层做 UID 水位线查件');
-        expect(client.lastWakeReason, 'NOOP查件', reason: '归因可见');
-        expect(hops.join('|'), contains('IDLE 挂载'), reason: '①建立可观测');
-        expect(hops.join('|'), contains('保活节拍到点'), reason: '①节拍跳可观测');
-        expect(hops.join('|'), contains('IDLE 重挂（NOOP 节拍循环）'),
-            reason: '①重挂可观测');
-        expect(server.received.toString(), isNot(contains(' NOOP')),
-            reason: '实测 QQ 对 IDLE 后 NOOP 一律断连——节拍不得发 NOOP');
-        expect(server.received.toString(), contains('DONE'));
+        final mountedAt = server.received.toString();
+        final n = await client.waitForEvent(beat: const Duration(seconds: 10));
+        expect(n, 5, reason: 'EXISTS 推送原样上抛（非 -1 哨兵）');
+        expect(client.lastWakeReason, 'IDLE推送', reason: '归因可见');
+        // G3：从挂载到 EXISTS 返回，客户端未发任何命令（挂载态保持）
+        expect(server.received.toString(), mountedAt,
+            reason: '挂载期零命令写出（不发 DONE/NOOP/SELECT）');
+        expect(hops.join('|'), contains('IDLE 挂载'));
+        expect(hops.join('|'), contains('IDLE 推送 EXISTS=5'));
         await client.close();
       } finally {
         ImapIdleClient.socketFactory = null;
@@ -121,45 +124,48 @@ void main() {
       }
     });
 
-    test('重发被拒 → ImapClosedException（上层即时重建语义）', () async {
-      final server = await _ScriptedImapServer.bind();
-      server.rejectIdleReissue = true; // 重发 IDLE 回 tagged NO
-      ImapIdleClient.socketFactory =
-          (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
-      try {
-        final client = ImapIdleClient(
-          config: ImapConfig(
-              account: 'acct',
-              authCode: 'code',
-              host: '127.0.0.1',
-              port: server.socket.port),
-        );
-        final hops = <String>[];
-        client.onLifecycleLog = hops.add;
-        await client.connect();
-        expect(await client.startIdle(), isTrue);
-        Object? caught;
-        try {
-          await client.waitForEvent(
-              beat: const Duration(seconds: 10),
-              noopBeat: const Duration(milliseconds: 300));
-        } catch (e) {
-          caught = e;
-        }
-        expect(caught, isA<ImapClosedException>(),
-            reason: '重发被拒=连接不可用语义 → 上层即时重建');
-        expect(hops.join('|'), contains('重发 IDLE 被拒 → 重建会话'));
-        await client.close();
-      } finally {
-        ImapIdleClient.socketFactory = null;
-        await server.close();
-      }
-    });
-
-    test('死连：重发 IDLE 无响应 → 10s 超时转断连语义（聋态从 25 分钟压到 ≤节拍+10s）',
+    test('G3 时序：EXISTS 返回后先 DONE（等 tag OK）→ UID SEARCH 在 DONE 之后',
         () async {
       final server = await _ScriptedImapServer.bind();
-      server.swallowIdleReissue = true; // 吞重发 IDLE 的 continuation
+      server.pushExistsAfterIdle = true;
+      ImapIdleClient.socketFactory =
+          (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
+      try {
+        final client = ImapIdleClient(
+          config: ImapConfig(
+              account: 'acct',
+              authCode: 'code',
+              host: '127.0.0.1',
+              port: server.socket.port),
+        );
+        await client.connect();
+        expect(await client.startIdle(), isTrue);
+        expect(await client.waitForEvent(beat: const Duration(seconds: 10)), 5);
+
+        // 🔴 挂载态返回点：此刻严禁已发出 UID SEARCH（G3 第④步的前置）
+        expect(server.received.toString(), isNot(contains('UID SEARCH')),
+            reason: '挂载态直接 UID SEARCH = 协议违规（BAD 断连）');
+
+        // ②③ DONE → tag OK（stopIdle 内部等待 tagged 完成响应）
+        await client.stopIdle();
+        // ④ 之后才允许查件
+        await client.fetchNewSince(0);
+
+        final transcript = server.received.toString();
+        final doneIdx = transcript.indexOf('DONE');
+        final searchIdx = transcript.indexOf('UID SEARCH');
+        expect(doneIdx, greaterThanOrEqualTo(0));
+        expect(searchIdx, greaterThan(doneIdx),
+            reason: 'G3：UID SEARCH 必须在 DONE 且 tag OK 之后（时序单点化）');
+        await client.close();
+      } finally {
+        ImapIdleClient.socketFactory = null;
+        await server.close();
+      }
+    });
+
+    test('90s 兜底节拍：到点返回 null（挂载保持，无 DONE）+ 归因 兜底查件', () async {
+      final server = await _ScriptedImapServer.bind();
       ImapIdleClient.socketFactory =
           (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
       try {
@@ -174,21 +180,54 @@ void main() {
         client.onLifecycleLog = hops.add;
         await client.connect();
         expect(await client.startIdle(), isTrue);
+        final mountedAt = server.received.toString();
+        final sw = Stopwatch()..start();
+        final n = await client.waitForEvent(beat: const Duration(milliseconds: 300));
+        sw.stop();
+        expect(n, isNull, reason: '节拍到点返回 null（旧版哨兵 -1 已退役）');
+        expect(client.lastWakeReason, '兜底查件');
+        expect(server.received.toString(), mountedAt,
+            reason: '节拍返回时挂载保持——DONE 由调用方统一发起（G3 时序单点化）');
+        expect(sw.elapsed.inMilliseconds, lessThan(5000));
+        expect(server.received.toString(), isNot(contains(' NOOP')),
+            reason: 'NOOP 已随 10s 拍一并退役');
+        await client.close();
+      } finally {
+        ImapIdleClient.socketFactory = null;
+        await server.close();
+      }
+    });
+
+    test('死连：DONE 无响应 → stopIdle 抛 ImapClosedException（≤15s 暴露，即时重建语义）',
+        () async {
+      final server = await _ScriptedImapServer.bind();
+      server.swallowDone = true; // 吞 DONE 的 tagged OK
+      ImapIdleClient.socketFactory =
+          (host, port, timeout) => Socket.connect(host, port, timeout: timeout);
+      try {
+        final client = ImapIdleClient(
+          config: ImapConfig(
+              account: 'acct',
+              authCode: 'code',
+              host: '127.0.0.1',
+              port: server.socket.port),
+        );
+        await client.connect();
+        expect(await client.startIdle(), isTrue);
+        expect(await client.waitForEvent(beat: const Duration(milliseconds: 300)),
+            isNull);
         final sw = Stopwatch()..start();
         Object? caught;
         try {
-          await client.waitForEvent(
-              beat: const Duration(minutes: 25),
-              noopBeat: const Duration(milliseconds: 300));
+          await client.stopIdle();
         } catch (e) {
           caught = e;
         }
         sw.stop();
         expect(caught, isA<ImapClosedException>(),
-            reason: '死连（重发 IDLE 超时）必须转断连语义即时暴露，而非聋等 25 分钟');
+            reason: 'DONE 无响应 = 死连 → 断连语义（上层即时重建），而非通用退避');
         expect(sw.elapsed.inSeconds, lessThan(15),
-            reason: '重挂超时 10s → 抛出点 ≤15s（对比改前最坏 25 分钟）');
-        expect(hops.join('|'), contains('保活节拍到点'));
+            reason: 'stopIdle 10s 超时 → 暴露点 ≤15s');
         await client.close();
       } finally {
         ImapIdleClient.socketFactory = null;

@@ -325,9 +325,14 @@ void main() {
   });
 
   group('时效契约常量（工单 ④ 硬指标的守门断言）', () {
-    test('IDLE 节拍必须 < 30 分钟（实测服务端 30.0 分钟强断）', () {
-      expect(CalendarSyncService.idleBeat, lessThan(const Duration(minutes: 30)));
-      expect(CalendarSyncService.idleBeat, const Duration(minutes: 25));
+    test('WO-82-R3：兜底看门狗节拍=90s（管理员裁决：替代 10s 高频拍，'
+        '远低于 30min 服务端强断）', () {
+      expect(
+        CalendarSyncService.idleWatchdogBeat,
+        const Duration(seconds: 90),
+      );
+      expect(CalendarSyncService.idleWatchdogBeat,
+          lessThan(const Duration(minutes: 30)));
     });
 
     test('兜底轮询必须是 15 分钟——严禁退化到 1 分钟轮询（QQ 风控 + 耗电）', () {
@@ -514,7 +519,7 @@ class FakeSource implements CalendarMailSource {
   }
 
   @override
-  Future<int?> waitForEvent({required Duration beat, Duration noopBeat = const Duration(seconds: 60)}) async {
+  Future<int?> waitForEvent({required Duration beat}) async {
     // 真实 IDLE 语义：长阻塞至 close() 唤醒（否则立即 null 会让会话循环
     // 微任务级紧密空转、饿死测试 Timer——此前用例挂死的根因）
     await _idleWake.future;
