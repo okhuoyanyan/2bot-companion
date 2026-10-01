@@ -11,9 +11,10 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
 
-    <!-- 前台服务与常驻保活权限 -->
+    <!-- 前台服务与常驻保活权限 (WO-75-R2: dataSync → specialUse——dataSync 在 Android 15 有 6h/日上限,
+         跨晨长跑必被 ForegroundServiceDidNotStopInTime 掐断; specialUse 无时限) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
@@ -50,11 +51,20 @@
             </intent-filter>
         </activity>
 
-        <!-- flutter_foreground_task 前台常驻保活服务 (dataSync 类型) -->
+        <!-- flutter_foreground_task 前台常驻保活服务 (WO-75-R2: specialUse 类型——
+             插件 8.17.0 经 ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST 采信此声明,
+             Dart 侧无类型参数) -->
         <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="specialUse"
             android:exported="false" />
+
+        <!-- WO-75-R2: specialUse 用途声明（系统/应用商店审核可读）：
+             设备状态遥测中继 + 日历 WebDAV/IMAP 双通道常驻同步，
+             用户显式开启的 7x24 保活语义，dataSync 6h 上限与之本质冲突 -->
+        <property
+            android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+            android:value="User-enabled persistent device-telemetry relay and calendar sync keepalive (7x24 by design; Android 15 dataSync 6h cap conflicts with the always-on contract the user explicitly opted into)" />
 
         <meta-data
             android:name="flutterEmbedding"
