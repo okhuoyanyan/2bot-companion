@@ -156,6 +156,10 @@ abstract class CalendarGateway {
 
   /// 通道健康探测（可选实现；默认成功）
   Future<void> ping() async {}
+
+  /// WO-86 删除协调：库内全部 UID（不可枚举的降级面返回 null → 协调静默让位，
+  /// 邮件 CANCELLED 腿仍在，语义不缺口）
+  Future<Set<String>?> storedUids() async => null;
 }
 
 /// WO-70：默认日历写入通道 = 本机事件库（CalendarProvider 路径降级为回滚面）
@@ -168,6 +172,10 @@ class EventStoreCalendarGateway implements CalendarGateway {
   @override
   Future<int> storedCount() async =>
       CalendarLocalService.instance.store.events.length;
+
+  @override
+  Future<Set<String>?> storedUids() async =>
+      CalendarLocalService.instance.store.events.keys.toSet();
 
   @override
   Future<void> ping() async {}
@@ -203,6 +211,9 @@ class MethodChannelCalendarGateway implements CalendarGateway {
 
   @override
   Future<int> storedCount() async => -1; // 降级面无法回读库内条数
+
+  @override
+  Future<Set<String>?> storedUids() async => null; // 库不可枚举 → 协调让位
 
   @override
   Future<void> ping() async {
@@ -585,7 +596,9 @@ class CalendarSyncService {
 
   /// 单拍探测（供轮询器与单测调用）：GET ctag.txt（明文，与内存值比对）→
   /// 未变 = 本拍结束（零全量 GET，配额红线）；变化 = GET calendar.ics →
-  /// 走既有解析/台账/应用管线。ctag 仅在应用成功后提交（失败不消费，下拍重拉）。
+  /// 走既有解析/台账判新/删除协调/分批应用管线（幂等；护栏拍不清库）。
+  /// ctag 在 ctag+ics 双 GET 成功后一律消费——含护栏拍（防 8s 全量 GET 死循环，
+  /// WO-86）与 0 应用拍（台账判重的合法重拉）；仅通道写失败不消费（下拍重拉）。
   @visibleForTesting
   Future<void> webdavProbeAndSync(String base,
       {HttpClient? customClient}) async {
@@ -600,8 +613,16 @@ class CalendarSyncService {
       final ctag = (await _webdavGetText(client, uri, 'ctag.txt', auth)).trim();
       if (ctag == _lastWebdavCtag) return; // 未变：零全量 GET
       final icsText = await _webdavGetText(client, uri, 'calendar.ics', auth);
+      final emptySnapshot = !icsText.toUpperCase().contains('BEGIN:VEVENT');
       final applied = await _applyIcsSnapshot(icsText);
-      _lastWebdavCtag = ctag; // 应用成功才提交 ctag（失败不消费变更）
+      _lastWebdavCtag = ctag;
+      if (emptySnapshot) return; // 护栏拍：库未动，不刷状态（[WO86] 警告行已记录）
+      // WO-86 ④：快路消费成功即刷新同步状态——根治「KashCal 秒更、面板却残留
+      // 邮件腿 error（IMAP 会话失败退避最长 15min）」的状态分裂（管理员报
+      // 「同步完成，有错误」）。仅变更拍写状态，零写放大。
+      try {
+        await _touchState(result: 'ok', applied: applied);
+      } catch (_) {}
       if (applied > 0) {
         // ignore: avoid_print
         print('[WO84] WebDAV ctag 变化 → 拉取并应用 $applied 条');
@@ -636,9 +657,17 @@ class CalendarSyncService {
   }
 
   /// 全量 ICS 快照 → 既有解析/台账判新/分批应用管线（幂等；返回应用条数）
+  /// WO-86：+空快照护栏（0 事件严禁清库）+删除协调（快照缺席 UID 按 CANCELLED
+  /// 同路移除 + 台账墓碑防复活）——手机库是 NAS 单源喂给，全量权威安全。
   Future<int> _applyIcsSnapshot(String icsText) async {
     final parsed = parseIcs(icsText);
-    if (parsed.events.isEmpty) return 0;
+    if (parsed.events.isEmpty) {
+      // WO-86 护栏②：0 事件 = NAS 侧目录被清/渲染异常，全量权威前提不成立。
+      // 库内存量原样保留，跳过本拍；ctag 由调用方消费（防 8s 全量 GET 死循环）。
+      // ignore: avoid_print
+      print('[WO86] ⚠️ 快照 0 事件（NAS 目录被清/渲染异常？）——护栏拦截，本拍不清库');
+      return 0;
+    }
     final ledger =
         CalendarEventLedger(StorageService.loadCalendarEventLedger());
     final decided = <IcsEvent>[];
@@ -648,16 +677,59 @@ class CalendarSyncService {
         ledger.recordApplied(e);
       }
     }
-    if (decided.isEmpty) return 0;
     const batchSize = 50;
+    var applied = 0;
     for (var i = 0; i < decided.length; i += batchSize) {
       final chunk = decided.sublist(i,
           (i + batchSize) < decided.length ? i + batchSize : decided.length);
       await gateway.upsertEvents(chunk.map(_eventToNativeMap).toList());
+      applied += chunk.length;
+    }
+    // WO-86 协调①：快照缺席的库内 UID = NAS 已删 → 按 CANCELLED 同路删除
+    // （cancelled:true 原生 map → 库内按 UID 移除 + 库级墓碑）。降级面
+    // （MethodChannel）库不可枚举 → storedUids=null，协调静默让位。
+    final storeUids = await gateway.storedUids();
+    if (storeUids != null) {
+      final snapshotUids = parsed.events.map((e) => e.uid).toSet();
+      final absent = storeUids.difference(snapshotUids).toList()..sort();
+      for (var i = 0; i < absent.length; i += batchSize) {
+        final chunk = absent.sublist(i,
+            (i + batchSize) < absent.length ? i + batchSize : absent.length);
+        await gateway.upsertEvents(chunk.map(_cancelTombstoneMap).toList());
+      }
+      // WO-86 协调③：台账墓碑防复活（与邮件 CANCELLED 语义同形：seq=0/lm=0。
+      // 不可保留原高水位 seq——否则 NAS 同版本重加会被 decideFor 判 skip 永久焊死）。
+      for (final uid in absent) {
+        final known = ledger.entries[uid];
+        if (known != null) {
+          known['cancelled'] = true;
+          known['sequence'] = 0;
+          known['lastModifiedMs'] = 0;
+        } else {
+          ledger.entries[uid] = {
+            'cancelled': true,
+            'sequence': 0,
+            'lastModifiedMs': 0,
+          };
+        }
+      }
+      if (absent.isNotEmpty) {
+        // ignore: avoid_print
+        print('[WO86] 删除协调：快照缺席 ${absent.length} 条 → 已按 UID 移除（台账墓碑）');
+      }
     }
     await StorageService.saveCalendarEventLedger(ledger.entries);
-    return decided.length;
+    return applied; // 删除条数走 [WO86] 行独立报告，不计入「应用」语义
   }
+
+  /// WO-86：协调删除墓碑的原生 map（与邮件 CANCELLED 同路：
+  /// applyUpserts 对 cancelled=true 按 UID 移除 + 写库级墓碑）
+  Map<String, dynamic> _cancelTombstoneMap(String uid) => {
+        'uid': uid,
+        'cancelled': true,
+        'sequence': 0,
+        'lastModifiedMs': DateTime.now().millisecondsSinceEpoch,
+      };
 
   /// 启动同步循环（幂等）：IMAP 邮件会话（90s 兜底）+ WebDAV 快路轮询器（8s/30s 分档）
   void start() {

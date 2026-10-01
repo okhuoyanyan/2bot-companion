@@ -2,7 +2,7 @@ name: bot_companion
 description: "2BOT 官方 Android 专属轻量伴侣端 - 纯血开源、0广告、极致省电的设备状态感知与生命脉搏中继客户端"
 publish_to: 'none'
 
-version: 1.6.2+31  # WO-84增补(管理员令): WebDAV轮询恒8s(删前后台8s/30s分档)——后台30s档把端到端打到23s;每拍~15字节GET电池代价可忽略
+version: 1.6.2+32  # WO-86: 快照删除协调——NAS全量ICS缺席UID按CANCELLED同路移除+台账墓碑防复活;空快照护栏(0事件严禁清库,ctag消费防死循环);快路变更拍刷新同步状态(根治「同步完成,有错误」状态分裂)
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
