@@ -406,10 +406,10 @@ class CalendarSyncService {
   /// 管理员终裁 8s IMAP 拍 → **WO-84**：8s 拍让位给 WebDAV ctag 快路（坚果云
   /// 纯文本 GET，绕开 QQ 索引层；未变零全量 GET 的配额红线），IMAP 邮件轮询
   /// 降为 90s 兜底（QQ 推送死亡 + 索引滞后 25-35s 实证下，邮件通道只承担兜底）。
-  /// 🔒 前后台分档：WebDAV 前台 8s / 后台 FGS 30s（主 isolate 生命周期写 pref，
-  /// FGS isolate 每拍读——WO-70 跨 isolate 同款模式）。
-  static const Duration webdavForegroundBeat = Duration(seconds: 8);
-  static const Duration webdavBackgroundBeat = Duration(seconds: 30);
+  /// **WO-84 增补（管理员令 2026-10-01）**：删除前台/后台分档（原 8s/30s），
+  /// **恒 8s**——管理员主流程=KashCal 看结果、伴侣 App 几乎恒为后台，30s 后台档
+  /// 把端到端打到 23s；每拍仅一个 ~15 字节 GET，电池代价可忽略。
+  static const Duration webdavBeat = Duration(seconds: 8);
   /// 邮件兜底轮询节拍（WebDAV 优先架构下的 IMAP 感知节拍）
   static const Duration mailFallbackBeat = Duration(seconds: 90);
   /// 🔒 频控熔断阶梯：429/503 或连续 2 次失败 → 60s/120s 指数退避，严禁 8s 死磕
@@ -548,26 +548,21 @@ class CalendarSyncService {
 
   Future<void> _webdavTick() async {
     if (_stopRequested) return;
-    var tier = webdavForegroundBeat;
+    // WO-84 增补：恒 8s 节拍（分档已删）；reloadPrefs 保留——凭据/开关改动下拍即生效
     try {
       await StorageService.reloadPrefs();
-      // 🔒 前后台分档：主 isolate 生命周期写 pref → FGS 每拍读（跨 isolate 桥）
-      final foreground = StorageService.prefs
-              .getBool(AppConstants.keyCalSyncForeground) ??
-          false;
-      tier = foreground ? webdavForegroundBeat : webdavBackgroundBeat;
     } catch (_) {}
     try {
       final s = settingsProvider();
       final base =
           webdavBaseFromSettings(s.webdavUser, s.webdavPass, s.webdavFolder);
       if (base == null) {
-        // 空=禁用快路：不发任何网络请求，低频自检等配置变化
-        _scheduleWebdavTick(webdavBackgroundBeat);
+        // 空=禁用快路：不发任何网络请求，恒 8s 自检等配置变化（纯 prefs 读，零外呼）
+        _scheduleWebdavTick(webdavBeat);
         return;
       }
       if (_webdavInFlight) {
-        _scheduleWebdavTick(tier);
+        _scheduleWebdavTick(webdavBeat);
         return;
       }
       _webdavInFlight = true;
@@ -585,7 +580,7 @@ class CalendarSyncService {
       // 🔴 WebDAV 异常绝不崩服务：邮件兜底无缝承接（90s 拍独立运转）
     }
     if (_stopRequested) return;
-    _scheduleWebdavTick(_webdavBackoffActive ? _webdavCurrentBackoff : tier);
+    _scheduleWebdavTick(_webdavBackoffActive ? _webdavCurrentBackoff : webdavBeat);
   }
 
   /// 单拍探测（供轮询器与单测调用）：GET ctag.txt（明文，与内存值比对）→

@@ -313,14 +313,10 @@ void main() {
   });
 
   group('时效契约常量（工单 ④ 硬指标的守门断言）', () {
-    test('WO-84 终架构：WebDAV 前台 8s / 后台 FGS 30s / 邮件兜底 90s + 熔断 60/120s', () {
+    test('WO-84 增补（管理员令）：WebDAV 恒 8s（前后台分档已删）/ 邮件兜底 90s + 熔断 60/120s', () {
       expect(
-        CalendarSyncService.webdavForegroundBeat,
+        CalendarSyncService.webdavBeat,
         const Duration(seconds: 8),
-      );
-      expect(
-        CalendarSyncService.webdavBackgroundBeat,
-        const Duration(seconds: 30),
       );
       expect(
         CalendarSyncService.mailFallbackBeat,
@@ -698,7 +694,7 @@ void main() {
       // 成功：解除熔断、清失败链
       svc.noteWebdavSuccess();
       expect(svc.webdavNextIntervalForTest, Duration.zero,
-          reason: '零=按正常分档节拍（8s/30s）调度');
+          reason: '零=按恒定 8s 节拍调度（WO-84 增补：分档已删）');
       // 普通失败连续 2 次：熔断 60s
       svc.noteWebdavFailure('超时1');
       expect(svc.webdavNextIntervalForTest, Duration.zero, reason: '第 1 次不熔断');

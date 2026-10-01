@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/app_settings.dart';
-import '../utils/constants.dart';
 import '../models/device_telemetry.dart';
 import '../services/background_task_service.dart';
 import '../services/storage_service.dart';
@@ -74,12 +73,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _checkNotificationPermission();
       _checkServiceStatus();
     }
-    // WO-84 前后台分档桥：写 pref → FGS isolate 的 WebDAV 轮询器每拍读
-    //（前台 8s / 后台 FGS 30s）。paused/inactive/detached 一律按后台。
-    try {
-      final fg = state == AppLifecycleState.resumed;
-      StorageService.prefs.setBool(AppConstants.keyCalSyncForeground, fg);
-    } catch (_) {}
+    // WO-84 增补：前后台分档桥已删——WebDAV 快路恒 8s 节拍，生命周期不再参与调度
   }
 
   /// 初始化加载本地配置与状态
