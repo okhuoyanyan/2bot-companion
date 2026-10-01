@@ -63,8 +63,6 @@ class AppConstants {
   static const String keyWebdavFolder = 'pref_webdav_folder';
   /// 坚果云应用密码（**凭据 → 仅安全存储**，纪律与 mailAuthCode 同款）
   static const String secKeyWebdavPass = 'sec_webdav_pass';
-  /// 前后台分档桥（主 isolate 生命周期写，FGS isolate 每拍读；true=前台 8s / false=后台 30s）
-  static const String keyCalSyncForeground = 'pref_cal_sync_foreground';
 
   // ============================================================
   // WO-69 日历自动同步（自写 IMAP IDLE 拉取 ICS → 自建本地日历）
