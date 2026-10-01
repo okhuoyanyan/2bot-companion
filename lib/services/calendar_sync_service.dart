@@ -156,10 +156,6 @@ abstract class CalendarGateway {
 
   /// 通道健康探测（可选实现；默认成功）
   Future<void> ping() async {}
-
-  /// WO-86 删除协调：库内全部 UID（不可枚举的降级面返回 null → 协调静默让位，
-  /// 邮件 CANCELLED 腿仍在，语义不缺口）
-  Future<Set<String>?> storedUids() async => null;
 }
 
 /// WO-70：默认日历写入通道 = 本机事件库（CalendarProvider 路径降级为回滚面）
@@ -172,10 +168,6 @@ class EventStoreCalendarGateway implements CalendarGateway {
   @override
   Future<int> storedCount() async =>
       CalendarLocalService.instance.store.events.length;
-
-  @override
-  Future<Set<String>?> storedUids() async =>
-      CalendarLocalService.instance.store.events.keys.toSet();
 
   @override
   Future<void> ping() async {}
@@ -211,9 +203,6 @@ class MethodChannelCalendarGateway implements CalendarGateway {
 
   @override
   Future<int> storedCount() async => -1; // 降级面无法回读库内条数
-
-  @override
-  Future<Set<String>?> storedUids() async => null; // 库不可枚举 → 协调让位
 
   @override
   Future<void> ping() async {
@@ -657,8 +646,9 @@ class CalendarSyncService {
   }
 
   /// 全量 ICS 快照 → 既有解析/台账判新/分批应用管线（幂等；返回应用条数）
-  /// WO-86：+空快照护栏（0 事件严禁清库）+删除协调（快照缺席 UID 按 CANCELLED
-  /// 同路移除 + 台账墓碑防复活）——手机库是 NAS 单源喂给，全量权威安全。
+  /// WO-86：+空快照护栏（0 事件严禁清库）+删除协调（**台账登记册**缺席 UID 按
+  /// CANCELLED 同路移除 + 台账墓碑防复活）。协调范围钉死在台账（NAS 喂过的
+  /// UID）——手机库另含 KashCal 本地写入源，库内全集差集会误删用户真实日程。
   Future<int> _applyIcsSnapshot(String icsText) async {
     final parsed = parseIcs(icsText);
     if (parsed.events.isEmpty) {
@@ -685,38 +675,41 @@ class CalendarSyncService {
       await gateway.upsertEvents(chunk.map(_eventToNativeMap).toList());
       applied += chunk.length;
     }
-    // WO-86 协调①：快照缺席的库内 UID = NAS 已删 → 按 CANCELLED 同路删除
-    // （cancelled:true 原生 map → 库内按 UID 移除 + 库级墓碑）。降级面
-    // （MethodChannel）库不可枚举 → storedUids=null，协调静默让位。
-    final storeUids = await gateway.storedUids();
-    if (storeUids != null) {
-      final snapshotUids = parsed.events.map((e) => e.uid).toSet();
-      final absent = storeUids.difference(snapshotUids).toList()..sort();
-      for (var i = 0; i < absent.length; i += batchSize) {
-        final chunk = absent.sublist(i,
-            (i + batchSize) < absent.length ? i + batchSize : absent.length);
-        await gateway.upsertEvents(chunk.map(_cancelTombstoneMap).toList());
+    // WO-86 协调①（修正版）：协调范围 = **台账登记册**（NAS 喂过的 UID），
+    // 不是库内全集——真机实证：KashCal 经手机本地 CalDAV 写入的日程只存在
+    // 于手机库、永不下入 NAS（订单「手机库 = NAS 单源喂给」前提对这部分
+    // 不成立），按库内全集做缺席差集会误删用户真实日程。台账 = 同步管线
+    // （NAS 快照 + NAS 邮件）喂过的完整登记：缺席 = NAS 已删 → 按 CANCELLED
+    // 同路删除；不在台账的手机本地件永不触碰。
+    final fedUids = ledger.entries.keys
+        .where((uid) => ledger.entries[uid]?['cancelled'] != true)
+        .toSet();
+    final snapshotUids = parsed.events.map((e) => e.uid).toSet();
+    final absent = fedUids.difference(snapshotUids).toList()..sort();
+    for (var i = 0; i < absent.length; i += batchSize) {
+      final chunk = absent.sublist(i,
+          (i + batchSize) < absent.length ? i + batchSize : absent.length);
+      await gateway.upsertEvents(chunk.map(_cancelTombstoneMap).toList());
+    }
+    // WO-86 协调③：台账墓碑防复活（与邮件 CANCELLED 语义同形：seq=0/lm=0。
+    // 不可保留原高水位 seq——否则 NAS 同版本重加会被 decideFor 判 skip 永久焊死）。
+    for (final uid in absent) {
+      final known = ledger.entries[uid];
+      if (known != null) {
+        known['cancelled'] = true;
+        known['sequence'] = 0;
+        known['lastModifiedMs'] = 0;
+      } else {
+        ledger.entries[uid] = {
+          'cancelled': true,
+          'sequence': 0,
+          'lastModifiedMs': 0,
+        };
       }
-      // WO-86 协调③：台账墓碑防复活（与邮件 CANCELLED 语义同形：seq=0/lm=0。
-      // 不可保留原高水位 seq——否则 NAS 同版本重加会被 decideFor 判 skip 永久焊死）。
-      for (final uid in absent) {
-        final known = ledger.entries[uid];
-        if (known != null) {
-          known['cancelled'] = true;
-          known['sequence'] = 0;
-          known['lastModifiedMs'] = 0;
-        } else {
-          ledger.entries[uid] = {
-            'cancelled': true,
-            'sequence': 0,
-            'lastModifiedMs': 0,
-          };
-        }
-      }
-      if (absent.isNotEmpty) {
-        // ignore: avoid_print
-        print('[WO86] 删除协调：快照缺席 ${absent.length} 条 → 已按 UID 移除（台账墓碑）');
-      }
+    }
+    if (absent.isNotEmpty) {
+      // ignore: avoid_print
+      print('[WO86] 删除协调：NAS 登记册缺席 ${absent.length} 条 → 已按 UID 移除（台账墓碑）');
     }
     await StorageService.saveCalendarEventLedger(ledger.entries);
     return applied; // 删除条数走 [WO86] 行独立报告，不计入「应用」语义

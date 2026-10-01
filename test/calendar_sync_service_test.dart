@@ -794,7 +794,7 @@ void main() {
     });
   });
 
-  group('WO-86 删除协调（快照权威：手机库 = NAS 单源喂给）', () {
+  group('WO-86 删除协调（台账登记册范围：NAS 喂过的 UID 才可协调删除）', () {
     /// 本地 dav 夹具：ctag/ics 两端点（占位符凭据，loopback）
     Future<(HttpServer, String)> startDav({
         required String Function() ctag, required String Function() ics}) async {
@@ -823,11 +823,18 @@ void main() {
       return (dav, 'http://127.0.0.1:${dav.port}/dav/2bot-cal/');
     }
 
-    test('协调①③：快照缺席 UID 按 CANCELLED 同路移除 + 台账墓碑；重加同 UID 高版本可复活', () async {
+    test('协调①③：台账喂过的 UID 缺席 → CANCELLED 同路移除+墓碑；手机本地件（不在台账）永不触碰；重加高版本可复活', () async {
       var ctag = 'wo86-1';
-      var ics = _ics('wo86-keep'); // gone 缺席 = NAS 已删
+      final gateway = Wo86Gateway(storeUids: {'wo86-local'}); // KashCal 本地件：库有、台账无
+      var ics = 'BEGIN:VCALENDAR\r\n'
+          'BEGIN:VEVENT\r\nUID:wo86-keep\r\nSEQUENCE:0\r\n'
+          'LAST-MODIFIED:20260927T010000Z\r\nDTSTART:20260928T090000Z\r\n'
+          'DURATION:PT1H\r\nSUMMARY:夹具日程\r\nEND:VEVENT\r\n'
+          'BEGIN:VEVENT\r\nUID:wo86-gone\r\nSEQUENCE:0\r\n'
+          'LAST-MODIFIED:20260927T010000Z\r\nDTSTART:20260928T090000Z\r\n'
+          'DURATION:PT1H\r\nSUMMARY:夹具日程\r\nEND:VEVENT\r\n'
+          'END:VCALENDAR\r\n';
       final (dav, base) = await startDav(ctag: () => ctag, ics: () => ics);
-      final gateway = Wo86Gateway(storeUids: {'wo86-keep', 'wo86-gone'});
       try {
         final svc = CalendarSyncService.test(
           settingsProvider: () => AppSettings(
@@ -839,19 +846,25 @@ void main() {
           sourceFactory: (_) => FakeSource(uidValidity: 1, result: scan([], 0)),
           gateway: gateway,
         );
+        // 拍 1：NAS 快照喂 keep+gone → 入库 + 台账登记（local 不在快照，不被触碰）
         await svc.webdavProbeAndSync(base);
+        expect(gateway.storeUids, {'wo86-local', 'wo86-keep', 'wo86-gone'});
 
-        // 快照缺席 → 库内移除 + 库级墓碑；在场事件原样
-        expect(gateway.storeUids, {'wo86-keep'},
-            reason: '快照缺席的 UID 必须被协调删除（原纯 upsert 缺陷）');
+        // 拍 2：NAS 删 gone（快照缺席）→ 协调删除；local 不在台账 → 永不触碰
+        ctag = 'wo86-2';
+        ics = _ics('wo86-keep');
+        await svc.webdavProbeAndSync(base);
+        expect(gateway.storeUids, {'wo86-local', 'wo86-keep'},
+            reason: '台账喂过的缺席 UID 被协调删除（原纯 upsert 缺陷）');
         expect(gateway.tombstones, {'wo86-gone'}, reason: '与 CANCELLED 同路：库级墓碑');
-        // 台账墓碑（防复活）：同形 seq=0/lm=0
         final ledger = StorageService.loadCalendarEventLedger();
         expect(ledger['wo86-gone']?['cancelled'], true, reason: '台账墓碑防复活');
         expect(ledger['wo86-gone']?['sequence'], 0);
+        expect(ledger.containsKey('wo86-local'), false,
+            reason: '手机本地件不进台账（非 NAS 喂）');
 
-        // 防复活边界验证：NAS 重加同 UID 但版本更高 → 判新复活（墓碑让位权威）
-        ctag = 'wo86-2';
+        // 拍 3：NAS 重加同 UID 高版本 → 判新复活（墓碑让位权威）；local 仍存活
+        ctag = 'wo86-3';
         ics = 'BEGIN:VCALENDAR\r\n'
             'BEGIN:VEVENT\r\nUID:wo86-keep\r\nSEQUENCE:0\r\n'
             'LAST-MODIFIED:20260927T010000Z\r\nDTSTART:20260928T090000Z\r\n'
@@ -861,7 +874,7 @@ void main() {
             'DURATION:PT1H\r\nSUMMARY:夹具日程\r\nEND:VEVENT\r\n'
             'END:VCALENDAR\r\n';
         await svc.webdavProbeAndSync(base);
-        expect(gateway.storeUids, {'wo86-keep', 'wo86-gone'},
+        expect(gateway.storeUids, {'wo86-local', 'wo86-keep', 'wo86-gone'},
             reason: 'NAS 重加（seq=1 > 墓碑 seq=0）→ 判新复活');
         expect(gateway.tombstones, isEmpty,
             reason: '复活语义：同 UID 重新出现即移除库级墓碑');
@@ -913,30 +926,6 @@ void main() {
         expect(icsGets, 1, reason: '护栏拍后严禁逐拍重拉全量（配额红线）');
       } finally {
         await monitor.close(force: true);
-      }
-    });
-
-    test('降级面：库不可枚举（storedUids=null）协调静默让位，邮件 CANCELLED 腿不缺口', () async {
-      final (dav, base) = await startDav(
-          ctag: () => 'wo86-d1', ics: () => _ics('wo86-a'));
-      final batches = <List<Map<String, dynamic>>>[];
-      final svc = CalendarSyncService.test(
-        settingsProvider: () => AppSettings(
-          calendarSyncEnabled: true,
-          webdavUser: 'user@example.invalid',
-          webdavPass: 'apppass',
-          webdavFolder: base,
-        ),
-        sourceFactory: (_) => FakeSource(uidValidity: 1, result: scan([], 0)),
-        gateway: FakeGateway(onUpsert: (b) => batches.add(b)),
-      );
-      try {
-        await svc.webdavProbeAndSync(base); // 不得抛
-        expect(batches.single.single['uid'], 'wo86-a');
-        expect(batches.single.single['cancelled'], isNot(true),
-            reason: '降级面无库清单 → 无协调墓碑批次（邮件腿语义仍在）');
-      } finally {
-        await dav.close(force: true);
       }
     });
   });
@@ -999,9 +988,6 @@ class FakeGateway implements CalendarGateway {
   Future<int> storedCount() async => -1;
 
   @override
-  Future<Set<String>?> storedUids() async => null;
-
-  @override
   Future<void> ping() async {}
 }
 
@@ -1031,9 +1017,6 @@ class Wo86Gateway implements CalendarGateway {
 
   @override
   Future<int> storedCount() async => storeUids.length;
-
-  @override
-  Future<Set<String>?> storedUids() async => {...storeUids};
 
   @override
   Future<void> ping() async {}
