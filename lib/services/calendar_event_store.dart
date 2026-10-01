@@ -29,6 +29,36 @@ String _fmtIcsUtc(DateTime utc) {
       'T${two(u.hour)}${two(u.minute)}${two(u.second)}Z';
 }
 
+/// WO-76 护栏 G2：防御性转换 reminderMinutes（可空、非负整数、宽容 String/num；
+/// 负数归一化为 null；畸形记录日志不抛异常，防 TypeError 崩溃）
+int? _parseReminderMinutes(dynamic v) {
+  if (v == null) return null;
+  if (v is num) {
+    final n = v.toInt();
+    return n >= 0 ? n : null;
+  }
+  if (v is String) {
+    final n = int.tryParse(v.trim());
+    if (n != null) {
+      return n >= 0 ? n : null;
+    }
+    // ignore: avoid_print
+    print('[WO76] 畸形 reminderMinutes: "$v"，已归一为 null');
+    return null;
+  }
+  // ignore: avoid_print
+  print('[WO76] 畸形 reminderMinutes 类型: ${v.runtimeType} ($v)，已归一为 null');
+  return null;
+}
+
+/// WO-76：导出 TRIGGER 形态（RFC 5545 Duration，严禁绝对时间戳）
+String _formatReminderTrigger(int remMin) {
+  if (remMin == 0) return 'PT0S';
+  if (remMin % 1440 == 0) return '-P${remMin ~/ 1440}D';
+  if (remMin % 60 == 0) return '-PT${remMin ~/ 60}H';
+  return '-PT${remMin}M';
+}
+
 /// 库内单个事件（字段即渲染所需全部；时间均为 epoch ms）
 class StoredEvent {
   final String uid;
@@ -40,6 +70,7 @@ class StoredEvent {
   final String? rrule;
   final String summary;
   final String? description;
+  final int? reminderMinutes;
 
   const StoredEvent({
     required this.uid,
@@ -51,6 +82,7 @@ class StoredEvent {
     required this.summary,
     this.rrule,
     this.description,
+    this.reminderMinutes,
   });
 
   Map<String, dynamic> toJson() => {
@@ -63,6 +95,7 @@ class StoredEvent {
         'summary': summary,
         if (rrule != null) 'rrule': rrule,
         if (description != null) 'description': description,
+        if (reminderMinutes != null) 'reminderMinutes': reminderMinutes,
       };
 
   static StoredEvent fromJson(Map<String, dynamic> j) => StoredEvent(
@@ -75,6 +108,7 @@ class StoredEvent {
         summary: (j['summary'] as String?) ?? '(无标题)',
         rrule: j['rrule'] as String?,
         description: j['description'] as String?,
+        reminderMinutes: _parseReminderMinutes(j['reminderMinutes']),
       );
 
   /// 单事件 VEVENT 文本（WO-69 通道事件 → CalDAV 资源；对齐 NAS 渲染语义）
@@ -119,6 +153,15 @@ class StoredEvent {
     buf.writeln('SUMMARY:${_escapeIcsText(summary)}');
     if (description != null && description!.isNotEmpty) {
       buf.writeln('DESCRIPTION:${_escapeIcsText(description!)}');
+    }
+    // WO-76 护栏 G1：严禁凭空造提醒——当且仅当 reminderMinutes != null 才输出 BEGIN:VALARM
+    // 字段为 null（含 NAS 节日事件已定点豁免）恒不输出 VALARM，严禁擅自补齐默认提醒
+    if (reminderMinutes != null) {
+      buf.writeln('BEGIN:VALARM');
+      buf.writeln('ACTION:DISPLAY');
+      buf.writeln('DESCRIPTION:${_escapeIcsText(summary)}');
+      buf.writeln('TRIGGER:${_formatReminderTrigger(reminderMinutes!)}');
+      buf.writeln('END:VALARM');
     }
     buf.write('END:VEVENT');
     return buf.toString();
@@ -240,6 +283,7 @@ class CalendarEventStore {
         summary: (e['summary'] as String?) ?? '(无标题)',
         rrule: e['rrule'] as String?,
         description: e['description'] as String?,
+        reminderMinutes: _parseReminderMinutes(e['reminderMinutes']),
       );
       tombstones.remove(uid); // 复活语义：同 UID 重新出现即移除墓碑
       applied++;

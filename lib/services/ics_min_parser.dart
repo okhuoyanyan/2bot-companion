@@ -24,6 +24,7 @@ class IcsEvent {
   final String? description;
   final String? rrule;
   final bool cancelled;
+  final int? reminderMinutes;
 
   const IcsEvent({
     required this.uid,
@@ -38,15 +39,22 @@ class IcsEvent {
     this.description,
     this.rrule,
     this.cancelled = false,
+    this.reminderMinutes,
   });
 }
 
 /// 解析结果：[events] 为成功解析的事件；[errors] 为跳过原因（不中断整体解析）
+/// [ignoredAbsoluteTriggerCount] 为遇到绝对时间 TRIGGER 而显式忽略的计数（WO-76）
 class IcsParseResult {
   final List<IcsEvent> events;
   final List<String> errors;
+  final int ignoredAbsoluteTriggerCount;
 
-  const IcsParseResult({required this.events, required this.errors});
+  const IcsParseResult({
+    required this.events,
+    required this.errors,
+    this.ignoredAbsoluteTriggerCount = 0,
+  });
 }
 
 /// RFC 5545 文本转义还原（TEXT 值：\\n / \\, / \\; / \\\\）
@@ -169,6 +177,28 @@ int? _parseInt(String? v) {
   return int.tryParse(v.trim());
 }
 
+/// 解析 VALARM TRIGGER：相对时长转分钟数；绝对时间戳（VALUE=DATE-TIME 或时间戳字符串）返回 isAbsolute=true（WO-76）
+({int? minutes, bool isAbsolute}) _parseValarmTrigger(
+    String value, Map<String, String> params) {
+  final v = value.trim();
+  final isExplicitDateTime = params['VALUE']?.toUpperCase() == 'DATE-TIME';
+  if (isExplicitDateTime || RegExp(r'^\d{8}T\d{6}').hasMatch(v)) {
+    return (minutes: null, isAbsolute: true);
+  }
+  final dur = _parseIcsDuration(v);
+  if (dur == null) {
+    return (minutes: null, isAbsolute: false);
+  }
+  if (dur.inSeconds == 0) {
+    return (minutes: 0, isAbsolute: false);
+  }
+  if (dur.isNegative) {
+    final mins = (-dur.inSeconds / 60).round();
+    return (minutes: mins >= 0 ? mins : null, isAbsolute: false);
+  }
+  return (minutes: null, isAbsolute: false);
+}
+
 /// 解析 ICS 全文 → [IcsParseResult]。永不抛出：坏行忽略，坏事件记入 errors。
 IcsParseResult parseIcs(String raw) {
   final events = <IcsEvent>[];
@@ -186,8 +216,14 @@ IcsParseResult parseIcs(String raw) {
   String? description;
   String? rrule;
   bool cancelled = false;
+  int? reminderMinutes;
   var inEvent = false;
-  final List<String> skipStack = <String>[]; // 未识别组件（VTIMEZONE/VALARM/自定义）栈
+  var inAlarm = false;
+  String? alarmAction;
+  String? alarmTrigger;
+  Map<String, String>? alarmTriggerParams;
+  var ignoredAbsoluteTriggerCount = 0;
+  final List<String> skipStack = <String>[]; // 未识别组件（VTIMEZONE/自定义）栈
 
   void resetEvent() {
     uid = null;
@@ -202,6 +238,11 @@ IcsParseResult parseIcs(String raw) {
     description = null;
     rrule = null;
     cancelled = false;
+    reminderMinutes = null;
+    inAlarm = false;
+    alarmAction = null;
+    alarmTrigger = null;
+    alarmTriggerParams = null;
   }
 
   for (final line in unfoldIcsLines(raw)) {
@@ -233,13 +274,36 @@ IcsParseResult parseIcs(String raw) {
           inEvent = true;
         } else if (comp == 'VCALENDAR') {
           // 根容器（可多层包裹）透明处理：绝不跳过内部 VEVENT
+        } else if (comp == 'VALARM' && inEvent) {
+          inAlarm = true;
+          alarmAction = null;
+          alarmTrigger = null;
+          alarmTriggerParams = null;
         } else {
           skipStack.add(comp);
         }
         break;
       case 'END':
         final comp = value.trim().toUpperCase();
-        if (comp == 'VEVENT' && inEvent) {
+        if (comp == 'VALARM' && inAlarm) {
+          inAlarm = false;
+          if (alarmTrigger != null) {
+            final pt = _parseValarmTrigger(
+                alarmTrigger!, alarmTriggerParams ?? const {});
+            if (pt.isAbsolute) {
+              ignoredAbsoluteTriggerCount++;
+            }
+            if (alarmAction == 'DISPLAY') {
+              if (pt.minutes != null && reminderMinutes == null) {
+                reminderMinutes = pt.minutes;
+              }
+            }
+          }
+          alarmAction = null;
+          alarmTrigger = null;
+          alarmTriggerParams = null;
+        } else if (comp == 'VEVENT' && inEvent) {
+          inAlarm = false;
           if (uid == null || uid!.isEmpty) {
             errors.add('VEVENT 缺少 UID，已跳过');
           } else if (dtstart == null) {
@@ -258,26 +322,38 @@ IcsParseResult parseIcs(String raw) {
               description: description,
               rrule: rrule,
               cancelled: cancelled,
+              reminderMinutes: reminderMinutes,
             ));
           }
           resetEvent();
           inEvent = false;
         }
         break;
+      case 'ACTION':
+        if (inAlarm) {
+          alarmAction = value.trim().toUpperCase();
+        }
+        break;
+      case 'TRIGGER':
+        if (inAlarm) {
+          alarmTrigger = value.trim();
+          alarmTriggerParams = prop.params;
+        }
+        break;
       case 'UID':
-        if (inEvent) uid = value.trim();
+        if (inEvent && !inAlarm) uid = value.trim();
         break;
       case 'SEQUENCE':
-        if (inEvent) sequence = _parseInt(value) ?? 0;
+        if (inEvent && !inAlarm) sequence = _parseInt(value) ?? 0;
         break;
       case 'DTSTAMP':
-        if (inEvent) dtstamp = _parseIcsDateTime(value, false);
+        if (inEvent && !inAlarm) dtstamp = _parseIcsDateTime(value, false);
         break;
       case 'LAST-MODIFIED':
-        if (inEvent) lastModified = _parseIcsDateTime(value, false);
+        if (inEvent && !inAlarm) lastModified = _parseIcsDateTime(value, false);
         break;
       case 'DTSTART':
-        if (inEvent) {
+        if (inEvent && !inAlarm) {
           dtstartIsDate =
               prop.params['VALUE']?.toUpperCase() == 'DATE' ||
                   RegExp(r'^\d{8}$').hasMatch(value.trim());
@@ -285,22 +361,22 @@ IcsParseResult parseIcs(String raw) {
         }
         break;
       case 'DTEND':
-        if (inEvent) dtend = _parseIcsDateTime(value, false);
+        if (inEvent && !inAlarm) dtend = _parseIcsDateTime(value, false);
         break;
       case 'DURATION':
-        if (inEvent) duration = _parseIcsDuration(value);
+        if (inEvent && !inAlarm) duration = _parseIcsDuration(value);
         break;
       case 'SUMMARY':
-        if (inEvent) summary = _unescapeText(value);
+        if (inEvent && !inAlarm) summary = _unescapeText(value);
         break;
       case 'DESCRIPTION':
-        if (inEvent) description = _unescapeText(value);
+        if (inEvent && !inAlarm) description = _unescapeText(value);
         break;
       case 'RRULE':
-        if (inEvent) rrule = value.trim();
+        if (inEvent && !inAlarm) rrule = value.trim();
         break;
       case 'STATUS':
-        if (inEvent) cancelled = value.trim().toUpperCase() == 'CANCELLED';
+        if (inEvent && !inAlarm) cancelled = value.trim().toUpperCase() == 'CANCELLED';
         break;
       default:
         // 未知属性一律忽略（不得抛错）
@@ -311,5 +387,9 @@ IcsParseResult parseIcs(String raw) {
   if (inEvent) {
     errors.add('ICS 末尾存在未闭合 VEVENT（UID: ${uid ?? '<缺>'}），已跳过');
   }
-  return IcsParseResult(events: events, errors: errors);
+  return IcsParseResult(
+    events: events,
+    errors: errors,
+    ignoredAbsoluteTriggerCount: ignoredAbsoluteTriggerCount,
+  );
 }

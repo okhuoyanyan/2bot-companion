@@ -651,6 +651,10 @@ class CalendarSyncService {
   /// UID）——手机库另含 KashCal 本地写入源，库内全集差集会误删用户真实日程。
   Future<int> _applyIcsSnapshot(String icsText) async {
     final parsed = parseIcs(icsText);
+    if (parsed.ignoredAbsoluteTriggerCount > 0) {
+      // ignore: avoid_print
+      print('[WO76] VALARM 忽略绝对时间 TRIGGER: ${parsed.ignoredAbsoluteTriggerCount} 条');
+    }
     if (parsed.events.isEmpty) {
       // WO-86 护栏②：0 事件 = NAS 侧目录被清/渲染异常，全量权威前提不成立。
       // 库内存量原样保留，跳过本拍；ctag 由调用方消费（防 8s 全量 GET 死循环）。
@@ -1091,6 +1095,10 @@ class CalendarSyncService {
         continue;
       }
       final parsed = parseIcs(icsText);
+      if (parsed.ignoredAbsoluteTriggerCount > 0) {
+        // ignore: avoid_print
+        print('[WO76] VALARM 忽略绝对时间 TRIGGER: ${parsed.ignoredAbsoluteTriggerCount} 条 (UID ${mail.uid})');
+      }
       if (parsed.events.isEmpty && parsed.errors.isNotEmpty) {
         badCount++;
         errors.add('UID ${mail.uid}: ICS 解析失败（${parsed.errors.first}）');
@@ -1197,7 +1205,7 @@ class CalendarSyncService {
     return utc; // UTC 时刻（本地差值用 DateTime.now() 差分，天然无歧义）
   }
 
-  Map<String, dynamic> _eventToNativeMap(IcsEvent e) {
+  static Map<String, dynamic> _eventToNativeMap(IcsEvent e) {
     // 结束时间：DTEND 优先，其次 DURATION；全天缺省 1 天、定时缺省 1 小时（防御性）
     Duration effectiveDuration = e.duration ??
         (e.allDay ? const Duration(days: 1) : const Duration(hours: 1));
@@ -1217,8 +1225,13 @@ class CalendarSyncService {
       'summary': e.summary,
       'description': e.description,
       'cancelled': e.cancelled,
+      'reminderMinutes': e.reminderMinutes,
     };
   }
+
+  @visibleForTesting
+  static Map<String, dynamic> eventToNativeMap(IcsEvent e) =>
+      _eventToNativeMap(e);
 
   String _formatWait(Duration d) {
     if (d.inMinutes >= 1) return d.inMinutes >= 15 ? '15 分钟' : '${d.inMinutes} 分钟';
