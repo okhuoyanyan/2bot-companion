@@ -647,6 +647,7 @@ class ImapIdleClient {
       fetchNewSince(
     int lastProcessedUid, {
     Duration timeout = const Duration(seconds: 15),
+    bool headersOnly = false,
   }) async {
     // RFC 3501 怪癖：UID n:* 在 n 大于最大 UID 时返回最大 UID 那封——
     // 结果必须再按 `uid > lastProcessedUid` 过滤（NAS 侧同款处理）。
@@ -670,6 +671,19 @@ class ImapIdleClient {
     final fresh = candidates.where((u) => u > lastProcessedUid).toList()..sort();
     final maxSeenUid =
         candidates.isEmpty ? 0 : candidates.reduce((a, b) => a > b ? a : b);
+    // [WO-101 条款③] 仅头部档位（回退验证重扫专用）：只做 UID SEARCH 取候选集与
+    // maxSeen（**粗筛同口径 = SEARCH 候选集 max**，见紧邻上一行），不拉
+    // HEADER/FULL 正文——省 ~20s/轮并减少 QQ 侧全文拉取；上层对该档结果
+    // 一律「只验不放」（重扫帧 100% 零应用）。IDLE/会话管理/其它命令路径不受影响。
+    if (headersOnly) {
+      _log('IMAP .. SEARCH-only（仅头部档）：候选=${candidates.length}，'
+          'maxSeen=$maxSeenUid，跳过实体拉取');
+      return (
+        mails: const <CalendarMail>[],
+        maxSeenUid: maxSeenUid,
+        candidates: candidates
+      );
+    }
     if (fresh.isEmpty) {
       return (
         mails: const <CalendarMail>[],
