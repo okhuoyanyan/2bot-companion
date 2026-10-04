@@ -261,8 +261,10 @@ abstract class CalendarMailSource {
   /// 连接并 SELECT INBOX；返回 UIDVALIDITY（拿不到为 null）
   Future<int?> connect();
 
+  /// [WO-101 条款③] headersOnly=true 时只做 UID SEARCH（返回 maxSeenUid/candidates，
+  /// mails 恒空、不拉 HEADER/FULL 正文）——回退验证重扫专用「只验不放」档位。
   Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
-      fetchNewSince(int lastProcessedUid);
+      fetchNewSince(int lastProcessedUid, {bool headersOnly = false});
 
   Future<bool> startIdle();
   Future<int?> waitForEvent({required Duration beat});
@@ -312,8 +314,8 @@ class QqImapSource implements CalendarMailSource {
 
   @override
   Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
-      fetchNewSince(int lastProcessedUid) async {
-    return _client!.fetchNewSince(lastProcessedUid);
+      fetchNewSince(int lastProcessedUid, {bool headersOnly = false}) async {
+    return _client!.fetchNewSince(lastProcessedUid, headersOnly: headersOnly);
   }
 
   @override
@@ -373,6 +375,13 @@ class CalendarSyncService {
   /// 冷却退化成每 ~36s 一轮 11s 重验证）；「序列是否重置」与具体水位线无关，
   /// 10 分钟内一次「序列健在」结论全局有效。真重置最坏延迟一冷却窗发现。
   DateTime? _rollbackVerifiedAt;
+  /// [WO-101 补充块 4] 回退验证结论缓存：键=(uidValidity, boxExists, lastUid)（重扫
+  /// 判定帧粗筛 maxSeen 恒为 0，不得用作键），值=判定结论
+  /// （true_reset / sequence_intact / transient）。
+  /// 跳过判据仍用 _rollbackVerifiedAt 的既有 10 分钟纯时间冷却（跨水位线有效）。
+  final Map<String, String> _rollbackConclusion = <String, String>{};
+  /// [WO-101] 已打印过缓存命中行的键（同组合复现只记一行日志）
+  final Set<String> _rollbackCacheLogged = <String>{};
   String _mode = 'off';
 
   /// 主 isolate / 测试用默认构造
@@ -950,58 +959,79 @@ class CalendarSyncService {
     var mails = scan.mails;
     var maxSeen = scan.maxSeenUid;
     var candidates = scan.candidates;
+    // [WO-101] 状态 a 回正水位线的落盘标记：回正后 next==lastUid，既有
+    // `next > lastUid` 判据恒假 → 必须在空返回分支显式落盘（见下）
+    var rolledBack = false;
     // WO-78-R3 返工③：QQ UID 序列重置防御——实测 QQ 在某时刻【静默重置 UID 序列】
     //（UIDVALIDITY 不变：违反 RFC 3501）：旧水位线(1238) 高于新序列最大 UID，
     // SEARCH UID n:* 永远空返回 → 水位线机制对该账号失效。防御：粗筛空返回
     // 且 boxExists < 水位线 → 判定序列重置 → 水位线回退到 boxExists 全量重扫
-    //（幂等 upsert + 台账判重保证无害；新序列 minUID=1/maxUID=EXISTS 实测一致）。
+    //（新序列 minUID=1/maxUID=EXISTS 实测一致）。
     // WO-78-R3 返工③ + WO-82-R3 v2（真机实证修正 19:46）：QQ UID 序列重置防御。
     // 🔴 v2 修正：信箱带历史删除/移出（真机实证 EXISTS=1018 << 最大UID≈1290），
     // 旧判据「boxExists < 水位线 ⇒ 序列重置」在带删信箱【恒真】→ 每拍误鸣且回退
-    // 重扫遇 SEARCH 瞬断（同刻 NAS 侧同命令返回正常——连接级瞬断）时把会话打进
-    // 降级循环。改为【验证后采纳】三态：
-    //  a) 回退重扫非空且 maxSeen < 回退前水位线 → 真重置（新序列低位且活着）→ 采纳；
-    //  b) 回退重扫非空且 maxSeen ≥ 回退前 → 序列健在 → 恢复原水位线（重扫件台账幂等）；
-    //  c) 回退重扫空返回（EXISTS 明言有信）→ SEARCH 瞬断（非重置）→ 恢复原水位线，
-    //     交下方缺口/空返回重扫自愈。
+    // 重扫遇 SEARCH 瞬断时把会话打进降级循环。改为【验证后处置】三态。
+    // 🔴 v3（WO-101 · 2026-10-04）【只验不放】：v2 的 a/b 两态把 retry 件赋回应用
+    // 路径，实测让「已被协调删除 + 低水位墓碑」的历史件每轮复活（447 vs 412 事故）。
+    // v3：重扫帧 100% 零应用——只消费 retry.maxSeenUid（粗筛候选集 max，与正常拍
+    // 同口径）做判定与水位线校准：
+    //  a) retryMax < 回退前水位线（且 >0）→ 真重置 → **仅**回正水位线到 boxExists
+    //     （不重放历史；库为本地持久化资产，UID 空间重置不丢内容）；
+    //  b) retryMax ≥ 回退前 → 序列健在 → 丢弃历史件（不应用），水位线不变；
+    //  c) retryMax == 0 → SEARCH 瞬断（非重置）→ 水位线不变，交下方缺口/空返回
+    //     重扫自愈。
+    //  重扫帧内即使含 UID>水位线 的新件也不得应用——由后续正常拍（8s/IDLE/节拍）交付。
     if (mails.isEmpty && maxSeen == 0 && boxExists != null && boxExists < lastUid) {
       final preRollback = lastUid;
+      // [WO-101 补充块 4] 结论缓存键 = (uidValidity, boxExists, lastUid)；
+      // 重扫判定帧粗筛 maxSeen 恒为 0（见上方触发条件），不得用作键。
+      final cacheKey = '${uidValidity ?? '-'}|$boxExists|$lastUid';
+      // 跳过判据 = 既有【纯时间冷却】（跨水位线仍有效；以水位线为跳过键会在每次
+      // 消费后失效——真机 21:30 实证退化成每 ~36s 一轮重验证）。
       final verifiedRecently = _rollbackVerifiedAt != null &&
           DateTime.now().difference(_rollbackVerifiedAt!) <
               const Duration(minutes: 10);
-      if (!verifiedRecently) {
+      if (verifiedRecently) {
+        // 同组合复现：只记一行日志、不再重扫
+        if (_rollbackCacheLogged.add(cacheKey)) {
+          final conclusion = _rollbackConclusion[cacheKey] ?? 'unknown';
+          // ignore: avoid_print
+          print('[WO101] 10 分钟冷却内（key=$cacheKey）→ 跳过重扫；上次结论=$conclusion');
+        }
+      } else {
         // ignore: avoid_print
         print('[WO78-R3] boxExists($boxExists) < 水位线($lastUid) → 回退验证重扫'
-            '（v2 三态：真重置/序列健在/SEARCH 瞬断）');
-        final retry = await source.fetchNewSince(boxExists);
+            '（v3 只验不放：仅头部档，重扫帧 100% 零应用）');
+        final retry = await source.fetchNewSince(boxExists, headersOnly: true);
         _rollbackVerifiedAt = DateTime.now();
-        if (retry.mails.isNotEmpty || retry.maxSeenUid > 0) {
-          if (retry.maxSeenUid < preRollback) {
-            // a) 真重置
+        // [WO-101] 重扫帧**只消费 retry.maxSeenUid**（粗筛候选集 max，与正常拍
+        // 同口径）做三态判定与水位线校准；mails/maxSeen/candidates 一律不赋回
+        // 应用路径——「只验不放」不变量。新件交后续正常拍（8s/IDLE/节拍）交付。
+        final retryMax = retry.maxSeenUid;
+        if (retryMax > 0) {
+          if (retryMax < preRollback) {
+            // a) 真重置：仅校准水位线（不重放历史）
             // ignore: avoid_print
-            print('[WO78-R3] 重置验证成立（新基线 max=${retry.maxSeenUid} < '
-                '$preRollback）→ 水位线回退至 $boxExists 全量重扫（幂等）');
-            mails = retry.mails;
-            maxSeen = retry.maxSeenUid;
-            candidates = retry.candidates;
+            print('[WO78-R3] 真重置→仅校准水位线（不重放）：重扫 max=$retryMax '
+                '< $preRollback，水位线回正至 $boxExists');
             lastUid = boxExists;
+            rolledBack = true;
+            _rollbackConclusion[cacheKey] = 'true_reset';
           } else {
-            // b) 序列健在
+            // b) 序列健在：丢弃历史件（不应用）
             // ignore: avoid_print
-            print('[WO78-R3] 序列健在（重扫 max=${retry.maxSeenUid} ≥ $preRollback）'
-                '→ 恢复水位线 $preRollback（重扫件台账幂等去重）');
-            mails = retry.mails;
-            maxSeen = retry.maxSeenUid;
-            candidates = retry.candidates;
+            print('[WO78-R3] 序列健在→丢弃历史件（不应用）：重扫 max=$retryMax '
+                '≥ $preRollback，水位线保持 $preRollback');
+            _rollbackConclusion[cacheKey] = 'sequence_intact';
           }
         } else {
           // c) SEARCH 瞬断
           // ignore: avoid_print
           print('[WO82] 回退重扫空返回（EXISTS=$boxExists 明言有信）→ 判 SEARCH '
               '瞬断，恢复水位线 $preRollback（交缺口重扫自愈）');
+          _rollbackConclusion[cacheKey] = 'transient';
         }
       }
-      // verifiedRecently=true → 静默跳过（8s 拍常态路径零开销零日志）
     }
 
     // WO-82-R3 追加（12:12 跳信定案）：缺口检测 + 有界重扫。
@@ -1063,7 +1093,9 @@ class CalendarSyncService {
     if (mails.isEmpty) {
       // 空扫也推进（防重复扫），与 NAS 同口径
       final next = maxSeen > lastUid ? maxSeen : lastUid;
-      if (next > lastUid) {
+      // [WO-101 确认项②] 状态 a 回正后 next == lastUid，`next > lastUid` 恒假；
+      // 回正值必须显式落盘（本函数是唯一落盘路径，调用方只保存其返回值）。
+      if (next > lastUid || rolledBack) {
         await StorageService.saveCalendarWatermark(
             uidValidity: uidValidity, lastProcessedUid: next);
       }

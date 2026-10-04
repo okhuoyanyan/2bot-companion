@@ -558,16 +558,16 @@ void main() {
       expect(next, 1262);
     });
 
-    test('v2-a 真重置：回退重扫低位非空 → 采纳低位基线（序列重置防御保留）', () async {
-      final mail6 = _mail(6, _ics('cal_reset_a', sequence: 0));
+    test('v3-a 真重置：仅回正水位线、零应用；回正值已落盘（重启不反弹）', () async {
+      final low = _mail(6, _ics('cal_reset_v3', sequence: 0));
       final source = FakeSource(
         uidValidity: 1,
-        result: scan([], 0),
+        result: scan(const <CalendarMail>[], 0, candidates: const <int>[]),
         scanScript: [
           // 初始扫（水位线 1290）：SEARCH 空返回 → boxExists=5 < 1290 触发回退验证
           scan(const <CalendarMail>[], 0, candidates: const <int>[]),
-          // 回退重扫（从 5 起）：新序列低位且活着
-          scan([mail6], 6, candidates: [6]),
+          // 回退验证重扫（仅头部档）：新序列低位且活着 → 真重置
+          scan([low], 6, candidates: [6]),
         ],
       );
       final svc = build(source);
@@ -576,10 +576,64 @@ void main() {
       final next = await svc.debugSyncIncrement(source, 1290, boxExists: 5);
 
       expect(source.scanCalls, 2);
-      expect(next, 6, reason: '真重置 → 低位基线照常推进');
-      expect(gatewayBatches.single.single['uid'], 'cal_reset_a');
+      expect(source.headersOnlyCalls, 1, reason: '回退验证重扫必须走仅头部档（条款③）');
+      expect(gatewayBatches, isEmpty,
+          reason: '真重置不重放历史——重扫帧 100% 零应用（WO-101 复活环根治）');
+      expect(next, 5, reason: '真重置 → 水位线回正至 boxExists');
+      expect(StorageService.loadCalendarWatermark().lastProcessedUid, 5,
+          reason: '[确认项②] 回正后 next>lastUid 恒假，必须显式落盘——重连/重启不反弹');
     });
 
+    test('v3-b 序列健在：重扫历史前缀命中件 → 零应用、水位线不变', () async {
+      final hist = _mail(1280, _ics('cal_hist_v3', sequence: 1));
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+        scanScript: [
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          // 重扫：历史件（≤水位线）+ maxSeen 高于回退前 → 序列健在
+          scan([hist], 1295, candidates: [1280, 1295]),
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next = await svc.debugSyncIncrement(source, 1290, boxExists: 5);
+
+      expect(source.headersOnlyCalls, 1);
+      expect(gatewayBatches, isEmpty,
+          reason: '序列健在 → 丢弃历史件（不应用）——本周 447/412 复活环的根治点');
+      expect(next, 1290, reason: '水位线保持回退前值');
+    });
+
+    test('v3-c 重扫帧含 UID>水位线 新件也零应用；该新件由后续正常拍交付', () async {
+      final fresh = _mail(1300, _ics('cal_new_v3', sequence: 1));
+      final source = FakeSource(
+        uidValidity: 1,
+        result: scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+        scanScript: [
+          // 拍1 初始扫空 → 触发回退验证重扫
+          scan(const <CalendarMail>[], 0, candidates: const <int>[]),
+          // 回退验证重扫（仅头部档）：含 UID>水位线 的件 1300
+          scan([fresh], 1300, candidates: [1300]),
+          // 后续正常拍：同一新件按标准增量交付
+          scan([fresh], 1300, candidates: [1300]),
+        ],
+      );
+      final svc = build(source);
+      svc.skipRetryDelay = const Duration(milliseconds: 10);
+
+      final next1 = await svc.debugSyncIncrement(source, 1290, boxExists: 5);
+      expect(source.headersOnlyCalls, 1, reason: '重扫走仅头部档');
+      expect(gatewayBatches, isEmpty,
+          reason: '重扫帧即使含 UID>水位线 的件也必须零应用（补充块 3）');
+      expect(next1, 1290, reason: '序列健在 → 水位线不变，不为抓新件在重扫帧开口子');
+
+      final next2 = await svc.debugSyncIncrement(source, next1, boxExists: 5);
+      expect(gatewayBatches.single.single['uid'], 'cal_new_v3',
+          reason: '新件由后续正常拍交付（无丢失面）');
+      expect(next2, 1300);
+    });
     test('v2-c 回退重扫空返回 → 判 SEARCH 瞬断，恢复原水位线（带删信箱误鸣修正）',
         () async {
       final source = FakeSource(
@@ -1050,6 +1104,9 @@ class FakeSource implements CalendarMailSource {
   /// fetchNewSince 实际调用次数（缺口重扫次数断言用）
   int scanCalls = 0;
 
+  /// [WO-101] 仅头部档（headersOnly=true）调用次数——回退验证重扫专用档位
+  int headersOnlyCalls = 0;
+
   /// WO-71 ③：调用序列记录（断言「水位线空 → 先扫描再 IDLE」）
   final List<String> calls = <String>[];
 
@@ -1064,8 +1121,9 @@ class FakeSource implements CalendarMailSource {
 
   @override
   Future<({List<CalendarMail> mails, int maxSeenUid, List<int> candidates})>
-      fetchNewSince(int lastProcessedUid) async {
+      fetchNewSince(int lastProcessedUid, {bool headersOnly = false}) async {
     scanCalls++;
+    if (headersOnly) headersOnlyCalls++;
     calls.add('scan');
     if (scanScript != null && scanScript!.isNotEmpty) {
       final idx = scanCalls - 1;
