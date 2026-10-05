@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:meta/meta.dart';
 
 import 'calendar_event_store.dart';
 import 'local_caldav_server.dart';
+import 'storage_service.dart';
 
 /// ============================================================================
 /// WO-70 · 本机只读服务生命周期 + 事件库宿主（后台任务 isolate 内运行）
@@ -13,13 +16,33 @@ import 'local_caldav_server.dart';
 /// 单例持有事件库与 HttpServer；IMAP 同步管线经 [EventStoreCalendarGateway]
 /// 写入事件库；服务对系统日历（ICS URL 订阅）与 KashCal（CalDAV）提供只读出口。
 
-
 class CalendarLocalService {
   CalendarLocalService._internal();
   static final CalendarLocalService instance = CalendarLocalService._internal();
 
+  @visibleForTesting
+  CalendarLocalService.forTesting({
+    LocalCalDavServer? initialServer,
+    LocalCalDavServer Function(CalendarEventStore, String)? serverFactory,
+  }) : _serverFactory = serverFactory {
+    if (initialServer != null) {
+      _server = initialServer;
+      store = initialServer.store;
+      password = initialServer.password;
+      username = '2bot';
+      _loaded = true;
+    }
+  }
+
   CalendarEventStore store = CalendarEventStore();
   LocalCalDavServer? _server;
+  LocalCalDavServer? _pendingServer;
+  LocalCalDavServer Function(CalendarEventStore, String)? _serverFactory;
+  Future<void>? _starting;
+  Future<void>? _stopping;
+  bool _loaded = false;
+  bool _degraded = false;
+  int _generation = 0;
 
   bool get isRunning => _server?.isRunning ?? false;
   int get port => _server?.port ?? 0;
@@ -53,32 +76,109 @@ class CalendarLocalService {
   }
 
   String _generatePassword() {
-    const chars =
-        'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    const chars = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
     final rnd = Random.secure();
     return List.generate(12, (_) => chars[rnd.nextInt(chars.length)]).join();
   }
 
-  /// 启动本机服务（幂等；端口占用自动顺延并回写实际端口供 UI 显示）
-  Future<void> ensureStarted() async {
-    if (isRunning) return;
-    await load();
+  /// 18080 is the client contract. Subsequent degraded ticks bind once,
+  /// immediately; only the initial start waits through the 60s retry window.
+  Future<void> ensureStarted() {
+    if (_stopping != null) return _stopping!.then((_) => ensureStarted());
+    if (_starting != null) return _starting!;
+    if (isRunning && port == LocalCalDavServer.contractPort) {
+      return Future<void>.value();
+    }
+    final future = _ensureStarted(_generation);
+    _starting = future;
+    return future.whenComplete(() {
+      if (identical(_starting, future)) _starting = null;
+    });
+  }
+
+  void _portUnavailable(int requestedPort, bool exhausted) {
+    // Only port and lifecycle status: never interpolate credentials/errors.
+    // ignore: avoid_print
+    print(exhausted
+        ? '[WO102] WARNING port=$requestedPort retry exhausted; degraded; next tick retries immediately'
+        : '[WO102] WARNING port=$requestedPort unavailable; retrying same port');
+  }
+
+  Future<void> _publishState() async {
+    final state = await StorageService.loadCalendarSyncStateAsync();
+    state['serverRunning'] = isRunning;
+    state['serverPort'] = port;
+    state['serverUser'] = username;
+    state['serverPass'] = password;
+    state['storeCount'] = store.events.length;
+    await StorageService.saveCalendarSyncState(state);
+    final p = await SharedPreferences.getInstance();
+    await p.setInt(_kServerPort, port);
+  }
+
+  Future<void> _ensureStarted(int generation) async {
+    final drifted = isRunning && port != LocalCalDavServer.contractPort;
+    if (drifted) {
+      _degraded = true;
+      // ignore: avoid_print
+      print('[WO102] WARNING port=$port drifted; reclaiming 18080');
+    }
+    if (!_loaded) {
+      await load();
+      _loaded = true;
+    }
+    if (generation != _generation) return;
     final pass = password ?? _generatePassword();
     password = pass;
     await SharedPreferences.getInstance()
         .then((p) => p.setString(_kCalPass, pass));
-    final server = LocalCalDavServer(store: store, password: pass);
-    await server.start();
-    _server = server;
-    final p = await SharedPreferences.getInstance();
-    await p.setInt(_kServerPort, server.port);
+    if (generation != _generation) return;
+    await _publishState();
+    if (generation != _generation) return;
+    final server = _serverFactory?.call(store, pass) ??
+        LocalCalDavServer(
+            store: store, password: pass, onPortUnavailable: _portUnavailable);
+    _pendingServer = server;
+    try {
+      await server.start(retryFor: _degraded ? Duration.zero : null);
+      if (generation != _generation) {
+        await server.stop();
+        return;
+      }
+      if (server.isRunning) {
+        final previous = _server;
+        _server = server;
+        await previous?.stop();
+        final recovered = _degraded;
+        _degraded = false;
+        // ignore: avoid_print
+        print('[WO102] ${recovered ? "RECOVERED" : "READY"} port=18080');
+      } else {
+        _degraded = true;
+      }
+      await _publishState();
+    } finally {
+      if (identical(_pendingServer, server)) _pendingServer = null;
+    }
   }
 
-  Future<void> ensureStopped() async {
+  Future<void> ensureStopped() {
+    if (_stopping != null) return _stopping!;
+    _generation++;
+    final future = _ensureStopped();
+    _stopping = future;
+    return future.whenComplete(() {
+      if (identical(_stopping, future)) _stopping = null;
+    });
+  }
+
+  Future<void> _ensureStopped() async {
+    await _pendingServer?.stop();
+    await _starting;
     await _server?.stop();
     _server = null;
-    final p = await SharedPreferences.getInstance();
-    await p.setInt(_kServerPort, 0);
+    _degraded = false;
+    await _publishState();
   }
 
   /// 应用一批事件并持久化（同步管线调用）

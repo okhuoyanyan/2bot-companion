@@ -255,6 +255,8 @@ class _ConfigCardState extends State<ConfigCard> {
           final state = snap.data ?? const <String, dynamic>{};
           final running = state['serverRunning'] as bool? ?? false;
           final port = (state['serverPort'] as num?)?.toInt() ?? 0;
+          final degraded = state.containsKey('serverRunning') &&
+              (!running || port != LocalCalDavServer.contractPort);
           return FutureBuilder<String>(
             key: ValueKey('icsTok$tick'),
             future: LocalCalDavServer.ensureIcsToken(),
@@ -309,7 +311,12 @@ class _ConfigCardState extends State<ConfigCard> {
                   const SizedBox(height: 2),
                   SizedBox(
                     height: 30,
-                    child: url.isEmpty
+                    child: degraded
+                        ? const Text(
+                            '告警：18080 未就绪，正在恢复本机日历服务',
+                            style: TextStyle(fontSize: 10, color: Color(0xFFF59E0B)),
+                          )
+                        : url.isEmpty
                         ? const Text(
                             '本机服务未运行（开启日历自动同步后显示订阅 URL）',
                             style: TextStyle(

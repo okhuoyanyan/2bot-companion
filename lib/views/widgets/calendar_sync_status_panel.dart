@@ -99,15 +99,21 @@ class CalendarSyncStatusPanel extends StatelessWidget {
 
     final serverRunning = state['serverRunning'] as bool? ?? false;
     final serverPort = (state['serverPort'] as num?)?.toInt() ?? 0;
+    final serverDegraded = state.containsKey('serverRunning') &&
+        (!serverRunning || serverPort != 18080);
     final serverUser = '${state['serverUser'] ?? ''}';
     final serverPass = '${state['serverPass'] ?? ''}';
     final storeCount = (state['storeCount'] as num?)?.toInt() ?? 0;
     final bgError = '${state['bgError'] ?? ''}';
 
     // 服务块：3 个固定槽位（未运行时空槽占位，高度恒定）
-    final serverLine1 = serverRunning
-        ? '本机服务：运行中 · 端口 $serverPort · 库内 $storeCount 条'
-        : (bgError.isEmpty ? '本机服务：未运行' : '本机服务：未运行 · $bgError');
+    final serverLine1 = serverDegraded
+        ? (serverRunning
+            ? '告警：端口漂移 $serverPort，正在恢复 18080'
+            : '告警：18080 未就绪，正在重试')
+        : serverRunning
+            ? '本机服务：运行中 · 端口 $serverPort · 库内 $storeCount 条'
+            : (bgError.isEmpty ? '本机服务：未运行' : '本机服务：未运行 · $bgError');
     final serverLine2 =
         serverRunning ? '订阅 URL：http://127.0.0.1:$serverPort/calendar.ics' : '';
     final serverLine3 = serverRunning
@@ -124,13 +130,13 @@ class CalendarSyncStatusPanel extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _slot(_statusH, _fixedText(statusText, maxLines: 2, color: statusColor)),
+        _slot(
+            _statusH, _fixedText(statusText, maxLines: 2, color: statusColor)),
         // 失败原因槽：固定 2 行高度（空也占位——高度恒定纪律）
         _slot(
             _errorH,
-            _fixedText(lastError == null || lastError.isEmpty
-                ? ''
-                : '失败原因：$lastError',
+            _fixedText(
+                lastError == null || lastError.isEmpty ? '' : '失败原因：$lastError',
                 maxLines: 2)),
         _slot(
             _serverH,
@@ -142,9 +148,11 @@ class CalendarSyncStatusPanel extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                         fontSize: 10,
-                        color: serverRunning
-                            ? const Color(0xFF10B981)
-                            : const Color(0xFF64748B))),
+                        color: serverDegraded
+                            ? const Color(0xFFF59E0B)
+                            : serverRunning
+                                ? const Color(0xFF10B981)
+                                : const Color(0xFF64748B))),
                 _fixedText(serverLine2, maxLines: 1),
                 _fixedText(serverLine3, maxLines: 1),
               ],

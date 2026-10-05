@@ -20,6 +20,32 @@ Widget _wrap(Widget child) {
 }
 
 void main() {
+  for (final port in [0, 18081]) {
+    testWidgets('WO102: 本机端口 $port 显示降级告警', (tester) async {
+      await tester.pumpWidget(_wrap(CalendarSyncStatusPanel(
+          state: {'serverRunning': port != 0, 'serverPort': port},
+          imapLog: const [])));
+      expect(find.textContaining('告警'), findsOneWidget);
+      expect(find.textContaining('18080'), findsWidgets);
+    });
+  }
+
+  testWidgets('WO102: 告警与恢复均保持高度，18080 正常时无告警', (tester) async {
+    double? height;
+    for (final port in [18080, 0, 18081, 18080]) {
+      await tester.pumpWidget(_wrap(CalendarSyncStatusPanel(
+          state: {'serverRunning': port != 0, 'serverPort': port},
+          imapLog: const [])));
+      final current =
+          tester.getSize(find.byType(CalendarSyncStatusPanel)).height;
+      height ??= current;
+      expect(current, height);
+      expect(find.textContaining('告警'),
+          port == 18080 ? findsNothing : findsOneWidget);
+      expect(tester.takeException(), isNull);
+    }
+  });
+
   testWidgets('状态文本 1 行变 3 行：面板高度前后一致', (tester) async {
     final empty = <String, dynamic>{};
     final full = <String, dynamic>{

@@ -26,8 +26,25 @@ class LocalCalDavServer {
   final String password; // Basic 口令（用户名固定 2bot）
   HttpServer? _server;
   int port = 0;
+  static const int contractPort = 18080;
+  static const Duration defaultRetryInterval = Duration(milliseconds: 500);
+  static const Duration defaultRetryWindow = Duration(seconds: 60);
+  final Duration retryInterval;
+  final Duration retryWindow;
+  // Lifecycle owner reports port-only diagnostics; this server never logs.
+  final void Function(int port, bool exhausted)? onPortUnavailable;
+  Future<void>? _starting;
+  Completer<void>? _cancelStart;
+  int _generation = 0;
 
-  LocalCalDavServer({required this.store, required this.password});
+  LocalCalDavServer({
+    required this.store,
+    required this.password,
+    this.retryInterval = defaultRetryInterval,
+    this.retryWindow = defaultRetryWindow,
+    this.onPortUnavailable,
+  })  : assert(retryInterval > Duration.zero),
+        assert(retryWindow >= Duration.zero);
 
   bool get isRunning => _server != null;
   String get url => 'http://127.0.0.1:$port';
@@ -81,20 +98,62 @@ class LocalCalDavServer {
   String? _icsToken; // 启动时副本：仅供本 isolate 内展示/测试；鉴权不走它
   String get icsToken => _icsToken ?? '';
 
-  /// 绑定回环 18080 起，占用自动顺延（最多尝试 20 个端口）。
-  Future<void> start({int preferredPort = 18080}) async {
-    for (var p = preferredPort; p < preferredPort + 20; p++) {
+  /// Only bind the requested port. Exhaustion leaves running=false/port=0;
+  /// the lifecycle owner's next tick can retry with a zero window.
+  Future<void> start({int preferredPort = contractPort, Duration? retryFor}) {
+    if (isRunning) return Future<void>.value();
+    if (_starting != null) return _starting!;
+    final window = retryFor ?? retryWindow;
+    if (window < Duration.zero || retryInterval <= Duration.zero) {
+      throw ArgumentError('Invalid port retry duration');
+    }
+    final cancel = Completer<void>();
+    _cancelStart = cancel;
+    final generation = _generation;
+    final future = _bindWithRetry(preferredPort, window, generation, cancel);
+    _starting = future;
+    return future.whenComplete(() {
+      if (identical(_starting, future)) {
+        _starting = null;
+        _cancelStart = null;
+      }
+    });
+  }
+
+  Future<void> _bindWithRetry(int requestedPort, Duration window,
+      int generation, Completer<void> cancel) async {
+    final elapsed = Stopwatch()..start();
+    var warned = false;
+    while (generation == _generation) {
       try {
-        _server = await HttpServer.bind(InternetAddress.loopbackIPv4, p);
-        port = p;
+        final bound =
+            await HttpServer.bind(InternetAddress.loopbackIPv4, requestedPort);
+        if (generation != _generation) {
+          await bound.close(force: true);
+          return;
+        }
+        _server = bound;
+        port = bound.port;
         break;
       } on SocketException {
-        continue; // 端口占用 → 顺延
+        if (generation != _generation) return;
+        if (!warned) {
+          warned = true;
+          onPortUnavailable?.call(requestedPort, false);
+        }
+        final remaining = window - elapsed.elapsed;
+        if (remaining <= Duration.zero) {
+          onPortUnavailable?.call(requestedPort, true);
+          return;
+        }
+        await Future.any<void>([
+          Future<void>.delayed(
+              remaining < retryInterval ? remaining : retryInterval),
+          cancel.future,
+        ]);
       }
     }
-    if (_server == null) {
-      throw StateError('18080-18099 全部占用，本机服务无法启动');
-    }
+    if (generation != _generation || _server == null) return;
     _server!.listen(_handle, onError: (Object _) {});
     try {
       _icsToken = await ensureIcsToken();
@@ -104,9 +163,15 @@ class LocalCalDavServer {
   }
 
   Future<void> stop() async {
-    await _server?.close(force: false);
+    _generation++;
+    if (_cancelStart != null && !_cancelStart!.isCompleted) {
+      _cancelStart!.complete();
+    }
+    final bound = _server;
     _server = null;
     port = 0;
+    await bound?.close(force: true);
+    await _starting;
   }
 
   // ------------------------------------------------------------------
