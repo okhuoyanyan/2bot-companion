@@ -28,6 +28,112 @@ import 'calendar_sync_service_test.dart' show FakeGateway, FakeSource, scan;
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  group('WO-105 OS 锁防复发', () {
+    test('真实 isolate 排队、临界区心跳、无关句柄关闭不提前放锁', () async {
+      final tmp = await Directory.systemTemp.createTemp('wo105_lock_');
+      lockDirOverride = tmp.path;
+      final release = Completer<void>();
+      final entered = Completer<void>();
+      final signals = ReceivePort();
+      final firstAction = Completer<String>();
+      var contenderEntered = false;
+      var heartbeats = 0;
+      final subscription = signals.listen((message) {
+        if (message == 'entered') contenderEntered = true;
+        if (!firstAction.isCompleted) firstAction.complete(message as String);
+      });
+      final heartbeat = Timer.periodic(const Duration(milliseconds: 10), (_) {
+        heartbeats++;
+      });
+      final holder = crossIsolateSynchronized('guard', () async {
+        entered.complete();
+        await release.future;
+      });
+      Future<void>? contender;
+      try {
+        await entered.future.timeout(const Duration(seconds: 2));
+        contender = _wo105SpawnContender(tmp.path, signals.sendPort);
+        expect(await firstAction.future.timeout(const Duration(seconds: 2)),
+            'retry', reason: '真实 isolate 必须遇到 OS 锁竞争，不能重入');
+        final unrelated = await File('${tmp.path}/wo69_guard.lock')
+            .open(mode: FileMode.append);
+        await unrelated.close();
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+        expect(contenderEntered, isFalse,
+            reason: '同文件无关句柄关闭不得解除持有者锁');
+        expect(heartbeats, greaterThanOrEqualTo(3),
+            reason: '锁竞争期间事件循环必须持续响应');
+        release.complete();
+        await Future.wait([holder, contender]).timeout(const Duration(seconds: 3));
+        expect(contenderEntered, isTrue, reason: '释放后排队者必须接管');
+      } finally {
+        if (!release.isCompleted) release.complete();
+        await holder;
+        if (contender != null) await contender;
+        heartbeat.cancel();
+        await subscription.cancel();
+        signals.close();
+        lockDirOverride = null;
+        await tmp.delete(recursive: true);
+        expect(tmp.existsSync(), isFalse);
+      }
+    });
+
+    test('Unicode 锁路径异常释放后可重获，重复调用无残留 fd', () async {
+      final tmp = await Directory.systemTemp.createTemp('wo105_临界_😀_');
+      lockDirOverride = tmp.path;
+      var bodies = 0;
+      var retries = 0;
+      try {
+        for (var i = 0; i < 20; i++) {
+          await expectLater(crossIsolateSynchronized<void>('临界_😀', () async {
+            if (Platform.isLinux) {
+              expect(_wo105OpenLockDescriptors(tmp.path), 1,
+                  reason: '临界区持有真实 OS fd');
+            }
+            throw StateError('controlled failure');
+          }), throwsStateError);
+          await crossIsolateSynchronized('临界_😀', () async {
+            bodies++;
+          }, sleep: (_) async { retries++; });
+          if (Platform.isLinux) {
+            expect(_wo105OpenLockDescriptors(tmp.path), 0,
+                reason: '异常与正常路径均不得泄漏锁 fd');
+          }
+        }
+        expect(bodies, 20);
+        expect(retries, 0, reason: '每轮异常都必须释放锁，下一调用立即取得');
+      } finally {
+        lockDirOverride = null;
+        await tmp.delete(recursive: true);
+        expect(tmp.existsSync(), isFalse);
+      }
+    });
+
+    test('不同锁名可并行，不能以全局互斥替代 OS 文件锁', () async {
+      final tmp = await Directory.systemTemp.createTemp('wo105_names_');
+      lockDirOverride = tmp.path;
+      final bothEntered = Completer<void>();
+      final release = Completer<void>();
+      var count = 0;
+      Future<void> worker(String name) => crossIsolateSynchronized(name, () async {
+        if (++count == 2) bothEntered.complete();
+        await release.future;
+      });
+      final workers = Future.wait([worker('one'), worker('two')]);
+      try {
+        await bothEntered.future.timeout(const Duration(seconds: 2));
+        expect(count, 2);
+      } finally {
+        release.complete();
+        await workers;
+        lockDirOverride = null;
+        await tmp.delete(recursive: true);
+        expect(tmp.existsSync(), isFalse);
+      }
+    });
+  });
+
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     await StorageService.init();
@@ -513,6 +619,30 @@ void main() {
       expect(n, 1, reason: '后台 owner 正常发送');
     });
   });
+}
+
+Future<void> _wo105SpawnContender(String dir, SendPort signals) =>
+    Isolate.run(() async {
+      lockDirOverride = dir;
+      await crossIsolateSynchronized('guard', () async {
+        signals.send('entered');
+      }, retryInterval: const Duration(milliseconds: 30), maxRetries: 80,
+          sleep: (delay) async {
+        signals.send('retry');
+        await Future<void>.delayed(delay);
+      });
+    });
+
+int _wo105OpenLockDescriptors(String dir) {
+  var count = 0;
+  for (final entry in Directory('/proc/self/fd').listSync()) {
+    try {
+      if (Link(entry.path).targetSync().startsWith('$dir/wo69_')) count++;
+    } on FileSystemException {
+      // /proc 的枚举句柄在 listSync 返回时已关闭；其编号可能已消失。
+    }
+  }
+  return count;
 }
 
 DateTime fakeClock = DateTime(2026, 9, 27, 5);

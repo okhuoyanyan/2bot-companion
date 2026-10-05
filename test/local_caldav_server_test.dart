@@ -11,6 +11,7 @@ import 'package:bot_companion/services/cross_isolate_lock.dart';
 import 'package:bot_companion/services/local_caldav_server.dart';
 
 import 'w78_baseline.dart';
+import 'fixtures/wo105_timezone_probe.dart' as timezone_probe;
 
 /// ============================================================================
 /// WO-70 · 本机只读服务单测（事件模型 + HTTP 路由矩阵 + 只读契约）
@@ -46,6 +47,55 @@ CalendarEventStore buildStore() => CalendarEventStore()
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('WO-105 全天 DATE 与快照时区契约', () {
+    test('固定 epoch 快照显式要求北京时间日期，不改模型时区语义', () {
+      final event = buildStore().events['cal_2']!;
+      final start = DateTime.fromMillisecondsSinceEpoch(event.dtstartMs);
+      final end = DateTime.fromMillisecondsSinceEpoch(event.endMs!);
+      expect(start.timeZoneOffset, const Duration(hours: 8),
+          reason: '既有固定 epoch 字节快照在 Asia/Shanghai 生成，CI 必须声明该环境');
+      expect((start.year, start.month, start.day), (2024, 9, 25));
+      expect((end.year, end.month, end.day), (2024, 9, 26));
+      expect(event.toIcs(), contains('DTSTART;VALUE=DATE:20240925'));
+      expect(event.toIcs(), contains('DTEND;VALUE=DATE:20240926'));
+    });
+
+    test('DATE 文本夹具在当前时区保持跨年、闰日、月末逐字节往返', () {
+      final result = timezone_probe.probe();
+      expect(result['dates'], timezone_probe.expectedDates);
+    });
+
+    test('Linux 子进程 UTC 与北京时间均保持 DATE 往返', () async {
+      var ancestor = File(Platform.resolvedExecutable).parent;
+      File? dart;
+      while (ancestor.parent.path != ancestor.path) {
+        final candidate = File('${ancestor.path}/dart-sdk/bin/dart');
+        if (candidate.existsSync()) {
+          dart = candidate;
+          break;
+        }
+        ancestor = ancestor.parent;
+      }
+      expect(dart, isNotNull, reason: '从实际 Flutter tester 路径定位同版 SDK Dart');
+      final tmp = await Directory.systemTemp.createTemp('wo105_timezone_');
+      try {
+        for (final (zone, offset) in [('UTC', 0), ('Asia/Shanghai', 480)]) {
+          final result = await Process.run(dart!.path, [
+            '--packages=${File('.dart_tool/package_config.json').absolute.path}',
+            File('test/fixtures/wo105_timezone_probe.dart').absolute.path,
+          ], workingDirectory: tmp.path, environment: {'TZ': zone});
+          expect(result.exitCode, 0, reason: '$zone: ${result.stderr}');
+          final data = jsonDecode(result.stdout as String) as Map<String, dynamic>;
+          expect(data['offsetMinutes'], offset, reason: '$zone 必须实际生效');
+          expect(data['dates'], timezone_probe.expectedDates, reason: zone);
+        }
+      } finally {
+        await tmp.delete(recursive: true);
+        expect(tmp.existsSync(), isFalse, reason: '临时子进程工作目录清理复验');
+      }
+    }, skip: !Platform.isLinux); // Windows 的 TZ 不改变系统时区，明确记跳过。
+  });
 
   group('事件模型', () {
     test('upsert / CANCELLED 墓碑 / 同 UID 复活', () {
