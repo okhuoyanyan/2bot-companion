@@ -59,6 +59,10 @@ jobs:
       # WO-36 §3.3：Dart 单测进 CI（协议帧 / 重试 / dot-stuffing / ENC1 跨语言 KAT）
       # WO-36-MOBILE-CI-FIX §六(b)：失败详情同样以 ::error:: 注解公开输出，解决"日志需登录"的可观测性盲区。
       - name: 🧪 Run Dart Unit Tests
+        env:
+          # WO-105：既有 epoch/ctag 字节快照取自北京时间；DATE 模型语义不改。
+          # 新回归另以 UTC/Asia/Shanghai 子进程检验 DATE 往返，防止时区假绿。
+          TZ: Asia/Shanghai
         run: |
           set +e
           flutter test 2>&1 | tee /tmp/test.log

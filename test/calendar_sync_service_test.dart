@@ -292,23 +292,33 @@ void main() {
         gateway: FakeGateway(onUpsert: (_) {}),
       );
       // 直接驱动一个短会话：start → 等 1 秒 → stop
+      final tmp = await Directory.systemTemp.createTemp('wo105_sync_order_');
+      final debugLog = File('${tmp.path}/wo71_dbg.log');
       void dbg(String m) {
-        File('C:/Users/NAS/AppData/Local/Temp/wo71_dbg.log').writeAsStringSync(
-            '$m\r\n', mode: FileMode.append);
+        debugLog.writeAsStringSync('$m\r\n', mode: FileMode.append);
       }
-      dbg('start begin, calls=${source.calls}');
-      svc.start();
-      dbg('start returned');
-      await Future<void>.delayed(const Duration(milliseconds: 1200));
-      dbg('waited, calls=${source.calls}');
-      await svc.stop();
-      dbg('stopped, calls=${source.calls}');
-      expect(source.calls.first, 'scan',
-          reason: '水位线为空时必须先扫描再 IDLE——'
-              '先 IDLE 则无历史推送、永不扫描、库内恒 0（WO-71 §1.2）');
-      final idleIdx = source.calls.indexOf('idle');
-      final scanIdx = source.calls.indexOf('scan');
-      expect(idleIdx, greaterThan(scanIdx), reason: 'IDLE 必须在首轮扫描之后');
+      try {
+        dbg('start begin, calls=${source.calls}');
+        svc.start();
+        dbg('start returned');
+        await Future<void>.delayed(const Duration(milliseconds: 1200));
+        dbg('waited, calls=${source.calls}');
+        await svc.stop();
+        dbg('stopped, calls=${source.calls}');
+        expect(source.calls.first, 'scan',
+            reason: '水位线为空时必须先扫描再 IDLE——'
+                '先 IDLE 则无历史推送、永不扫描、库内恒 0（WO-71 §1.2）');
+        final idleIdx = source.calls.indexOf('idle');
+        final scanIdx = source.calls.indexOf('scan');
+        expect(idleIdx, greaterThan(scanIdx), reason: 'IDLE 必须在首轮扫描之后');
+      } finally {
+        try {
+          await svc.stop();
+        } finally {
+          await tmp.delete(recursive: true);
+          expect(tmp.existsSync(), isFalse, reason: '调试沙盒清理复验');
+        }
+      }
     });
   });
 

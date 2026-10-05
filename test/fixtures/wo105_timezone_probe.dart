@@ -17,18 +17,23 @@ Map<String, Object> probe() {
         'UID:wo105-$i\n${pair.join('\n')}\n'
         'SUMMARY:fixture\nEND:VEVENT\nEND:VCALENDAR';
     final parsed = parseIcs(input).events.single;
-    final store = CalendarEventStore()..applyUpserts([
-      {
-        'uid': parsed.uid,
-        'sequence': parsed.sequence,
-        'allDay': parsed.allDay,
-        'dtstartMs': parsed.dtstart.millisecondsSinceEpoch,
-        'endMs': parsed.dtend!.millisecondsSinceEpoch,
-      }
-    ]);
-    dates.add(store.events[parsed.uid]!.toIcs().split('\n').where((line) =>
-        line.startsWith('DTSTART;VALUE=DATE:') ||
-        line.startsWith('DTEND;VALUE=DATE:')).toList());
+    final store = CalendarEventStore()
+      ..applyUpserts([
+        {
+          'uid': parsed.uid,
+          'sequence': parsed.sequence,
+          'allDay': parsed.allDay,
+          'dtstartMs': parsed.dtstart.millisecondsSinceEpoch,
+          'endMs': parsed.dtend!.millisecondsSinceEpoch,
+        }
+      ]);
+    dates.add(store.events[parsed.uid]!
+        .toIcs()
+        .split('\n')
+        .where((line) =>
+            line.startsWith('DTSTART;VALUE=DATE:') ||
+            line.startsWith('DTEND;VALUE=DATE:'))
+        .toList());
   }
   return {
     'offsetMinutes': DateTime(2024, 9, 25).timeZoneOffset.inMinutes,

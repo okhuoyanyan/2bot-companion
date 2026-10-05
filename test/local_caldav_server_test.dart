@@ -89,6 +89,8 @@ void main() {
           final data = jsonDecode(result.stdout as String) as Map<String, dynamic>;
           expect(data['offsetMinutes'], offset, reason: '$zone 必须实际生效');
           expect(data['dates'], timezone_probe.expectedDates, reason: zone);
+          print('[WO105] DATE probe TZ=$zone offsetMinutes=${data['offsetMinutes']} '
+              'roundtripRows=${(data['dates'] as List).length}');
         }
       } finally {
         await tmp.delete(recursive: true);

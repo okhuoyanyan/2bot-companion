@@ -66,6 +66,8 @@ void main() {
         release.complete();
         await Future.wait([holder, contender]).timeout(const Duration(seconds: 3));
         expect(contenderEntered, isTrue, reason: '释放后排队者必须接管');
+        print('[WO105] OS guard queued=true unrelatedCloseSafe=true '
+            'heartbeats=$heartbeats takeover=$contenderEntered');
       } finally {
         if (!release.isCompleted) release.complete();
         await holder;
@@ -103,6 +105,9 @@ void main() {
         }
         expect(bodies, 20);
         expect(retries, 0, reason: '每轮异常都必须释放锁，下一调用立即取得');
+        print('[WO105] Unicode lock exceptionLoops=20 reacquired=$bodies '
+            'retries=$retries remainingLockFds='
+            '${Platform.isLinux ? _wo105OpenLockDescriptors(tmp.path) : 'not-applicable'}');
       } finally {
         lockDirOverride = null;
         await tmp.delete(recursive: true);
